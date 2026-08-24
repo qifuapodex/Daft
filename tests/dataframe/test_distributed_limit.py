@@ -277,15 +277,6 @@ def test_refund_between_set_and_resume_does_not_release_waiter():
     assert asyncio.run(run()) == ["t2"]
 
 
-@pytest.mark.skip(
-    reason="`limit` under a cross join hangs on main, unrelated to this test's subject. "
-    "SwordfishTaskBuilder::combine_with resets notify_tokens/cancel_token to empty, so the "
-    "oneshot sender LimitNode registered via add_notify_token is dropped when CrossJoinNode "
-    "combines the builder. Its receiver then resolves Err, limit_execution_loop's "
-    "`if let Ok(Ok(task_id))` swallows it, completed_ids never gains the task, and "
-    "`contributors.is_subset(completed_ids)` is never satisfied. Re-enable once tokens survive "
-    "combine_with."
-)
 @pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
 def test_limit_under_cross_join_keeps_the_other_side_whole():
     """Satisfying a `LIMIT` must not stop the *other* side of a fused join.
