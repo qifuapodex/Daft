@@ -23,10 +23,36 @@ fn make_shuffle_id(context: &PipelineNodeContext) -> u64 {
     ((context.query_idx as u64) << 32) | (context.node_id as u64)
 }
 
+/// Which map-side writer a shuffle node uses.
+///
+/// This decides whether shared placement is available, because only the combined
+/// file carries an index a peer can resolve byte ranges from. The per-partition
+/// layout is addressable only through the writing worker's in-memory cache, so
+/// putting it on a shared mount would buy nothing and would leave the read side
+/// looking for files in the wrong place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShuffleWriteKind {
+    /// One combined, self-indexing file per map task (`RepartitionWrite`).
+    CombinedFile,
+    /// One directory per output partition (`GatherWrite`, `IntoPartitions`).
+    PerPartition,
+}
+
+/// A shuffle node's resolved backend: the plan-level [`ShuffleBackend`] with this
+/// node's `shuffle_id` stamped in, plus the node handles task building needs.
 #[derive(Clone)]
 pub(crate) enum DistributedShuffleBackend {
     Ray,
     Flight(FlightShuffleBackendConfig),
+}
+
+impl DistributedShuffleBackend {
+    fn shared_root(&self) -> Option<&str> {
+        match self {
+            Self::Ray => None,
+            Self::Flight(config) => config.shared.as_ref().map(|shared| shared.root.as_str()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -41,18 +67,19 @@ impl ShuffleBackend {
         context: &PipelineNodeContext,
         schema: SchemaRef,
         backend: DistributedShuffleBackend,
+        write_kind: ShuffleWriteKind,
     ) -> Self {
         Self {
             schema,
             node_id: context.node_id,
             backend: match backend {
                 DistributedShuffleBackend::Ray => DistributedShuffleBackend::Ray,
-                DistributedShuffleBackend::Flight(backend) => {
-                    DistributedShuffleBackend::Flight(FlightShuffleBackendConfig {
-                        shuffle_id: make_shuffle_id(context),
-                        shuffle_dirs: backend.shuffle_dirs,
-                        compression: backend.compression,
-                    })
+                DistributedShuffleBackend::Flight(mut backend) => {
+                    backend.shuffle_id = make_shuffle_id(context);
+                    if write_kind == ShuffleWriteKind::PerPartition {
+                        backend.shared = None;
+                    }
+                    DistributedShuffleBackend::Flight(backend)
                 }
             },
         }
@@ -89,6 +116,7 @@ impl ShuffleBackend {
                 shuffle_id: cfg.shuffle_id,
                 shuffle_dirs: cfg.shuffle_dirs,
                 compression: cfg.compression,
+                shared: cfg.shared,
             },
         }
     }
@@ -147,7 +175,8 @@ impl ShuffleBackend {
             )));
         }
 
-        let read_inputs = flight::read_inputs_from_refs(partition_refs)?;
+        let read_inputs =
+            flight::read_inputs_from_refs(partition_refs, self.backend.shared_root())?;
         let shuffle_read = LocalPhysicalPlan::shuffle_read(
             node_id,
             self.schema.clone(),
@@ -195,6 +224,7 @@ impl ShuffleBackend {
                     materialized_stream,
                     num_partitions,
                     cfg.shuffle_id,
+                    self.backend.shared_root(),
                 )
                 .await?;
                 flight::emit_read_tasks(

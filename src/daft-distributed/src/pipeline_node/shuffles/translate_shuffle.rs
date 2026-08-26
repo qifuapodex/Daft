@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use common_display::utils::bytes_to_human_readable;
 use common_error::DaftResult;
+use daft_local_plan::SharedShuffleSpec;
 use daft_logical_plan::partitioning::RepartitionSpec;
 use daft_schema::schema::SchemaRef;
 
@@ -25,9 +26,23 @@ impl LogicalPlanToPipelineNodeTranslator {
     /// Pick the shuffle backend implied by the current execution config.
     pub(crate) fn select_backend(&self) -> DistributedShuffleBackend {
         if self.plan_config.config.shuffle_algorithm.as_str() == "flight_shuffle" {
+            let config = &self.plan_config.config;
+            // The config layer already rejects `shared_only` without a directory,
+            // so a missing root here can only mean local placement.
+            let shared = match (
+                config.flight_shuffle_placement.as_str(),
+                config.flight_shuffle_shared_dir.as_ref(),
+            ) {
+                ("shared_only", Some(root)) => Some(SharedShuffleSpec {
+                    root: root.clone(),
+                    durability: config.flight_shuffle_shared_durability.clone(),
+                }),
+                _ => None,
+            };
             DistributedShuffleBackend::Flight(FlightShuffleBackendConfig {
-                shuffle_dirs: self.plan_config.config.flight_shuffle_dirs.clone(),
-                compression: self.plan_config.config.flight_shuffle_compression.clone(),
+                shuffle_dirs: config.flight_shuffle_dirs.clone(),
+                compression: config.flight_shuffle_compression.clone(),
+                shared,
                 ..Default::default()
             })
         } else {

@@ -16,7 +16,7 @@ use crate::{
     pipeline_node::{
         ClusteringStrategy, DistributedPipelineNode, MaterializedOutput, NodeID,
         PipelineNodeConfig, PipelineNodeContext,
-        shuffles::backends::{DistributedShuffleBackend, ShuffleBackend},
+        shuffles::backends::{DistributedShuffleBackend, ShuffleBackend, ShuffleWriteKind},
     },
     plan::{PlanConfig, PlanExecutionContext, TaskIDCounter},
     scheduling::{
@@ -62,7 +62,12 @@ impl RandomShuffleNode {
             plan_config.config.clone(),
             ClusteringStrategy::Passthrough { child: &child },
         );
-        let shuffle_backend = ShuffleBackend::new(&context, output_schema, backend);
+        let shuffle_backend = ShuffleBackend::new(
+            &context,
+            output_schema,
+            backend,
+            ShuffleWriteKind::CombinedFile,
+        );
         Self {
             config,
             context,

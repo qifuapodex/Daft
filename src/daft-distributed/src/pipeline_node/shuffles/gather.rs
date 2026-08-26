@@ -12,7 +12,7 @@ use crate::{
         ClusteringStrategy, DistributedPipelineNode, MaterializedOutput, NodeID,
         PipelineNodeConfig, PipelineNodeContext, PipelineNodeImpl, TaskBuilderStream,
         clustering::BoundClusteringSpec,
-        shuffles::backends::{DistributedShuffleBackend, ShuffleBackend},
+        shuffles::backends::{DistributedShuffleBackend, ShuffleBackend, ShuffleWriteKind},
     },
     plan::{PlanConfig, PlanExecutionContext, TaskIDCounter},
     scheduling::{
@@ -52,7 +52,8 @@ impl GatherNode {
             plan_config.config.clone(),
             ClusteringStrategy::Explicit(BoundClusteringSpec::unknown(1)),
         );
-        let shuffle_backend = ShuffleBackend::new(&context, schema, backend);
+        let shuffle_backend =
+            ShuffleBackend::new(&context, schema, backend, ShuffleWriteKind::PerPartition);
         Self {
             config,
             context,

@@ -4,7 +4,8 @@ use common_error::DaftResult;
 use common_metrics::ops::{NodeCategory, NodeType};
 use common_runtime::OrderedJoinSet;
 use daft_local_plan::{
-    LocalNodeContext, LocalPhysicalPlan, LocalPhysicalPlanRef, ShuffleBackend as LocalShuffleBackend,
+    LocalNodeContext, LocalPhysicalPlan, LocalPhysicalPlanRef,
+    ShuffleBackend as LocalShuffleBackend,
 };
 use daft_logical_plan::stats::StatsState;
 use daft_schema::schema::SchemaRef;
@@ -15,7 +16,7 @@ use crate::{
     pipeline_node::{
         ClusteringStrategy, DistributedPipelineNode, NodeID, PipelineNodeConfig,
         PipelineNodeContext,
-        shuffles::backends::{DistributedShuffleBackend, ShuffleBackend},
+        shuffles::backends::{DistributedShuffleBackend, ShuffleBackend, ShuffleWriteKind},
     },
     plan::{PlanConfig, PlanExecutionContext, TaskIDCounter},
     scheduling::{
@@ -80,7 +81,8 @@ impl IntoPartitionsNode {
             plan_config.config.clone(),
             ClusteringStrategy::Explicit(BoundClusteringSpec::unknown(num_partitions)),
         );
-        let shuffle_backend = ShuffleBackend::new(&context, schema, backend);
+        let shuffle_backend =
+            ShuffleBackend::new(&context, schema, backend, ShuffleWriteKind::PerPartition);
 
         Self {
             config,
