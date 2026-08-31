@@ -1,0 +1,34 @@
+name: Sync apodex-0.7.24 release notes
+
+# Local gh PAT cannot write Releases; the Actions GITHUB_TOKEN can.
+# Pushing this branch creates or updates the GitHub Release body from the
+# markdown file. Wheel assets are still uploaded by "Build and publish apodex wheels".
+on:
+  push:
+    branches:
+    - release_apodex_0724
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-apodex-0.7.24-notes
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Create or update GitHub Release notes
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG=apodex-0.7.24
+        NOTES=.github/release-notes/apodex-0.7.24.md
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES"
+        else
+          gh release create "$TAG" --title "$TAG" --notes-file "$NOTES" --target "$GITHUB_SHA"
+        fi
+        gh release view "$TAG" --json url,name

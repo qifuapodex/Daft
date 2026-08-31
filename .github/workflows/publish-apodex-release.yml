@@ -69,6 +69,7 @@ jobs:
     permissions:
       contents: write
     steps:
+    - uses: actions/checkout@v7
     - uses: actions/download-artifact@v8
       with:
         pattern: wheels-*
@@ -82,21 +83,7 @@ jobs:
         tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
         name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
         target_commitish: ${{ github.sha }}
-        generate_release_notes: true
-        body: |
-          Apodex Daft wheels built from `${{ github.ref_name }}` (`${{ github.sha }}`).
-
-          Not published to PyPI. Install the wheel that matches the target OS/arch:
-
-          ```bash
-          pip install --force-reinstall --find-links "https://github.com/${{ github.repository }}/releases/expanded_assets/${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}" "daft"
-          ```
-
-          Ray extra:
-
-          ```bash
-          pip install --force-reinstall --find-links "https://github.com/${{ github.repository }}/releases/expanded_assets/${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}" "daft[ray]"
-          ```
+        body_path: .github/release-notes/apodex-0.7.24.md
         files: dist/*
         fail_on_unmatched_files: true
         make_latest: true
