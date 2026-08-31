@@ -82,6 +82,10 @@ jobs:
           # replace ".dev" with "-dev" to comply with Cargo SemVer rules
           VERSION="$(python -m setuptools_scm | sed 's/\.dev/-dev/'g)"
         fi
+        # Cargo rejects 0.7.24.1 (four numeric components). Map it to build metadata.
+        if [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)(.*)$ ]]; then
+          VERSION="${BASH_REMATCH[1]}+apodex.${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+        fi
         echo "Setting package version to: $VERSION"
         tomlq -i -t ".package.version = \"$VERSION\"" Cargo.toml
         tomlq -i -t ".workspace.package.version = \"$VERSION\"" Cargo.toml
