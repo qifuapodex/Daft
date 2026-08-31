@@ -44,10 +44,11 @@ defaults:
 
 jobs:
   build:
-    # GitHub-hosted runners (no Blacksmith). Linux aarch64 uses the ARM image
-    # so it native-compiles instead of QEMU-crossing from x86.
+    # GitHub-hosted runners (no Blacksmith). Linux aarch64 cross-compiles from
+    # ubuntu-latest (x86), matching the official workflow. Native ARM runners
+    # OOM / get shut down during release-lto of this crate.
     timeout-minutes: 360
-    runs-on: ${{ inputs.os == 'ubuntu' && (inputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest') || format('{0}-latest', inputs.os) }}
+    runs-on: ${{ format('{0}-latest', inputs.os) }}
 
     steps:
     - uses: actions/checkout@v7
