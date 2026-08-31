@@ -82,8 +82,8 @@ jobs:
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
-        name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        tag_name: apodex-0.7.24
+        name: apodex-0.7.24
         target_commitish: ${{ github.sha }}
         body_path: .github/release-notes/apodex-0.7.24.md
         files: dist/*
