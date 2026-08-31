@@ -24,6 +24,11 @@ on:
         description: Whether to run tests on the built wheels
         type: boolean
         default: false
+      package_version:
+        description: Override package version (otherwise derived from setuptools_scm)
+        type: string
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -39,7 +44,10 @@ defaults:
 
 jobs:
   build:
-    runs-on: ${{ inputs.os == 'ubuntu' && 'blacksmith-16vcpu-ubuntu-2204' || format('{0}-latest', inputs.os) }}
+    # GitHub-hosted runners (no Blacksmith). Linux aarch64 uses the ARM image
+    # so it native-compiles instead of QEMU-crossing from x86.
+    timeout-minutes: 360
+    runs-on: ${{ inputs.os == 'ubuntu' && (inputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest') || format('{0}-latest', inputs.os) }}
 
     steps:
     - uses: actions/checkout@v7
@@ -67,7 +75,12 @@ jobs:
 
     - name: Patch package version
       run: |
-        VERSION="$(python -m setuptools_scm | sed 's/\.dev/-dev/'g)" # replace ".dev" with "-dev" to comply with Cargo SemVer rules
+        if [[ -n "${{ inputs.package_version }}" ]]; then
+          VERSION="${{ inputs.package_version }}"
+        else
+          # replace ".dev" with "-dev" to comply with Cargo SemVer rules
+          VERSION="$(python -m setuptools_scm | sed 's/\.dev/-dev/'g)"
+        fi
         echo "Setting package version to: $VERSION"
         tomlq -i -t ".package.version = \"$VERSION\"" Cargo.toml
         tomlq -i -t ".workspace.package.version = \"$VERSION\"" Cargo.toml

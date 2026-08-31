@@ -20,6 +20,7 @@ defaults:
 jobs:
   build:
     name: "Build Daft wheel for ${{ matrix.os }}-${{ matrix.arch }}-lts=${{ matrix.lts }}"
+    if: github.repository == 'Eventual-Inc/Daft'
     permissions:
       contents: read
     uses: ./.github/workflows/build-wheel.yml
@@ -44,6 +45,7 @@ jobs:
 
   publish:
     name: Publish wheels to PyPI
+    if: github.repository == 'Eventual-Inc/Daft'
     runs-on: ubuntu-latest
     environment:
       name: pypi

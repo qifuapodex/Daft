@@ -1,0 +1,102 @@
+name: Build and publish apodex wheels
+
+# Multi-platform wheels on GitHub-hosted runners, uploaded to a GitHub Release.
+# Does not publish to PyPI. Trigger manually from Actions, or push an `apodex-*` tag.
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: GitHub release tag to create or update
+        required: true
+        default: apodex-0.7.24
+      package_version:
+        description: Wheel version written into Cargo.toml (PEP 440 / Cargo semver)
+        required: true
+        default: "0.7.24+apodex.1"
+      run_tests:
+        description: Run dataframe tests on the Linux x86_64 wheel
+        type: boolean
+        default: false
+      use_lto:
+        description: Link-time optimization (slower build, faster binary)
+        type: boolean
+        default: true
+  push:
+    tags:
+    - apodex-*
+
+permissions: {}
+
+concurrency:
+  group: apodex-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DAFT_ANALYTICS_ENABLED: "0"
+  DAFT_PROGRESS_BAR: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: "Build Daft wheel for ${{ matrix.os }}-${{ matrix.arch }}"
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-wheel.yml
+    with:
+      os: ${{ matrix.os }}
+      arch: ${{ matrix.arch }}
+      lts: false
+      build_type: release
+      use_lto: ${{ github.event_name != 'workflow_dispatch' || inputs.use_lto }}
+      run_tests: ${{ github.event_name == 'workflow_dispatch' && inputs.run_tests }}
+      package_version: ${{ github.event_name == 'workflow_dispatch' && inputs.package_version || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, macos, windows]
+        arch: [x86_64, aarch64]
+        exclude:
+        - os: windows
+          arch: aarch64
+
+  publish:
+    name: Publish wheels to GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: wheels-*
+        merge-multiple: true
+        path: dist
+    - name: List wheels
+      run: ls -la dist
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        target_commitish: ${{ github.sha }}
+        generate_release_notes: true
+        body: |
+          Apodex Daft wheels built from `${{ github.ref_name }}` (`${{ github.sha }}`).
+
+          Not published to PyPI. Install the wheel that matches the target OS/arch:
+
+          ```bash
+          pip install --force-reinstall --find-links "https://github.com/${{ github.repository }}/releases/expanded_assets/${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}" "daft"
+          ```
+
+          Ray extra:
+
+          ```bash
+          pip install --force-reinstall --find-links "https://github.com/${{ github.repository }}/releases/expanded_assets/${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}" "daft[ray]"
+          ```
+        files: dist/*
+        fail_on_unmatched_files: true
+        make_latest: true
