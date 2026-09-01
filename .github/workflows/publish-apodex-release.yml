@@ -8,11 +8,11 @@ on:
       tag_name:
         description: GitHub release tag to create or update
         required: true
-        default: apodex-0.7.24
+        default: apodex-0.7.24.2
       package_version:
         description: Wheel version written into Cargo.toml (PEP 440 / Cargo semver)
         required: true
-        default: "0.7.24+apodex.1"
+        default: "0.7.24+apodex.2"
       run_tests:
         description: Run dataframe tests on the Linux x86_64 wheel
         type: boolean
@@ -52,7 +52,7 @@ jobs:
       build_type: release
       use_lto: ${{ github.event_name != 'workflow_dispatch' || inputs.use_lto }}
       run_tests: ${{ github.event_name == 'workflow_dispatch' && inputs.run_tests }}
-      package_version: ${{ github.event_name == 'workflow_dispatch' && inputs.package_version || '0.7.24+apodex.1' }}
+      package_version: ${{ github.event_name == 'workflow_dispatch' && inputs.package_version || '0.7.24+apodex.2' }}
     strategy:
       fail-fast: false
       matrix:
@@ -82,10 +82,10 @@ jobs:
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: apodex-0.7.24
-        name: apodex-0.7.24
+        tag_name: apodex-0.7.24.2
+        name: apodex-0.7.24.2
         target_commitish: ${{ github.sha }}
-        body_path: .github/release-notes/apodex-0.7.24.md
+        body_path: .github/release-notes/apodex-0.7.24.2.md
         files: dist/*
         fail_on_unmatched_files: true
         make_latest: true

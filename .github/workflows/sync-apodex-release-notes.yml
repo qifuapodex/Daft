@@ -1,4 +1,4 @@
-name: Sync apodex-0.7.24 release notes
+name: Sync apodex-0.7.24.2 release notes
 
 # Local gh PAT cannot write Releases; the Actions GITHUB_TOKEN can.
 # Pushing this branch creates or updates the GitHub Release body from the
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: sync-apodex-0.7.24-notes
+  group: sync-apodex-0.7.24.2-notes
   cancel-in-progress: true
 
 jobs:
@@ -24,8 +24,8 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        TAG=apodex-0.7.24
-        NOTES=.github/release-notes/apodex-0.7.24.md
+        TAG=apodex-0.7.24.2
+        NOTES=.github/release-notes/apodex-0.7.24.2.md
         if gh release view "$TAG" >/dev/null 2>&1; then
           gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES"
         else
