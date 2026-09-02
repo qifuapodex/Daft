@@ -48,7 +48,10 @@ jobs:
     # ubuntu-latest (x86), matching the official workflow. Native ARM runners
     # OOM / get shut down during release-lto of this crate.
     timeout-minutes: 360
-    runs-on: ${{ format('{0}-latest', inputs.os) }}
+    # macOS Intel uses a separate GitHub runner pool than macos-latest (M1).
+    # Requesting both wheels on macos-latest makes them compete for the same
+    # small ARM fleet and is how the last release lost both Mac jobs in queue.
+    runs-on: ${{ inputs.os == 'macos' && inputs.arch == 'x86_64' && 'macos-15-intel' || format('{0}-latest', inputs.os) }}
 
     steps:
     - uses: actions/checkout@v7
@@ -144,8 +147,7 @@ jobs:
       with:
         target: aarch64-unknown-linux-gnu
         manylinux: 2_24
-        # only produce sdist for linux x86 to avoid multiple copies
-        args: -i python${{ env.PYTHON_VERSION }} --profile ${{ inputs.use_lto && 'release-lto' || 'release' }} --out dist --sdist
+        args: -i python${{ env.PYTHON_VERSION }} --profile ${{ inputs.use_lto && 'release-lto' || 'release' }} --out dist
         before-script-linux: export JEMALLOC_SYS_WITH_LG_PAGE=16
       env:
         GITHUB_ACTIONS: true
