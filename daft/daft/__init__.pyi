@@ -2514,6 +2514,7 @@ class FlightPartitionRef:
     shuffle_id: int
     server_address: str
     partition_ref_id: int
+    attempt: int
     num_rows: int
     size_bytes: int
 
@@ -2522,6 +2523,7 @@ class FlightPartitionRef:
         shuffle_id: int,
         server_address: str,
         partition_ref_id: int,
+        attempt: int,
         num_rows: int,
         size_bytes: int,
     ): ...

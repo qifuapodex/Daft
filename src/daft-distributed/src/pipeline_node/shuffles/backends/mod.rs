@@ -19,8 +19,23 @@ mod ray;
 
 pub(crate) use flight::FlightShuffleBackendConfig;
 
+/// Mint the identity under which one shuffle's files and registrations live.
+///
+/// Random rather than derived from `(query_idx, node_id)`: those counters are
+/// local to one driver process, so two drivers sharing a cluster — or a shared
+/// filesystem — would produce the same id for their first query's first shuffle
+/// and then write into, and clean up, each other's directories. Sixty-four random
+/// bits make that collision negligible. The id is logged against the plan
+/// coordinates it stands for so a directory on disk can still be traced back.
 fn make_shuffle_id(context: &PipelineNodeContext) -> u64 {
-    ((context.query_idx as u64) << 32) | (context.node_id as u64)
+    let shuffle_id = rand::random::<u64>();
+    tracing::info!(
+        shuffle_id = shuffle_id,
+        query_idx = context.query_idx,
+        node_id = context.node_id,
+        "Assigned flight shuffle id"
+    );
+    shuffle_id
 }
 
 /// Which map-side writer a shuffle node uses.

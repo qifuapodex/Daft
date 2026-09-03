@@ -266,6 +266,8 @@ impl IntoPartitionsNode {
                 {
                     let node_id = self.node_id();
                     for builder in input_builders {
+                        // Same as the coalesce case: a one-partition concat is the
+                        // node's in-memory result, not a shuffle write.
                         let builder = builder.map_plan(self.as_ref(), |plan| {
                             local_concat_into_one_partition(plan, node_id)
                         });
