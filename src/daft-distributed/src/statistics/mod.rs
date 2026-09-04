@@ -208,6 +208,13 @@ impl StatisticsManager {
                     }
                 }
             }
+            // A retryable failure is not a finished task -- the dispatcher is about to
+            // re-enqueue it. Counting it here would decrement the operator's in-flight
+            // count without a matching increment, because retries re-enter the scheduler
+            // through `enqueue_tasks` and never emit a second `TaskEvent::Submitted`.
+            TaskEvent::Failed {
+                retryable: true, ..
+            } => {}
             TaskEvent::Completed { context, .. }
             | TaskEvent::Failed { context, .. }
             | TaskEvent::Cancelled { context } => {

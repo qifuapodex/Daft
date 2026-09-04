@@ -354,3 +354,116 @@ async fn run_pipeline_and_capture_first_n(
     let events = collector.drain();
     Ok(CapturedRun { events, stats })
 }
+
+/// Feed a hand-built task-event sequence through a real `StatisticsManager` and return
+/// the operator events it dispatched. Driving the events directly (rather than a whole
+/// pipeline) is what makes a retryable failure expressible: the local worker manager
+/// used by the other tests here never produces one.
+fn operator_events_for(
+    query_id: &str,
+    meter: &Meter,
+    feed: impl FnOnce(&crate::statistics::StatisticsManagerRef, crate::scheduling::task::TaskContext),
+) -> Vec<CapturedEvent> {
+    use crate::scheduling::task::TaskContext;
+
+    let collector = attach_event_collector(query_id);
+    let (pipeline, _) = build_in_memory_source(0, vec![make_partition(&[1, 2, 3])], meter);
+    let stats_manager =
+        StatisticsManager::from_pipeline_node(&pipeline, vec![], meter, query_id.into()).unwrap();
+
+    let context = TaskContext {
+        node_ids: vec![pipeline.node_id()],
+        last_node_id: pipeline.node_id(),
+        ..Default::default()
+    };
+    feed(&stats_manager, context);
+    collector.drain()
+}
+
+fn submitted(context: &crate::scheduling::task::TaskContext) -> crate::statistics::TaskEvent {
+    crate::statistics::TaskEvent::Submitted {
+        context: context.clone(),
+        name: "test-task".into(),
+        metadata: Default::default(),
+    }
+}
+
+fn failed(
+    context: &crate::scheduling::task::TaskContext,
+    retryable: bool,
+) -> crate::statistics::TaskEvent {
+    crate::statistics::TaskEvent::Failed {
+        context: context.clone(),
+        reason: "connection reset".to_string(),
+        worker_id: Some("worker-1".into()),
+        retryable,
+    }
+}
+
+/// A failure that is about to be retried must not end the operator.
+///
+/// The in-flight count is incremented by `TaskEvent::Submitted`, which fires once per
+/// task however many attempts it takes -- retries re-enter the scheduler through
+/// `enqueue_tasks` and emit no second `Submitted`. Counting a retryable failure as a
+/// completion therefore drops the count below the true number of live tasks, and once
+/// the node has finished producing tasks that fires `OperatorEnd` while a task is still
+/// running. `LifecyclePhase::Ended` is terminal, so the operator stays closed and the
+/// retry's own `TaskEnd` lands on an operator the dashboard has already finished.
+#[tokio::test]
+async fn retryable_failure_does_not_end_the_operator() {
+    let meter = Meter::test_scope("lifecycle_retryable_failure");
+    let events = operator_events_for(
+        "lifecycle-retryable-failure",
+        &meter,
+        |stats_manager, context| {
+            stats_manager.handle_event(submitted(&context)).unwrap();
+            stats_manager.notify_produce_complete(context.node_ids[0]);
+            stats_manager.handle_event(failed(&context, true)).unwrap();
+        },
+    );
+
+    assert_eq!(starts(&events).len(), 1);
+    assert!(
+        ends(&events).is_empty(),
+        "operator ended while its task was still going to be retried: {events:?}"
+    );
+}
+
+/// The same sequence, but the retry then succeeds: exactly one `OperatorEnd`, at the end.
+#[tokio::test]
+async fn operator_ends_once_the_retry_completes() {
+    let meter = Meter::test_scope("lifecycle_retry_then_complete");
+    let events = operator_events_for(
+        "lifecycle-retry-then-complete",
+        &meter,
+        |stats_manager, context| {
+            stats_manager.handle_event(submitted(&context)).unwrap();
+            stats_manager.notify_produce_complete(context.node_ids[0]);
+            stats_manager.handle_event(failed(&context, true)).unwrap();
+            // The retry is dispatched again and this time reaches a terminal state.
+            stats_manager.handle_event(failed(&context, false)).unwrap();
+        },
+    );
+
+    assert_eq!(starts(&events).len(), 1);
+    assert_eq!(ends(&events).len(), 1, "{events:?}");
+}
+
+/// Control: a terminal failure still ends the operator, i.e. the fix did not simply
+/// stop counting failures.
+#[tokio::test]
+async fn terminal_failure_still_ends_the_operator() {
+    let meter = Meter::test_scope("lifecycle_terminal_failure");
+    let events = operator_events_for(
+        "lifecycle-terminal-failure",
+        &meter,
+        |stats_manager, context| {
+            stats_manager.handle_event(submitted(&context)).unwrap();
+            stats_manager.notify_produce_complete(context.node_ids[0]);
+            stats_manager.handle_event(failed(&context, false)).unwrap();
+        },
+    );
+
+    assert_eq!(starts(&events).len(), 1);
+    assert_eq!(ends(&events).len(), 1, "{events:?}");
+}
