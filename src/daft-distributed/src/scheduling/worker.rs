@@ -301,3 +301,81 @@ pub(crate) mod tests {
         }
     }
 }
+
+/// What a worker manager should do about its *next* worker refresh, once any refresh that
+/// has already finished has been collected. Refreshing means asking the cluster for nodes
+/// we do not have a worker on yet; on the Ray backend that call blocks until every actor
+/// in the batch is ready, so it must not sit on the scheduler's event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshAction {
+    /// Nothing to start; keep using the workers we already have.
+    Wait,
+    /// Run it on the calling thread. Only ever the first refresh.
+    RunSynchronously,
+    /// Start it on a background thread.
+    Spawn,
+}
+
+pub(crate) fn next_refresh_action(
+    initial_refresh_done: bool,
+    is_due: bool,
+    refresh_in_flight: bool,
+) -> RefreshAction {
+    if refresh_in_flight {
+        // One at a time: a refresh creates a worker for every node it is not told to skip,
+        // so two overlapping refreshes would race to build one for the same node.
+        RefreshAction::Wait
+    } else if !initial_refresh_done {
+        RefreshAction::RunSynchronously
+    } else if is_due {
+        RefreshAction::Spawn
+    } else {
+        RefreshAction::Wait
+    }
+}
+
+#[cfg(test)]
+mod refresh_action_tests {
+    use super::{RefreshAction, next_refresh_action};
+
+    #[test]
+    fn first_refresh_runs_on_the_calling_thread() {
+        // Nothing can be dispatched until there is at least one worker, and
+        // `start_ray_workers` reports total initial startup failure by raising -- that has
+        // to reach the caller rather than land in a background thread.
+        assert_eq!(
+            next_refresh_action(false, true, false),
+            RefreshAction::RunSynchronously
+        );
+    }
+
+    #[test]
+    fn later_refreshes_never_block_the_caller() {
+        assert_eq!(next_refresh_action(true, true, false), RefreshAction::Spawn);
+    }
+
+    /// `try_autoscale` and `retire_idle_workers` clear `last_refresh` to force the next
+    /// refresh. That must not be mistaken for "we have never refreshed" and drag the
+    /// blocking path back in -- those two run during a scale-up, which is exactly when
+    /// the scheduler must not stall.
+    #[test]
+    fn forced_refresh_after_startup_stays_in_the_background() {
+        assert_eq!(next_refresh_action(true, true, false), RefreshAction::Spawn);
+        assert_ne!(
+            next_refresh_action(true, true, false),
+            RefreshAction::RunSynchronously
+        );
+    }
+
+    #[test]
+    fn only_one_refresh_runs_at_a_time() {
+        // Overlapping calls would race to create an actor for the same node.
+        assert_eq!(next_refresh_action(true, true, true), RefreshAction::Wait);
+        assert_eq!(next_refresh_action(false, true, true), RefreshAction::Wait);
+    }
+
+    #[test]
+    fn nothing_happens_when_no_refresh_is_due() {
+        assert_eq!(next_refresh_action(true, false, false), RefreshAction::Wait);
+    }
+}
