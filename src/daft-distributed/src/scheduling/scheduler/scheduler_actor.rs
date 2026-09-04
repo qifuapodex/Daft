@@ -30,7 +30,7 @@ use crate::{
 pub(crate) type SchedulerSender<T> = UnboundedSender<PendingTask<T>>;
 pub(crate) type SchedulerReceiver<T> = UnboundedReceiver<PendingTask<T>>;
 
-const SCHEDULER_LOG_TARGET: &str = "DaftFlotillaScheduler";
+pub(super) const SCHEDULER_LOG_TARGET: &str = "DaftFlotillaScheduler";
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Owned state for the scheduler event loop — one instance per plan run.
