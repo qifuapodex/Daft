@@ -739,6 +739,7 @@ pub(super) mod tests {
     #[derive(Debug, Clone)]
     pub enum MockTaskFailure {
         Error(String),
+        TransientError(String),
         Panic(String),
         WorkerDied,
         WorkerUnavailable,
@@ -890,6 +891,11 @@ pub(super) mod tests {
                         MockTaskFailure::Error(error_message) => {
                             return TaskStatus::Failed {
                                 error: DaftError::InternalError(error_message),
+                            };
+                        }
+                        MockTaskFailure::TransientError(error_message) => {
+                            return TaskStatus::Failed {
+                                error: DaftError::SocketError(error_message.into()),
                             };
                         }
                         MockTaskFailure::Panic(error_message) => {
