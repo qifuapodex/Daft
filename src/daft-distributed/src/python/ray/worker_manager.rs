@@ -12,7 +12,7 @@ use super::{task::RayTaskResultHandle, worker::RaySwordfishWorker};
 use crate::scheduling::{
     scheduler::WorkerSnapshot,
     task::{SwordfishTask, TaskContext, TaskResourceRequest},
-    worker::{Worker, WorkerId, WorkerManager},
+    worker::{RefreshAction, Worker, WorkerId, WorkerManager, next_refresh_action},
 };
 
 const REFRESH_INTERVAL_SECS: Duration = Duration::from_secs(5);
@@ -23,7 +23,12 @@ const RAY_AUTOSCALER_UPDATE_INTERVAL_ENV: &str = "AUTOSCALER_UPDATE_INTERVAL_S";
 
 struct RayWorkerManagerState {
     ray_workers: HashMap<WorkerId, RaySwordfishWorker>,
+    /// When the last refresh *completed*. `None` means "refresh at the next opportunity",
+    /// which is how `try_autoscale` and `retire_idle_workers` force one.
     last_refresh: Option<Instant>,
+    /// Whether any refresh has ever completed. Distinct from `last_refresh`, which gets
+    /// reset to `None` to force refreshes long after startup.
+    initial_refresh_done: bool,
     max_resources_requested: ResourceRequest,
     pending_release_blacklist: HashMap<WorkerId, Instant>,
     last_autoscale_request_time: Option<Instant>,
@@ -32,17 +37,18 @@ struct RayWorkerManagerState {
 }
 
 impl RayWorkerManagerState {
-    fn refresh_workers(&mut self) -> DaftResult<()> {
-        let should_refresh = match self.last_refresh {
-            None => true,
-            Some(last_time) => last_time.elapsed() > REFRESH_INTERVAL_SECS,
-        };
+    /// Whether enough time has passed since the last completed refresh. `last_refresh` is
+    /// also cleared by `try_autoscale` and `retire_idle_workers` to force the next refresh
+    /// to happen immediately.
+    fn refresh_is_due(&self) -> bool {
+        self.last_refresh
+            .is_none_or(|last_time| last_time.elapsed() > REFRESH_INTERVAL_SECS)
+    }
 
-        if !should_refresh {
-            return Ok(());
-        }
-
-        // Exclude pending-release workers for a grace TTL to prevent immediate respawn.
+    /// Node ids `start_ray_workers` should not build an actor for: ones we already have,
+    /// plus ones held back by the pending-release grace TTL so a just-retired node is not
+    /// immediately respawned.
+    fn nodes_to_skip(&mut self) -> Vec<String> {
         let ttl_secs: u64 = std::env::var("DAFT_AUTOSCALING_PENDING_RELEASE_EXCLUDE_SECONDS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -50,72 +56,54 @@ impl RayWorkerManagerState {
         self.pending_release_blacklist
             .retain(|_, ts| ts.elapsed() < Duration::from_secs(ttl_secs));
 
-        let started = Instant::now();
-        let ray_workers = Python::attach(|py| {
-            let flotilla_module = py.import(pyo3::intern!(py, "daft.runners.flotilla"))?;
-
-            let mut existing_worker_ids = self
-                .ray_workers
+        let mut ids = self
+            .ray_workers
+            .keys()
+            .map(|id| id.as_ref().to_string())
+            .collect::<Vec<_>>();
+        ids.extend(
+            self.pending_release_blacklist
                 .keys()
-                .map(|id| id.as_ref().to_string())
-                .collect::<Vec<_>>();
-            existing_worker_ids.extend(
-                self.pending_release_blacklist
-                    .keys()
-                    .map(|id| id.as_ref().to_string()),
-            );
+                .map(|id| id.as_ref().to_string()),
+        );
+        ids
+    }
 
-            let ray_workers = flotilla_module
-                .call_method1(
-                    pyo3::intern!(py, "start_ray_workers"),
-                    (existing_worker_ids, self.worker_startup_timeout),
-                )?
-                .extract::<Vec<RaySwordfishWorker>>()?;
-
-            DaftResult::Ok(ray_workers)
-        })?;
-
-        // `start_ray_workers` is called synchronously from the scheduler's event loop, and
-        // when it finds a new node it blocks on `ray.wait` until every actor in that batch
-        // is ready. Nothing is dispatched and no results are collected while it does, so
-        // this is the number to look at if the loop appears to stall during a scale-up.
-        // It is ~0 when no node joined (the Python side short-circuits).
-        let elapsed = started.elapsed();
-        let num_started = ray_workers.len();
-        if num_started > 0 {
-            tracing::info!(
-                target: "ray_worker_manager",
-                num_started,
-                elapsed_ms = elapsed.as_millis(),
-                "Started new Ray workers (scheduler loop was blocked for this long)"
-            );
-        } else {
-            tracing::debug!(
-                target: "ray_worker_manager",
-                elapsed_ms = elapsed.as_millis(),
-                "Worker refresh found no new nodes"
-            );
-        }
-
-        for worker in ray_workers {
+    fn install_refresh(&mut self, workers: Vec<RaySwordfishWorker>) {
+        for worker in workers {
             self.ray_workers.insert(worker.id().clone(), worker);
         }
         self.last_refresh = Some(Instant::now());
-        DaftResult::Ok(())
+        self.initial_refresh_done = true;
     }
+}
+
+/// One completed call to `start_ray_workers`.
+struct RefreshOutcome {
+    workers: Vec<RaySwordfishWorker>,
+    elapsed: Duration,
+}
+
+/// Tracks the refresh currently running off the scheduler thread, if any.
+#[derive(Default)]
+struct BackgroundRefresh {
+    pending: Option<std::sync::mpsc::Receiver<DaftResult<RefreshOutcome>>>,
 }
 
 // Wrapper around the RaySwordfishWorkerManager class in the distributed_swordfish module.
 pub(crate) struct RayWorkerManager {
     state: Arc<Mutex<RayWorkerManagerState>>,
+    refresh: Mutex<BackgroundRefresh>,
 }
 
 impl RayWorkerManager {
     pub fn new(worker_startup_timeout: usize) -> Self {
         Self {
+            refresh: Mutex::new(BackgroundRefresh::default()),
             state: Arc::new(Mutex::new(RayWorkerManagerState {
                 ray_workers: HashMap::new(),
                 last_refresh: None,
+                initial_refresh_done: false,
                 max_resources_requested: ResourceRequest::default(),
                 pending_release_blacklist: HashMap::new(),
                 last_autoscale_request_time: None,
@@ -128,6 +116,138 @@ impl RayWorkerManager {
                 worker_startup_timeout,
             })),
         }
+    }
+
+    /// Run one refresh. Deliberately does **not** hold the state lock across the call into
+    /// Python: `submit_tasks_to_workers`, `mark_task_finished` and `mark_worker_died` all
+    /// take that same lock from the scheduler thread, so holding it here would just move
+    /// the stall from the event loop onto the mutex.
+    fn run_refresh(state: &Arc<Mutex<RayWorkerManagerState>>) -> DaftResult<RefreshOutcome> {
+        let (nodes_to_skip, worker_startup_timeout) = {
+            let mut state = state.lock().expect("Failed to lock RayWorkerManagerState");
+            (state.nodes_to_skip(), state.worker_startup_timeout)
+        };
+
+        let started = Instant::now();
+        let workers = Python::attach(|py| {
+            let flotilla_module = py.import(pyo3::intern!(py, "daft.runners.flotilla"))?;
+            DaftResult::Ok(
+                flotilla_module
+                    .call_method1(
+                        pyo3::intern!(py, "start_ray_workers"),
+                        (nodes_to_skip, worker_startup_timeout),
+                    )?
+                    .extract::<Vec<RaySwordfishWorker>>()?,
+            )
+        })?;
+
+        DaftResult::Ok(RefreshOutcome {
+            workers,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    fn install_refresh(&self, outcome: RefreshOutcome, blocked_loop: bool) {
+        let num_started = outcome.workers.len();
+        if num_started > 0 {
+            // `elapsed_ms` is how long `start_ray_workers` spent inside `ray.wait`, which
+            // waits for *every* actor in the batch to report its address. Divided by
+            // `num_started` it exposes the head-of-line blocking this refresh is subject
+            // to: if the per-worker figure climbs with batch size, one slow actor is
+            // holding up the ready ones and the submit/harvest split is worth doing.
+            tracing::info!(
+                target: "ray_worker_manager",
+                num_started,
+                elapsed_ms = outcome.elapsed.as_millis(),
+                elapsed_ms_per_worker = outcome.elapsed.as_millis() / num_started as u128,
+                blocked_loop,
+                "Started new Ray workers"
+            );
+        } else {
+            tracing::debug!(
+                target: "ray_worker_manager",
+                elapsed_ms = outcome.elapsed.as_millis(),
+                blocked_loop,
+                "Worker refresh found no new nodes"
+            );
+        }
+
+        self.state
+            .lock()
+            .expect("Failed to lock RayWorkerManagerState")
+            .install_refresh(outcome.workers);
+    }
+
+    /// Collect a finished background refresh and start the next one when due.
+    ///
+    /// Never blocks on `start_ray_workers` after the first call. That matters because the
+    /// Python side blocks on `ray.wait` until every actor in a newly-joined batch is ready,
+    /// and this runs at the top of the scheduler's event loop -- for the duration of that
+    /// wait nothing is dispatched, no task results are collected, and no autoscaling
+    /// request is sent, which is exactly the window during a scale-up when the scheduler
+    /// has the most work to do.
+    fn drive_refresh(&self) -> DaftResult<()> {
+        let mut refresh = self
+            .refresh
+            .lock()
+            .expect("Failed to lock BackgroundRefresh");
+
+        if let Some(rx) = refresh.pending.as_ref() {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    refresh.pending = None;
+                    self.install_refresh(outcome?, false);
+                }
+                // Still running; leave it be.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // The thread died without sending (it panicked). Drop it and retry below.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    refresh.pending = None;
+                    tracing::warn!(
+                        target: "ray_worker_manager",
+                        "Background worker refresh thread died; retrying on the next tick"
+                    );
+                }
+            }
+        }
+
+        let (initial_refresh_done, is_due) = {
+            let state = self
+                .state
+                .lock()
+                .expect("Failed to lock RayWorkerManagerState");
+            (state.initial_refresh_done, state.refresh_is_due())
+        };
+
+        match next_refresh_action(initial_refresh_done, is_due, refresh.pending.is_some()) {
+            RefreshAction::Wait => {}
+            // The very first refresh stays synchronous: the scheduler has no workers to
+            // dispatch to until it completes, and `start_ray_workers` raises when no worker
+            // at all comes up on initial startup -- an error that has to reach the caller
+            // rather than surface a tick later against an empty cluster.
+            RefreshAction::RunSynchronously => {
+                let outcome = Self::run_refresh(&self.state)?;
+                self.install_refresh(outcome, true);
+            }
+            RefreshAction::Spawn => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let state = self.state.clone();
+                std::thread::Builder::new()
+                    .name("daft-flotilla-worker-refresh".to_string())
+                    .spawn(move || {
+                        // A send failure just means the manager went away; nothing to do.
+                        let _ = tx.send(Self::run_refresh(&state));
+                    })
+                    .map_err(|e| {
+                        DaftError::InternalError(format!(
+                            "Failed to spawn worker refresh thread: {e}"
+                        ))
+                    })?;
+                refresh.pending = Some(rx);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -164,14 +284,13 @@ impl WorkerManager for RayWorkerManager {
     }
 
     fn worker_snapshots(&self) -> DaftResult<Vec<WorkerSnapshot>> {
-        let mut state = self
+        // Kicks off / collects the refresh; only blocks on the very first call.
+        self.drive_refresh()?;
+
+        let state = self
             .state
             .lock()
             .expect("Failed to lock RayWorkerManagerState");
-
-        // Refresh workers if needed (internally rate-limited)
-        state.refresh_workers()?;
-
         Ok(state
             .ray_workers
             .values()
