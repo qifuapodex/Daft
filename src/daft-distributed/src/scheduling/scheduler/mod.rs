@@ -34,6 +34,13 @@ pub(super) trait Scheduler<T: Task>: Send + Sync {
     fn num_pending_tasks(&self) -> usize;
 }
 
+/// Why a `WorkerAffinity` target could not take the task. The two cases get different
+/// treatment: a busy target is worth waiting for, a missing one never comes back.
+enum AffinityTarget {
+    Busy,
+    Missing,
+}
+
 fn pending_tasks_in_priority_order<T: Task>(
     pending_tasks: &BinaryHeap<PendingTask<T>>,
 ) -> Vec<&PendingTask<T>> {
@@ -57,6 +64,10 @@ pub(crate) struct PendingTask<T: Task> {
     /// dispatch until this instant, so a retry storm does not hammer a failing
     /// dependency at the scheduler's tick rate.
     not_before: Option<Instant>,
+    /// Set on a retry: the worker the previous attempt failed on. Spread scheduling
+    /// prefers any other worker, so a node with a local problem (a bad NIC, a stale DNS
+    /// cache) does not get handed the same task again and again.
+    avoid_worker: Option<WorkerId>,
 }
 
 impl<T: Task> PendingTask<T> {
@@ -71,18 +82,21 @@ impl<T: Task> PendingTask<T> {
             cancel_token,
             attempts: 0,
             not_before: None,
+            avoid_worker: None,
         }
     }
 
     /// Rebuild a task that failed and is being given another attempt. `attempts` is the
-    /// number of attempts already made (i.e. including the one that just failed), and the
-    /// task will not be dispatched again until `backoff` has elapsed.
+    /// number of attempts already made (i.e. including the one that just failed), the task
+    /// will not be dispatched again until `backoff` has elapsed, and `failed_on` is the
+    /// worker to steer away from when the task is next placed.
     pub fn retry(
         task: T,
         result_tx: OneshotSender<DaftResult<Option<MaterializedOutput>>>,
         cancel_token: CancellationToken,
         attempts: u32,
         backoff: Duration,
+        failed_on: WorkerId,
     ) -> Self {
         Self {
             task,
@@ -90,6 +104,7 @@ impl<T: Task> PendingTask<T> {
             cancel_token,
             attempts,
             not_before: Some(Instant::now() + backoff),
+            avoid_worker: Some(failed_on),
         }
     }
 
@@ -100,6 +115,11 @@ impl<T: Task> PendingTask<T> {
     /// Whether this task's retry backoff (if any) has elapsed.
     pub fn is_ready(&self, now: Instant) -> bool {
         self.not_before.is_none_or(|not_before| now >= not_before)
+    }
+
+    /// The worker the previous attempt failed on, if this is a retry.
+    pub fn avoid_worker(&self) -> Option<&WorkerId> {
+        self.avoid_worker.as_ref()
     }
 
     pub fn strategy(&self) -> &SchedulingStrategy {
@@ -357,6 +377,26 @@ pub(super) mod test_utils {
             mock_task,
             tokio::sync::oneshot::channel().0,
             tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    /// A spread task shaped like a retry: it already failed once on `failed_on`, so the
+    /// scheduler should steer it elsewhere.
+    pub fn create_retry_spread_task(
+        id: Option<TaskID>,
+        failed_on: &WorkerId,
+    ) -> PendingTask<MockTask> {
+        let task = MockTaskBuilder::default()
+            .with_scheduling_strategy(SchedulingStrategy::Spread)
+            .with_task_id(id.unwrap_or_default())
+            .build();
+        PendingTask::retry(
+            task,
+            tokio::sync::oneshot::channel().0,
+            tokio_util::sync::CancellationToken::new(),
+            1,
+            std::time::Duration::ZERO,
+            failed_on.clone(),
         )
     }
 

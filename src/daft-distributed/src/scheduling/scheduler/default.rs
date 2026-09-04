@@ -1,10 +1,11 @@
 use std::{
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     time::Instant,
 };
 
 use super::{
-    PendingTask, ScheduledTask, Scheduler, WorkerSnapshot, scheduler_actor::SCHEDULER_LOG_TARGET,
+    AffinityTarget, PendingTask, ScheduledTask, Scheduler, WorkerSnapshot,
+    scheduler_actor::SCHEDULER_LOG_TARGET,
 };
 use crate::scheduling::{
     task::{SchedulingStrategy, Task, TaskDetails, TaskResourceRequest},
@@ -15,6 +16,9 @@ pub(super) struct DefaultScheduler<T: Task> {
     pending_tasks: BinaryHeap<PendingTask<T>>,
     worker_snapshots: HashMap<WorkerId, WorkerSnapshot>,
     autoscaling_threshold: f64,
+    /// Affinity targets already warned about, so the missing-target warning is emitted
+    /// once per worker rather than once per pending task per tick.
+    warned_missing_affinity_targets: HashSet<WorkerId>,
 }
 
 impl<T: Task> Default for DefaultScheduler<T> {
@@ -39,6 +43,7 @@ impl<T: Task> DefaultScheduler<T> {
             pending_tasks: BinaryHeap::new(),
             worker_snapshots: HashMap::new(),
             autoscaling_threshold,
+            warned_missing_affinity_targets: HashSet::new(),
         }
     }
 
@@ -50,10 +55,19 @@ impl<T: Task> DefaultScheduler<T> {
 
     // Spread scheduling: Schedule tasks to the worker with the most available slots, to
     // TODO: Change the approach to instead spread based on tasks of the same 'type', i.e. from the same pipeline node.
-    fn try_schedule_spread_task(&self, task: &T) -> Option<WorkerId> {
+    fn try_schedule_spread_task(&self, task: &T, avoid: Option<&WorkerId>) -> Option<WorkerId> {
+        // `avoid` is a preference, not a constraint: if the worker a retry just failed on
+        // is the only one with room, placing the task there beats leaving it pending.
+        self.best_spread_candidate(task, avoid)
+            .or_else(|| self.best_spread_candidate(task, None))
+    }
+
+    fn best_spread_candidate(&self, task: &T, avoid: Option<&WorkerId>) -> Option<WorkerId> {
         self.worker_snapshots
             .iter()
-            .filter(|(_, worker)| worker.can_schedule_task(task))
+            .filter(|(_, worker)| {
+                worker.can_schedule_task(task) && avoid != Some(&worker.worker_id)
+            })
             .max_by_key(|(_, worker)| {
                 (worker.available_num_cpus() + worker.available_num_gpus()) as usize
             })
@@ -63,42 +77,54 @@ impl<T: Task> DefaultScheduler<T> {
     // Soft worker affinity scheduling: Schedule task to the worker if it has capacity
     // Otherwise, fallback to spread scheduling
     fn try_schedule_worker_affinity_task(
-        &self,
-        task: &T,
+        &mut self,
+        task: &PendingTask<T>,
         worker_id: &WorkerId,
         soft: bool,
     ) -> Option<WorkerId> {
-        match self.worker_snapshots.get(worker_id) {
-            Some(worker) if worker.can_schedule_task(task) => {
-                // Target worker exists and has capacity
-                Some(worker.worker_id.clone())
+        // Resolve the target before touching `self` mutably below.
+        let target = match self.worker_snapshots.get(worker_id) {
+            // Target worker exists and has capacity
+            Some(worker) if worker.can_schedule_task(&task.task) => {
+                return Some(worker.worker_id.clone());
             }
-            Some(_) => {
-                // Target worker exists but is busy: soft affinity falls back, hard affinity waits
-                if soft {
-                    self.try_schedule_spread_task(task)
-                } else {
-                    None
+            // Target worker exists but is busy: soft affinity falls back, hard affinity waits
+            Some(_) => AffinityTarget::Busy,
+            // Target worker is missing from the snapshots
+            None => AffinityTarget::Missing,
+        };
+
+        match target {
+            AffinityTarget::Busy if !soft => None,
+            AffinityTarget::Busy => self.try_schedule_spread_task(&task.task, task.avoid_worker()),
+            AffinityTarget::Missing => {
+                // Fall back to spread regardless of the soft flag: the worker most likely
+                // died, and holding out for it would deadlock the task. Warn once per
+                // target -- this runs for every pending task on every tick, so an
+                // unconditional log here is thousands of lines a second under backlog.
+                if self
+                    .warned_missing_affinity_targets
+                    .insert(worker_id.clone())
+                {
+                    tracing::warn!(
+                        target: SCHEDULER_LOG_TARGET,
+                        worker_id = %worker_id,
+                        "Affinity target missing from worker snapshots; falling back to spread scheduling"
+                    );
                 }
-            }
-            None => {
-                // Target worker missing from snapshots: fall back to spread regardless of soft flag
-                // (worker likely died; keeping hard affinity would deadlock the task)
-                tracing::warn!(
-                    target: SCHEDULER_LOG_TARGET,
-                    worker_id = %worker_id,
-                    "Affinity target missing from worker snapshots; falling back to spread scheduling"
-                );
-                self.try_schedule_spread_task(task)
+                self.try_schedule_spread_task(&task.task, task.avoid_worker())
             }
         }
     }
 
-    fn try_schedule_task(&self, task: &PendingTask<T>) -> Option<WorkerId> {
+    fn try_schedule_task(&mut self, task: &PendingTask<T>) -> Option<WorkerId> {
         match task.strategy() {
-            SchedulingStrategy::Spread => self.try_schedule_spread_task(&task.task),
+            SchedulingStrategy::Spread => {
+                self.try_schedule_spread_task(&task.task, task.avoid_worker())
+            }
             SchedulingStrategy::WorkerAffinity { worker_id, soft } => {
-                self.try_schedule_worker_affinity_task(&task.task, worker_id, *soft)
+                let (worker_id, soft) = (worker_id.clone(), *soft);
+                self.try_schedule_worker_affinity_task(task, &worker_id, soft)
             }
         }
     }
@@ -171,6 +197,11 @@ impl<T: Task> Scheduler<T> for DefaultScheduler<T> {
             .iter()
             .map(|snapshot| (snapshot.worker_id.clone(), snapshot.clone()))
             .collect();
+        // A worker whose actor was rebuilt on the same node reappears under the same id;
+        // drop it from the warned set so a genuine later loss is reported again.
+        let present = &self.worker_snapshots;
+        self.warned_missing_affinity_targets
+            .retain(|worker_id| !present.contains_key(worker_id));
     }
 
     fn num_pending_tasks(&self) -> usize {
@@ -198,8 +229,8 @@ mod tests {
     use super::*;
     use crate::scheduling::{
         scheduler::test_utils::{
-            create_schedulable_task, create_spread_task, create_worker_affinity_task,
-            setup_scheduler, setup_workers,
+            create_retry_spread_task, create_schedulable_task, create_spread_task,
+            create_worker_affinity_task, setup_scheduler, setup_workers,
         },
         tests::{MockTask, MockTaskBuilder},
         worker::tests::MockWorker,
@@ -833,5 +864,75 @@ mod tests {
         let (scheduled, _) = scheduler.schedule_tasks();
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].worker_id, worker_1);
+    }
+
+    #[test]
+    fn test_retry_avoids_the_worker_it_failed_on() {
+        // worker1 has the most free capacity, so spread would normally pick it. A retry
+        // that already failed there should go elsewhere instead.
+        let worker_1: WorkerId = Arc::from("worker1");
+        let worker_2: WorkerId = Arc::from("worker2");
+
+        let workers = setup_workers(&[(worker_1.clone(), 8), (worker_2.clone(), 4)]);
+        let mut scheduler: DefaultScheduler<MockTask> = setup_scheduler(&workers);
+
+        scheduler.enqueue_tasks(vec![create_spread_task(Some(1))]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled[0].worker_id, worker_1);
+
+        scheduler.update_worker_state(
+            &setup_workers(&[(worker_1.clone(), 8), (worker_2.clone(), 4)])
+                .values()
+                .map(WorkerSnapshot::from)
+                .collect::<Vec<_>>(),
+        );
+        scheduler.enqueue_tasks(vec![create_retry_spread_task(Some(2), &worker_1)]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_2);
+    }
+
+    #[test]
+    fn test_retry_uses_failed_worker_when_it_is_the_only_option() {
+        // Avoiding the previous worker is a preference: with nowhere else to go, the task
+        // must still be scheduled rather than left pending forever.
+        let worker_1: WorkerId = Arc::from("worker1");
+
+        let workers = setup_workers(&[(worker_1.clone(), 4)]);
+        let mut scheduler: DefaultScheduler<MockTask> = setup_scheduler(&workers);
+
+        scheduler.enqueue_tasks(vec![create_retry_spread_task(Some(1), &worker_1)]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_1);
+    }
+
+    #[test]
+    fn test_missing_affinity_target_warns_once_until_the_worker_returns() {
+        let worker_1: WorkerId = Arc::from("worker1");
+        let missing_worker: WorkerId = Arc::from("worker999");
+
+        let workers = setup_workers(&[(worker_1.clone(), 4)]);
+        let mut scheduler: DefaultScheduler<MockTask> = setup_scheduler(&workers);
+
+        for id in 1..=3 {
+            scheduler.enqueue_tasks(vec![create_worker_affinity_task(
+                &missing_worker,
+                false,
+                Some(id),
+            )]);
+            scheduler.schedule_tasks();
+        }
+        assert_eq!(scheduler.warned_missing_affinity_targets.len(), 1);
+
+        // The worker comes back (an actor rebuilt on the same node keeps its id), so a
+        // later disappearance is worth reporting again.
+        scheduler.update_worker_state(
+            &setup_workers(&[(worker_1, 4), (missing_worker.clone(), 4)])
+                .values()
+                .map(WorkerSnapshot::from)
+                .collect::<Vec<_>>(),
+        );
+        assert!(scheduler.warned_missing_affinity_targets.is_empty());
     }
 }
