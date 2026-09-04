@@ -1,4 +1,7 @@
-use std::collections::{BinaryHeap, HashMap};
+use std::{
+    collections::{BinaryHeap, HashMap},
+    time::Instant,
+};
 
 use super::{
     PendingTask, ScheduledTask, Scheduler, WorkerSnapshot, scheduler_actor::SCHEDULER_LOG_TARGET,
@@ -122,9 +125,15 @@ impl<T: Task> Scheduler<T> for LinearScheduler<T> {
         let mut cancelled = Vec::new();
 
         // Process all tasks in the queue
+        let now = Instant::now();
         while let Some(task) = self.pending_tasks.pop() {
             if task.is_cancelled() {
                 cancelled.push(task);
+                continue;
+            }
+            // A retry that is still backing off stays queued but is not dispatchable yet.
+            if !task.is_ready(now) {
+                unscheduled.push(task);
                 continue;
             }
             if let Some(worker_id) = self.try_schedule_task(&task) {

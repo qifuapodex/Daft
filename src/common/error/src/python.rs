@@ -4,6 +4,7 @@ use crate::{DaftError, format::format_error_for_user};
 
 import_exception!(daft.exceptions, DaftCoreException);
 import_exception!(daft.exceptions, DaftTypeError);
+import_exception!(daft.exceptions, DaftTransientError);
 import_exception!(daft.exceptions, ConnectTimeoutError);
 import_exception!(daft.exceptions, ReadTimeoutError);
 import_exception!(daft.exceptions, ByteStreamError);

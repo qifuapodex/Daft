@@ -1,6 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 use common_runtime::{JoinSet, JoinSetId};
 
 use super::{
@@ -15,6 +15,52 @@ use crate::{
 
 const DISPATCHER_LOG_TARGET: &str = "DaftFlotillaDispatcher";
 
+/// Retry budget for a task that failed with a transient error (network blips, timeouts,
+/// throttling). Deliberately small: the task is re-run as-is, so a dependency that is
+/// genuinely down should surface as a query failure quickly rather than after minutes of
+/// retrying.
+const DEFAULT_MAX_TRANSIENT_RETRIES: u32 = 3;
+const MAX_TRANSIENT_RETRIES_ENV: &str = "DAFT_FLOTILLA_TASK_MAX_TRANSIENT_RETRIES";
+
+/// Retry budget for a task whose *worker* went away. Larger than the transient budget
+/// because losing a node is not the task's fault and is expected during downscaling --
+/// but still bounded: a task that reliably OOMs its actor would otherwise loop forever,
+/// and every `WorkerDied` also removes a node from the cluster via `mark_worker_died`.
+const DEFAULT_MAX_INFRA_RETRIES: u32 = 10;
+const MAX_INFRA_RETRIES_ENV: &str = "DAFT_FLOTILLA_TASK_MAX_INFRA_RETRIES";
+
+/// Ceiling on the exponential backoff between attempts.
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+fn retry_limit_from_env(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|val| val.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// Backoff before the next attempt, given how many attempts have already been made.
+/// Without this a retry is redispatched on the very next scheduler tick, which for a
+/// throttled or briefly unreachable dependency just burns the whole budget in a few
+/// seconds. Doubles from 1s and is capped at [`MAX_RETRY_BACKOFF`].
+fn retry_backoff(attempts_made: u32) -> Duration {
+    Duration::from_secs(1u64 << attempts_made.min(6)).min(MAX_RETRY_BACKOFF)
+}
+
+/// What the dispatcher will do with a task that just came back from a worker.
+///
+/// This has to be decided *before* the statistics event is emitted: the event carries a
+/// `retryable` flag that suppresses the terminal `TaskEnd`, so emitting it first would
+/// report an attempt that is about to be repeated as a terminal failure and leave the
+/// task with two `TaskEnd` events.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskDisposition {
+    /// Re-enqueue for another attempt.
+    Retry,
+    /// Give up and report the outcome upstream.
+    Terminal,
+}
+
 pub(super) struct Dispatcher<W: Worker> {
     // JoinSet of task results futures
     task_result_joinset: JoinSet<TaskStatus>,
@@ -22,6 +68,8 @@ pub(super) struct Dispatcher<W: Worker> {
     // The scheduled task is kept here so that we can reschedule the task if it fails
     joinset_id_to_task: HashMap<JoinSetId, ScheduledTask<W::Task>>,
     statistics_manager: StatisticsManagerRef,
+    max_transient_retries: u32,
+    max_infra_retries: u32,
 }
 
 impl<W: Worker> Dispatcher<W> {
@@ -30,6 +78,27 @@ impl<W: Worker> Dispatcher<W> {
             task_result_joinset: JoinSet::new(),
             joinset_id_to_task: HashMap::new(),
             statistics_manager,
+            max_transient_retries: retry_limit_from_env(
+                MAX_TRANSIENT_RETRIES_ENV,
+                DEFAULT_MAX_TRANSIENT_RETRIES,
+            ),
+            max_infra_retries: retry_limit_from_env(
+                MAX_INFRA_RETRIES_ENV,
+                DEFAULT_MAX_INFRA_RETRIES,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_retry_limits(
+        statistics_manager: StatisticsManagerRef,
+        max_transient_retries: u32,
+        max_infra_retries: u32,
+    ) -> Self {
+        Self {
+            max_transient_retries,
+            max_infra_retries,
+            ..Self::new(statistics_manager)
         }
     }
 
@@ -100,12 +169,36 @@ impl<W: Worker> Dispatcher<W> {
 
             // Process all completed tasks
             for CompletedTask { task_result, task } in task_results {
-                let (worker_id, task, result_tx, canc) = task.into_inner();
+                let (worker_id, task, result_tx, canc, attempts) = task.into_inner();
 
                 // Always mark the task as finished regardless of the result
                 worker_manager.mark_task_finished(task.task_context(), worker_id.clone());
+
+                // Decide the disposition before emitting the event, so the event's
+                // `retryable` flag matches what actually happens to the task.
+                // `attempts` counts failures *before* this one, so the run that just
+                // finished is attempt number `attempts + 1`.
+                let disposition = match &task_result {
+                    Ok(TaskStatus::Failed { error })
+                        if error.is_transient() && attempts < self.max_transient_retries =>
+                    {
+                        TaskDisposition::Retry
+                    }
+                    Ok(TaskStatus::WorkerDied | TaskStatus::WorkerUnavailable)
+                        if attempts < self.max_infra_retries =>
+                    {
+                        TaskDisposition::Retry
+                    }
+                    _ => TaskDisposition::Terminal,
+                };
+
                 // Send the event to the statistics manager
-                let event = TaskEvent::new(task.task_context(), &task_result, worker_id.clone());
+                let event = TaskEvent::new(
+                    task.task_context(),
+                    &task_result,
+                    worker_id.clone(),
+                    disposition == TaskDisposition::Retry,
+                );
                 self.statistics_manager.handle_event(event)?;
 
                 match task_result {
@@ -116,24 +209,98 @@ impl<W: Worker> Dispatcher<W> {
                                 tracing::error!(target: DISPATCHER_LOG_TARGET, error = "Failed to send result of task to result_tx", task_context = ?task.task_context());
                             }
                         }
-                        // Task failed, send the error to the result_tx
-                        TaskStatus::Failed { error } => {
-                            if result_tx.send(Err(error)).is_err() {
-                                tracing::error!(target: DISPATCHER_LOG_TARGET, error = "Failed to send error of task to result_tx", task_context = ?task.task_context());
+                        // Task failed. Transient errors get another attempt; everything
+                        // else goes straight upstream and fails the query.
+                        TaskStatus::Failed { error } => match disposition {
+                            TaskDisposition::Retry => {
+                                let backoff = retry_backoff(attempts);
+                                tracing::warn!(
+                                    target: DISPATCHER_LOG_TARGET,
+                                    attempt = attempts + 1,
+                                    max_attempts = self.max_transient_retries + 1,
+                                    backoff_secs = backoff.as_secs(),
+                                    error = %error,
+                                    task_context = ?task.task_context(),
+                                    "Task failed with a transient error, retrying"
+                                );
+                                failed_tasks.push(PendingTask::retry(
+                                    task,
+                                    result_tx,
+                                    canc,
+                                    attempts + 1,
+                                    backoff,
+                                ));
                             }
-                        }
+                            TaskDisposition::Terminal => {
+                                if attempts > 0 {
+                                    // Forward the original error rather than wrapping it:
+                                    // the underlying cause is what the user needs, and the
+                                    // attempt count is only useful in the logs.
+                                    tracing::error!(
+                                        target: DISPATCHER_LOG_TARGET,
+                                        attempts = attempts + 1,
+                                        error = %error,
+                                        task_context = ?task.task_context(),
+                                        "Task still failing after exhausting its transient retry budget"
+                                    );
+                                }
+                                if result_tx.send(Err(error)).is_err() {
+                                    tracing::error!(target: DISPATCHER_LOG_TARGET, error = "Failed to send error of task to result_tx", task_context = ?task.task_context());
+                                }
+                            }
+                        },
                         // Task cancelled, do nothing
                         TaskStatus::Cancelled => {}
-                        // Task worker died, add the task to the failed tasks, and mark the worker as dead
-                        TaskStatus::WorkerDied => {
-                            worker_manager.mark_worker_died(worker_id);
-                            let schedulable_task = PendingTask::new(task, result_tx, canc);
-                            failed_tasks.push(schedulable_task);
-                        }
-                        // Task worker unavailable, add the task to the failed tasks
-                        TaskStatus::WorkerUnavailable => {
-                            let schedulable_task = PendingTask::new(task, result_tx, canc);
-                            failed_tasks.push(schedulable_task);
+                        // The task's worker went away. Retry it on another worker, but
+                        // only up to `max_infra_retries`: a task that keeps killing its
+                        // actor would otherwise loop forever, and each `WorkerDied` also
+                        // drops a node from the cluster.
+                        status @ (TaskStatus::WorkerDied | TaskStatus::WorkerUnavailable) => {
+                            let worker_died = matches!(status, TaskStatus::WorkerDied);
+                            if worker_died {
+                                worker_manager.mark_worker_died(worker_id);
+                            }
+                            match disposition {
+                                TaskDisposition::Retry => {
+                                    let backoff = retry_backoff(attempts);
+                                    tracing::warn!(
+                                        target: DISPATCHER_LOG_TARGET,
+                                        attempt = attempts + 1,
+                                        max_attempts = self.max_infra_retries + 1,
+                                        backoff_secs = backoff.as_secs(),
+                                        worker_died,
+                                        task_context = ?task.task_context(),
+                                        "Task lost its worker, retrying"
+                                    );
+                                    failed_tasks.push(PendingTask::retry(
+                                        task,
+                                        result_tx,
+                                        canc,
+                                        attempts + 1,
+                                        backoff,
+                                    ));
+                                }
+                                TaskDisposition::Terminal => {
+                                    let error = DaftError::InternalError(format!(
+                                        "Task {:?} lost its worker on all {} attempts; giving up. \
+                                         This usually means the task itself is killing the worker \
+                                         (e.g. running it out of memory). Set {} to allow more attempts.",
+                                        task.task_context(),
+                                        attempts + 1,
+                                        MAX_INFRA_RETRIES_ENV,
+                                    ));
+                                    tracing::error!(
+                                        target: DISPATCHER_LOG_TARGET,
+                                        attempts = attempts + 1,
+                                        worker_died,
+                                        task_context = ?task.task_context(),
+                                        "Task exhausted its worker-loss retry budget"
+                                    );
+                                    if result_tx.send(Err(error)).is_err() {
+                                        tracing::error!(target: DISPATCHER_LOG_TARGET, error = "Failed to send error of task to result_tx", task_context = ?task.task_context());
+                                    }
+                                }
+                            }
                         }
                     },
                     // Task failed because of panic in joinset, send the error to the result_tx
@@ -178,6 +345,8 @@ impl<T: Task> std::fmt::Debug for CompletedTask<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
     use super::*;
@@ -202,13 +371,48 @@ mod tests {
         Dispatcher<MockWorker>,
         Arc<dyn WorkerManager<Worker = MockWorker>>,
     ) {
+        setup_dispatcher_test_context_with_retry_limits(
+            worker_configs,
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            DEFAULT_MAX_INFRA_RETRIES,
+        )
+    }
+
+    /// Retry limits are injected rather than read from the environment: they are
+    /// process-global there, and these tests run in parallel in one process.
+    fn setup_dispatcher_test_context_with_retry_limits(
+        worker_configs: &[(WorkerId, usize)],
+        max_transient_retries: u32,
+        max_infra_retries: u32,
+    ) -> (
+        Dispatcher<MockWorker>,
+        Arc<dyn WorkerManager<Worker = MockWorker>>,
+    ) {
         let workers = setup_workers(worker_configs);
         let worker_manager: Arc<dyn WorkerManager<Worker = MockWorker>> =
             Arc::new(MockWorkerManager::new(workers));
         (
-            Dispatcher::new(StatisticsManagerRef::default()),
+            Dispatcher::with_retry_limits(
+                StatisticsManagerRef::default(),
+                max_transient_retries,
+                max_infra_retries,
+            ),
             worker_manager,
         )
+    }
+
+    /// Build a `ScheduledTask` that has already failed `attempts` times, so a single
+    /// dispatch can exercise behaviour partway through (or at the end of) a retry budget.
+    fn scheduled_task_with_attempts(
+        task: MockTask,
+        worker_id: WorkerId,
+        attempts: u32,
+    ) -> (ScheduledTask<MockTask>, SubmittedTask) {
+        let (pending, submitted) =
+            SchedulerHandle::prepare_task_for_submission(SubmittableTask::task_only(task));
+        let (task, result_tx, cancel_token) = pending.into_inner();
+        let pending = PendingTask::retry(task, result_tx, cancel_token, attempts, Duration::ZERO);
+        (ScheduledTask::new(pending, worker_id), submitted)
     }
 
     #[tokio::test]
@@ -525,6 +729,118 @@ mod tests {
             "Only worker2 should remain alive"
         );
         assert_eq!(worker_snapshots[0].worker_id(), &worker2_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transient_error_is_retried() -> DaftResult<()> {
+        let worker_id: WorkerId = Arc::from("worker1");
+        let (mut dispatcher, worker_manager) =
+            setup_dispatcher_test_context(&[(worker_id.clone(), 1)]);
+
+        let task = MockTaskBuilder::new(create_mock_partition_ref(100, 1024))
+            .with_failure(MockTaskFailure::TransientError(
+                "connection reset".to_string(),
+            ))
+            .build();
+        let (scheduled_task, _submitted_task) = scheduled_task_with_attempts(task, worker_id, 0);
+        dispatcher.dispatch_tasks(vec![scheduled_task], &worker_manager)?;
+
+        let failed_tasks = dispatcher.await_completed_tasks(&worker_manager).await?;
+        assert_eq!(failed_tasks.len(), 1);
+        assert_eq!(failed_tasks[0].attempts(), 1);
+        // The retry is backed off, so it is queued but not immediately dispatchable.
+        assert!(!failed_tasks[0].is_ready(Instant::now()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transient_error_gives_up_at_retry_limit() -> DaftResult<()> {
+        let worker_id: WorkerId = Arc::from("worker1");
+        let (mut dispatcher, worker_manager) =
+            setup_dispatcher_test_context_with_retry_limits(&[(worker_id.clone(), 1)], 2, 10);
+
+        let task = MockTaskBuilder::new(create_mock_partition_ref(100, 1024))
+            .with_failure(MockTaskFailure::TransientError("timeout".to_string()))
+            .build();
+        // Two attempts already made: the budget is spent.
+        let (scheduled_task, submitted_task) = scheduled_task_with_attempts(task, worker_id, 2);
+        dispatcher.dispatch_tasks(vec![scheduled_task], &worker_manager)?;
+
+        let failed_tasks = dispatcher.await_completed_tasks(&worker_manager).await?;
+        assert!(failed_tasks.is_empty());
+
+        // The original error is forwarded, not wrapped, so the cause stays visible.
+        let result = submitted_task.await;
+        assert!(result.unwrap_err().to_string().contains("timeout"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_non_transient_error_is_not_retried() -> DaftResult<()> {
+        let worker_id: WorkerId = Arc::from("worker1");
+        let (mut dispatcher, worker_manager) =
+            setup_dispatcher_test_context(&[(worker_id.clone(), 1)]);
+
+        let task = MockTaskBuilder::new(create_mock_partition_ref(100, 1024))
+            .with_failure(MockTaskFailure::Error("data error".to_string()))
+            .build();
+        let (scheduled_task, submitted_task) = scheduled_task_with_attempts(task, worker_id, 0);
+        dispatcher.dispatch_tasks(vec![scheduled_task], &worker_manager)?;
+
+        let failed_tasks = dispatcher.await_completed_tasks(&worker_manager).await?;
+        assert!(failed_tasks.is_empty());
+        assert!(submitted_task.await.is_err());
+
+        Ok(())
+    }
+
+    /// A lost worker must not reset the attempt counter. Before this was fixed, a task
+    /// alternating between transient failures and worker deaths could retry forever,
+    /// dropping a node from the cluster on every `WorkerDied`.
+    #[tokio::test]
+    async fn test_worker_loss_preserves_attempt_count() -> DaftResult<()> {
+        let worker_id: WorkerId = Arc::from("worker1");
+        let (mut dispatcher, worker_manager) =
+            setup_dispatcher_test_context(&[(worker_id.clone(), 1)]);
+
+        let task = MockTaskBuilder::new(create_mock_partition_ref(100, 1024))
+            .with_failure(MockTaskFailure::WorkerDied)
+            .build();
+        let (scheduled_task, _submitted_task) = scheduled_task_with_attempts(task, worker_id, 2);
+        dispatcher.dispatch_tasks(vec![scheduled_task], &worker_manager)?;
+
+        let failed_tasks = dispatcher.await_completed_tasks(&worker_manager).await?;
+        assert_eq!(failed_tasks.len(), 1);
+        assert_eq!(failed_tasks[0].attempts(), 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_worker_loss_gives_up_at_infra_retry_limit() -> DaftResult<()> {
+        let worker_id: WorkerId = Arc::from("worker1");
+        let (mut dispatcher, worker_manager) =
+            setup_dispatcher_test_context_with_retry_limits(&[(worker_id.clone(), 1)], 3, 2);
+
+        let task = MockTaskBuilder::new(create_mock_partition_ref(100, 1024))
+            .with_failure(MockTaskFailure::WorkerDied)
+            .build();
+        let (scheduled_task, submitted_task) = scheduled_task_with_attempts(task, worker_id, 2);
+        dispatcher.dispatch_tasks(vec![scheduled_task], &worker_manager)?;
+
+        let failed_tasks = dispatcher.await_completed_tasks(&worker_manager).await?;
+        assert!(failed_tasks.is_empty());
+
+        let error = submitted_task.await.unwrap_err().to_string();
+        assert!(
+            error.contains("lost its worker on all 3 attempts"),
+            "{error}"
+        );
+        assert!(error.contains(MAX_INFRA_RETRIES_ENV), "{error}");
 
         Ok(())
     }
