@@ -1,6 +1,8 @@
 use std::collections::{BinaryHeap, HashMap};
 
-use super::{PendingTask, ScheduledTask, Scheduler, WorkerSnapshot};
+use super::{
+    PendingTask, ScheduledTask, Scheduler, WorkerSnapshot, scheduler_actor::SCHEDULER_LOG_TARGET,
+};
 use crate::scheduling::{
     task::{SchedulingStrategy, Task, TaskDetails, TaskResourceRequest},
     worker::WorkerId,
@@ -63,16 +65,29 @@ impl<T: Task> DefaultScheduler<T> {
         worker_id: &WorkerId,
         soft: bool,
     ) -> Option<WorkerId> {
-        if let Some(worker) = self.worker_snapshots.get(worker_id)
-            && worker.can_schedule_task(task)
-        {
-            return Some(worker.worker_id.clone());
-        }
-        // Fallback to spread scheduling if soft is true
-        if soft {
-            self.try_schedule_spread_task(task)
-        } else {
-            None
+        match self.worker_snapshots.get(worker_id) {
+            Some(worker) if worker.can_schedule_task(task) => {
+                // Target worker exists and has capacity
+                Some(worker.worker_id.clone())
+            }
+            Some(_) => {
+                // Target worker exists but is busy: soft affinity falls back, hard affinity waits
+                if soft {
+                    self.try_schedule_spread_task(task)
+                } else {
+                    None
+                }
+            }
+            None => {
+                // Target worker missing from snapshots: fall back to spread regardless of soft flag
+                // (worker likely died; keeping hard affinity would deadlock the task)
+                tracing::warn!(
+                    target: SCHEDULER_LOG_TARGET,
+                    worker_id = %worker_id,
+                    "Affinity target missing from worker snapshots; falling back to spread scheduling"
+                );
+                self.try_schedule_spread_task(task)
+            }
         }
     }
 
@@ -735,5 +750,79 @@ mod tests {
 
         // Should not request autoscaling
         assert!(scheduler.get_autoscaling_request().is_none());
+    }
+
+    #[test]
+    fn test_hard_affinity_fallback_on_missing_worker() {
+        // Hard affinity to a worker that's not in snapshots should fall back to spread
+        let worker_1: WorkerId = Arc::from("worker1");
+        let worker_2: WorkerId = Arc::from("worker2");
+        let missing_worker: WorkerId = Arc::from("worker999");
+
+        let workers = setup_workers(&[(worker_1, 4), (worker_2.clone(), 8)]);
+        let mut scheduler: DefaultScheduler<MockTask> = setup_scheduler(&workers);
+
+        // Hard affinity to missing worker
+        let task = create_worker_affinity_task(&missing_worker, false, Some(1));
+        scheduler.enqueue_tasks(vec![task]);
+
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        // Should have fallen back to spread (worker2 has more capacity)
+        assert_eq!(scheduled[0].worker_id, worker_2);
+    }
+
+    #[test]
+    fn test_hard_affinity_waits_when_worker_busy() {
+        // Hard affinity to a busy worker should wait (return None), not fall back
+        let worker_1: WorkerId = Arc::from("worker1");
+        let worker_2: WorkerId = Arc::from("worker2");
+
+        let workers = setup_workers(&[(worker_1.clone(), 1), (worker_2.clone(), 4)]);
+        let mut scheduler: DefaultScheduler<MockTask> = setup_scheduler(&workers);
+
+        // Occupy worker1's only slot with a hard-affinity task
+        let occupy_task = create_worker_affinity_task(&worker_1, false, Some(1));
+        scheduler.enqueue_tasks(vec![occupy_task]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_1);
+
+        // Hard affinity to now-busy worker1: must wait, not spill to worker2
+        let task = create_worker_affinity_task(&worker_1, false, Some(2));
+        scheduler.enqueue_tasks(vec![task]);
+
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 0);
+        assert_eq!(scheduler.num_pending_tasks(), 1);
+
+        // worker1 disappears from the cluster (died / retired): the pinned task must not wedge
+        let worker_2_snapshot = WorkerSnapshot::from(&MockWorker::new(worker_2.clone(), 4.0, 0.0));
+        scheduler.update_worker_state(&[worker_2_snapshot]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_2);
+        assert_eq!(scheduler.num_pending_tasks(), 0);
+    }
+
+    #[test]
+    fn test_soft_affinity_falls_back_on_missing_worker() {
+        // The missing-worker branch is shared by both affinity modes; make sure soft
+        // affinity keeps falling back through it.
+        let worker_1: WorkerId = Arc::from("worker1");
+        let missing_worker: WorkerId = Arc::from("worker999");
+
+        let workers = setup_workers(&[(worker_1.clone(), 4)]);
+        let mut scheduler: DefaultScheduler<MockTask> = setup_scheduler(&workers);
+
+        scheduler.enqueue_tasks(vec![create_worker_affinity_task(
+            &missing_worker,
+            true,
+            Some(1),
+        )]);
+
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_1);
     }
 }
