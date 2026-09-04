@@ -229,6 +229,7 @@ impl<W: Worker> Dispatcher<W> {
                                     canc,
                                     attempts + 1,
                                     backoff,
+                                    worker_id,
                                 ));
                             }
                             TaskDisposition::Terminal => {
@@ -258,7 +259,7 @@ impl<W: Worker> Dispatcher<W> {
                         status @ (TaskStatus::WorkerDied | TaskStatus::WorkerUnavailable) => {
                             let worker_died = matches!(status, TaskStatus::WorkerDied);
                             if worker_died {
-                                worker_manager.mark_worker_died(worker_id);
+                                worker_manager.mark_worker_died(worker_id.clone());
                             }
                             match disposition {
                                 TaskDisposition::Retry => {
@@ -278,6 +279,7 @@ impl<W: Worker> Dispatcher<W> {
                                         canc,
                                         attempts + 1,
                                         backoff,
+                                        worker_id,
                                     ));
                                 }
                                 TaskDisposition::Terminal => {
@@ -411,7 +413,14 @@ mod tests {
         let (pending, submitted) =
             SchedulerHandle::prepare_task_for_submission(SubmittableTask::task_only(task));
         let (task, result_tx, cancel_token) = pending.into_inner();
-        let pending = PendingTask::retry(task, result_tx, cancel_token, attempts, Duration::ZERO);
+        let pending = PendingTask::retry(
+            task,
+            result_tx,
+            cancel_token,
+            attempts,
+            Duration::ZERO,
+            worker_id.clone(),
+        );
         (ScheduledTask::new(pending, worker_id), submitted)
     }
 
