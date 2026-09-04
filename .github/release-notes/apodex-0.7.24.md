@@ -1,14 +1,14 @@
-## 这是什么
+## 版本说明
 
 这是 **Apodex 内部发行版**，不是官方 Daft 发到 PyPI 的包。
 
-- **基线：** 官方 [`v0.7.24`](https://github.com/Eventual-Inc/Daft/releases/tag/v0.7.24)（2026-08-14）
+- **相对版本：** 官方 [`v0.7.24`](https://github.com/Eventual-Inc/Daft/releases/tag/v0.7.24)（2026-08-14）
 - **分支：** [`release_apodex_0724`](https://github.com/qifuapodex/Daft/tree/release_apodex_0724)
 - **构建 tag：** `apodex-0.7.24`
-- **包名：** 仍是 `daft`（不要 `pip install daft` 装官方源）
+- **安装版本：** `daft==0.7.24+apodex.1`
 - **发布渠道：** 只挂在本 GitHub Release 的 Assets 上，**不会上传 pypi.org**
 
-官方 v0.7.24 之后、`main` 上的其它提交**没有**合进来。下面 4 个 PR 当时都还开着，按依赖顺序 cherry-pick 到 `v0.7.24` 上。
+这是 `0.7.24+apodex.1` 的首个内部版本。相对官方 v0.7.24，只包含下面 4 个 PR；官方 v0.7.24 之后、`main` 上的其它提交**没有**合进来。
 
 | PR | 标题 | 解决的问题 |
 |---|---|---|
@@ -24,18 +24,18 @@
 从本 Release 的 Assets 里选当前机器对应的 wheel，或让 pip 自己选：
 
 ```bash
-pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24" "daft"
+pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24" "daft==0.7.24+apodex.1"
 ```
 
 Ray 集群（**head 和每个 worker 都要装同一份**，不要混用官方 `daft==0.7.24`）：
 
 ```bash
-pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24" "daft[ray]"
+pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24" "daft[ray]==0.7.24+apodex.1"
 ```
 
-本 tag 会打这些平台（GitHub 免费 runner，`manylinux_2_24` / macOS / Windows）：
+本 Release 提供这些平台的 wheel：
 
-- Linux x86_64、Linux aarch64
+- Linux x86_64
 - macOS x86_64、macOS aarch64（Apple Silicon）
 - Windows x86_64
 
@@ -46,7 +46,7 @@ import daft
 print(daft.__version__)
 ```
 
-`setuptools_scm` 会从 git 历史生成一个带 `dev` / commit 的版本号，例如 `0.7.24.devN+g...`，从而和官方 `0.7.24` 区分开。
+应打印 `0.7.24+apodex.1`。
 
 ---
 

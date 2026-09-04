@@ -85,7 +85,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: apodex-0.7.24.3
-        name: apodex-0.7.24.3
+        name: 0.7.24+apodex.3
         target_commitish: ${{ github.sha }}
         body_path: .github/release-notes/apodex-0.7.24.3.md
         files: dist/*

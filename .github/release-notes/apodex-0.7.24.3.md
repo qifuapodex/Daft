@@ -1,11 +1,11 @@
-## 这是什么
+## 版本说明
 
 这是 **Apodex 内部发行版**，不是官方 Daft 发到 PyPI 的包。
 
-- **基线：** [`apodex-0.7.24.2`](https://github.com/qifuapodex/Daft/releases/tag/apodex-0.7.24.2)
+- **相对版本：** [`0.7.24+apodex.2`](https://github.com/qifuapodex/Daft/releases/tag/apodex-0.7.24.2)
 - **分支：** [`release_apodex_0724`](https://github.com/qifuapodex/Daft/tree/release_apodex_0724)
 - **构建 tag：** `apodex-0.7.24.3`
-- **wheel 版本：** `daft-0.7.24+apodex.3`
+- **安装版本：** `daft==0.7.24+apodex.3`
 - **发布渠道：** 只挂在本 GitHub Release 的 Assets 上，**不会上传 pypi.org**
 
 本版只新增 [#7463](https://github.com/Eventual-Inc/Daft/pull/7463)；此前版本的修复继续保留，这里不再重复。
@@ -48,13 +48,13 @@ df.write_parquet(
 让 pip 从本 Release 的 Assets 中选择当前平台对应的 wheel：
 
 ```bash
-pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.3" "daft"
+pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.3" "daft==0.7.24+apodex.3"
 ```
 
 Ray 集群（head 和每个 worker 都要安装同一版本）：
 
 ```bash
-pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.3" "daft[ray]"
+pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.3" "daft[ray]==0.7.24+apodex.3"
 ```
 
 发布资产覆盖：
