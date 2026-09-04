@@ -928,7 +928,7 @@ mod tests {
         // The worker comes back (an actor rebuilt on the same node keeps its id), so a
         // later disappearance is worth reporting again.
         scheduler.update_worker_state(
-            &setup_workers(&[(worker_1, 4), (missing_worker.clone(), 4)])
+            &setup_workers(&[(worker_1, 4), (missing_worker, 4)])
                 .values()
                 .map(WorkerSnapshot::from)
                 .collect::<Vec<_>>(),

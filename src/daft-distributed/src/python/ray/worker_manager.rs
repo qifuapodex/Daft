@@ -50,6 +50,7 @@ impl RayWorkerManagerState {
         self.pending_release_blacklist
             .retain(|_, ts| ts.elapsed() < Duration::from_secs(ttl_secs));
 
+        let started = Instant::now();
         let ray_workers = Python::attach(|py| {
             let flotilla_module = py.import(pyo3::intern!(py, "daft.runners.flotilla"))?;
 
@@ -73,6 +74,28 @@ impl RayWorkerManagerState {
 
             DaftResult::Ok(ray_workers)
         })?;
+
+        // `start_ray_workers` is called synchronously from the scheduler's event loop, and
+        // when it finds a new node it blocks on `ray.wait` until every actor in that batch
+        // is ready. Nothing is dispatched and no results are collected while it does, so
+        // this is the number to look at if the loop appears to stall during a scale-up.
+        // It is ~0 when no node joined (the Python side short-circuits).
+        let elapsed = started.elapsed();
+        let num_started = ray_workers.len();
+        if num_started > 0 {
+            tracing::info!(
+                target: "ray_worker_manager",
+                num_started,
+                elapsed_ms = elapsed.as_millis(),
+                "Started new Ray workers (scheduler loop was blocked for this long)"
+            );
+        } else {
+            tracing::debug!(
+                target: "ray_worker_manager",
+                elapsed_ms = elapsed.as_millis(),
+                "Worker refresh found no new nodes"
+            );
+        }
 
         for worker in ray_workers {
             self.ray_workers.insert(worker.id().clone(), worker);
