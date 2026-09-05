@@ -203,11 +203,13 @@ pub fn new_attempt_token() -> u64 {
 /// Keyed by shuffle so the whole map can be dropped when that shuffle's tree is
 /// removed (see [`forget_created_dirs`]); nothing else ever shrinks it, and a
 /// long-lived worker would otherwise accumulate an entry per shard per query.
-static CREATED_DIRS: LazyLock<Mutex<HashMap<u64, HashMap<String, Arc<DirSync>>>>> =
+type DirSyncsByPath = HashMap<String, Arc<DirSync>>;
+type CreatedDirsByShuffle = HashMap<u64, DirSyncsByPath>;
+
+static CREATED_DIRS: LazyLock<Mutex<CreatedDirsByShuffle>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn lock_created_dirs() -> std::sync::MutexGuard<'static, HashMap<u64, HashMap<String, Arc<DirSync>>>>
-{
+fn lock_created_dirs() -> std::sync::MutexGuard<'static, CreatedDirsByShuffle> {
     CREATED_DIRS
         .lock()
         .expect("shuffle directory memo poisoned")

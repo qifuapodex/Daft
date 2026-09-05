@@ -18,7 +18,7 @@ use common_runtime::RuntimeTask;
 use daft_core::prelude::SchemaRef;
 use daft_recordbatch::RecordBatch;
 use futures::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncSeekExt, BufReader};
 use tonic::{Request, Response, Status, transport::Server};
 
 use super::stream::{FlightMessage, next_flight_data, skip_stream_metadata};
@@ -120,6 +120,9 @@ enum FileReadSpec {
     },
 }
 
+type MissingFlightPartitionRefs = Vec<(u64, u64)>;
+type ShuffleFileSpecs = Result<(Vec<FileReadSpec>, SchemaRef), MissingFlightPartitionRefs>;
+
 /// Every output partition this worker has written and can still serve.
 ///
 /// A plain `std::sync::Mutex` rather than an async one: nothing under this lock
@@ -212,11 +215,7 @@ impl ShuffleFlightServer {
     /// would hand the caller a stream that looks complete and is not — the caller
     /// has no way to tell which inputs were skipped. Refusing lets it fall back
     /// to shared storage or fail loudly.
-    fn get_shuffle_file_specs(
-        &self,
-        shuffle_id: u64,
-        refs: &[(u64, u64)],
-    ) -> Result<(Vec<FileReadSpec>, SchemaRef), Vec<(u64, u64)>> {
+    fn get_shuffle_file_specs(&self, shuffle_id: u64, refs: &[(u64, u64)]) -> ShuffleFileSpecs {
         let partitions = self.lock_partitions();
 
         let mut missing = Vec::new();
@@ -556,7 +555,6 @@ pub fn start_server_loop(
 
 #[cfg(test)]
 mod tests {
-    use daft_micropartition::MicroPartition;
     use daft_schema::{dtype::DataType, field::Field, schema::Schema};
     use daft_writers::test::make_dummy_mp;
     use futures::TryStreamExt;
