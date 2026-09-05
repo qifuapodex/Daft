@@ -1,6 +1,12 @@
-use std::collections::{BinaryHeap, HashMap};
+use std::{
+    collections::{BinaryHeap, HashMap, HashSet},
+    time::Instant,
+};
 
-use super::{PendingTask, ScheduledTask, Scheduler, WorkerSnapshot};
+use super::{
+    AffinityTarget, PendingTask, ScheduledTask, Scheduler, WorkerSnapshot,
+    scheduler_actor::SCHEDULER_LOG_TARGET,
+};
 use crate::scheduling::{
     task::{SchedulingStrategy, Task, TaskDetails, TaskResourceRequest},
     worker::WorkerId,
@@ -9,6 +15,9 @@ use crate::scheduling::{
 pub(super) struct LinearScheduler<T: Task> {
     worker_snapshots: HashMap<WorkerId, WorkerSnapshot>,
     pending_tasks: BinaryHeap<PendingTask<T>>,
+    /// Affinity targets already warned about, so the missing-target warning is emitted
+    /// once per worker rather than once per pending task per tick.
+    warned_missing_affinity_targets: HashSet<WorkerId>,
 }
 
 impl<T: Task> Default for LinearScheduler<T> {
@@ -22,13 +31,23 @@ impl<T: Task> LinearScheduler<T> {
         Self {
             worker_snapshots: HashMap::new(),
             pending_tasks: BinaryHeap::new(),
+            warned_missing_affinity_targets: HashSet::new(),
         }
     }
 
-    fn try_schedule_spread_task(&self, task: &T) -> Option<WorkerId> {
+    fn try_schedule_spread_task(&self, task: &T, avoid: Option<&WorkerId>) -> Option<WorkerId> {
+        // `avoid` is a preference, not a constraint: if the worker a retry just failed on
+        // is the only one with room, placing the task there beats leaving it pending.
+        self.best_spread_candidate(task, avoid)
+            .or_else(|| self.best_spread_candidate(task, None))
+    }
+
+    fn best_spread_candidate(&self, task: &T, avoid: Option<&WorkerId>) -> Option<WorkerId> {
         self.worker_snapshots
             .iter()
-            .filter(|(_, worker)| worker.can_schedule_task(task))
+            .filter(|(_, worker)| {
+                worker.can_schedule_task(task) && avoid != Some(&worker.worker_id)
+            })
             .max_by_key(|(_, worker)| {
                 (worker.available_num_cpus() + worker.available_num_gpus()) as usize
             })
@@ -36,29 +55,54 @@ impl<T: Task> LinearScheduler<T> {
     }
 
     fn try_schedule_worker_affinity_task(
-        &self,
-        task: &T,
+        &mut self,
+        task: &PendingTask<T>,
         worker_id: &WorkerId,
         soft: bool,
     ) -> Option<WorkerId> {
-        if let Some(worker) = self.worker_snapshots.get(worker_id)
-            && worker.can_schedule_task(task)
-        {
-            return Some(worker.worker_id.clone());
-        }
-        // Fallback to spread scheduling if soft is true
-        if soft {
-            self.try_schedule_spread_task(task)
-        } else {
-            None
+        // Resolve the target before touching `self` mutably below.
+        let target = match self.worker_snapshots.get(worker_id) {
+            // Target worker exists and has capacity
+            Some(worker) if worker.can_schedule_task(&task.task) => {
+                return Some(worker.worker_id.clone());
+            }
+            // Target worker exists but is busy: soft affinity falls back, hard affinity waits
+            Some(_) => AffinityTarget::Busy,
+            // Target worker is missing from the snapshots
+            None => AffinityTarget::Missing,
+        };
+
+        match target {
+            AffinityTarget::Busy if !soft => None,
+            AffinityTarget::Busy => self.try_schedule_spread_task(&task.task, task.avoid_worker()),
+            AffinityTarget::Missing => {
+                // Fall back to spread regardless of the soft flag: the worker most likely
+                // died, and holding out for it would deadlock the task. Warn once per
+                // target -- this runs for every pending task on every tick, so an
+                // unconditional log here is thousands of lines a second under backlog.
+                if self
+                    .warned_missing_affinity_targets
+                    .insert(worker_id.clone())
+                {
+                    tracing::warn!(
+                        target: SCHEDULER_LOG_TARGET,
+                        worker_id = %worker_id,
+                        "Affinity target missing from worker snapshots; falling back to spread scheduling"
+                    );
+                }
+                self.try_schedule_spread_task(&task.task, task.avoid_worker())
+            }
         }
     }
 
-    fn try_schedule_task(&self, task: &PendingTask<T>) -> Option<WorkerId> {
+    fn try_schedule_task(&mut self, task: &PendingTask<T>) -> Option<WorkerId> {
         match task.strategy() {
-            SchedulingStrategy::Spread => self.try_schedule_spread_task(&task.task),
+            SchedulingStrategy::Spread => {
+                self.try_schedule_spread_task(&task.task, task.avoid_worker())
+            }
             SchedulingStrategy::WorkerAffinity { worker_id, soft } => {
-                self.try_schedule_worker_affinity_task(&task.task, worker_id, *soft)
+                let (worker_id, soft) = (worker_id.clone(), *soft);
+                self.try_schedule_worker_affinity_task(task, &worker_id, soft)
             }
         }
     }
@@ -80,16 +124,15 @@ impl<T: Task> LinearScheduler<T> {
 
 impl<T: Task> Scheduler<T> for LinearScheduler<T> {
     fn update_worker_state(&mut self, worker_snapshots: &[WorkerSnapshot]) {
-        for worker_snapshot in worker_snapshots {
-            if let Some(existing_snapshot) =
-                self.worker_snapshots.get_mut(&worker_snapshot.worker_id)
-            {
-                *existing_snapshot = worker_snapshot.clone();
-            } else {
-                self.worker_snapshots
-                    .insert(worker_snapshot.worker_id.clone(), worker_snapshot.clone());
-            }
-        }
+        self.worker_snapshots = worker_snapshots
+            .iter()
+            .map(|snapshot| (snapshot.worker_id.clone(), snapshot.clone()))
+            .collect();
+        // A worker whose actor was rebuilt on the same node reappears under the same id;
+        // drop it from the warned set so a genuine later loss is reported again.
+        let present = &self.worker_snapshots;
+        self.warned_missing_affinity_targets
+            .retain(|worker_id| !present.contains_key(worker_id));
     }
 
     fn enqueue_tasks(&mut self, tasks: Vec<PendingTask<T>>) {
@@ -113,9 +156,15 @@ impl<T: Task> Scheduler<T> for LinearScheduler<T> {
         let mut cancelled = Vec::new();
 
         // Process all tasks in the queue
+        let now = Instant::now();
         while let Some(task) = self.pending_tasks.pop() {
             if task.is_cancelled() {
                 cancelled.push(task);
+                continue;
+            }
+            // A retry that is still backing off stays queued but is not dispatchable yet.
+            if !task.is_ready(now) {
+                unscheduled.push(task);
                 continue;
             }
             if let Some(worker_id) = self.try_schedule_task(&task) {
@@ -415,5 +464,99 @@ mod tests {
 
         assert_eq!(result.len(), 0);
         assert_eq!(scheduler.num_pending_tasks(), 2);
+    }
+
+    #[test]
+    fn test_linear_hard_affinity_fallback_on_missing_worker() {
+        // Hard affinity to a worker that's not in snapshots should fall back to spread
+        let worker_1: WorkerId = Arc::from("worker1");
+        let worker_2: WorkerId = Arc::from("worker2");
+        let missing_worker: WorkerId = Arc::from("worker999");
+
+        let workers = setup_workers(&[(worker_1, 4), (worker_2.clone(), 8)]);
+        let mut scheduler: LinearScheduler<MockTask> = setup_scheduler(&workers);
+
+        // Hard affinity to missing worker
+        let task = create_worker_affinity_task(&missing_worker, false, Some(1));
+        scheduler.enqueue_tasks(vec![task]);
+
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        // Should have fallen back to spread (worker2 has more capacity)
+        assert_eq!(scheduled[0].worker_id, worker_2);
+    }
+
+    #[test]
+    fn test_linear_hard_affinity_waits_when_worker_busy() {
+        // Hard affinity should wait when worker is busy, but fall back when worker disappears
+        let worker_1: WorkerId = Arc::from("worker1");
+        let worker_2: WorkerId = Arc::from("worker2");
+
+        let workers = setup_workers(&[(worker_1.clone(), 1), (worker_2.clone(), 4)]);
+        let mut scheduler: LinearScheduler<MockTask> = setup_scheduler(&workers);
+
+        // Occupy worker1's only slot with a hard-affinity task
+        let occupy_task = create_worker_affinity_task(&worker_1, false, Some(1));
+        scheduler.enqueue_tasks(vec![occupy_task]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_1);
+
+        // Enqueue another hard-affinity task to worker1 (which is now busy)
+        let task = create_worker_affinity_task(&worker_1, false, Some(2));
+        scheduler.enqueue_tasks(vec![task]);
+
+        // Linear scheduler won't schedule anything while a task is active
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 0);
+        assert_eq!(scheduler.num_pending_tasks(), 1);
+
+        // worker1 disappears from the cluster (died / retired): update to only worker2
+        let idle_worker_2 = setup_workers(&[(worker_2.clone(), 4)]);
+        scheduler.update_worker_state(
+            &idle_worker_2
+                .values()
+                .map(WorkerSnapshot::from)
+                .collect::<Vec<_>>(),
+        );
+
+        // Now the pinned task should fall back to worker2 (worker1 missing = fallback)
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_2);
+        assert_eq!(scheduler.num_pending_tasks(), 0);
+    }
+
+    /// `update_worker_state` replaces the snapshot map wholesale rather than merging into
+    /// it. That matters here: the linear scheduler refuses to schedule while *any* worker
+    /// shows an active task, so a merge would leave a dead worker's stale
+    /// `active_task_details` in the map forever and wedge the scheduler permanently.
+    #[test]
+    fn test_linear_vanished_worker_is_dropped_from_snapshots() {
+        let worker_1: WorkerId = Arc::from("worker1");
+        let worker_2: WorkerId = Arc::from("worker2");
+
+        let workers = setup_workers(&[(worker_1.clone(), 1), (worker_2.clone(), 4)]);
+        let mut scheduler: LinearScheduler<MockTask> = setup_scheduler(&workers);
+
+        // Put an active task on worker1, then have worker1 vanish while it is still running.
+        scheduler.enqueue_tasks(vec![create_worker_affinity_task(&worker_1, true, Some(1))]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_1);
+
+        let surviving = setup_workers(&[(worker_2.clone(), 4)]);
+        scheduler.update_worker_state(
+            &surviving
+                .values()
+                .map(WorkerSnapshot::from)
+                .collect::<Vec<_>>(),
+        );
+
+        // With worker1 gone there are no active tasks left, so scheduling resumes.
+        scheduler.enqueue_tasks(vec![create_spread_task(Some(2))]);
+        let (scheduled, _) = scheduler.schedule_tasks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].worker_id, worker_2);
     }
 }

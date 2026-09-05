@@ -122,9 +122,16 @@ impl RuntimeNodeManager {
         }
     }
 
-    /// Record that a task touching this node has finished (Completed,
-    /// Failed, or Cancelled — including retryable failures, which mirror
-    /// the unconditional active-counter decrement in `handle_task_event`).
+    /// Record that a task touching this node has reached a terminal state (Completed,
+    /// Cancelled, or a failure that will *not* be retried).
+    ///
+    /// Retryable failures must not be counted here, unlike in the active-task gauge in
+    /// `handle_task_event`. That gauge is driven by `TaskEvent::Scheduled`, which fires on
+    /// every dispatch, so its decrement is matched by a re-increment when the retry is
+    /// dispatched again. This counter is driven by `TaskEvent::Submitted`, which fires
+    /// once per task no matter how many attempts it takes, so a decrement per attempt
+    /// would drift below the true in-flight count and end the operator early.
+    ///
     /// Returns `true` iff the caller should now fire `OperatorEnd`.
     pub fn on_task_finished(&self) -> bool {
         let mut s = self.lifecycle.lock().unwrap();

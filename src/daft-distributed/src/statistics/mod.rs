@@ -59,7 +59,19 @@ pub(crate) enum TaskEvent {
 }
 
 impl TaskEvent {
-    pub fn new(context: TaskContext, result: &DaftResult<TaskStatus>, worker_id: WorkerId) -> Self {
+    /// Build the event for a task that just came back from a worker.
+    ///
+    /// `retryable` says whether the dispatcher is going to re-enqueue this task rather
+    /// than report the failure upstream, and must be decided *before* this is called:
+    /// downstream subscribers use it to suppress the terminal `TaskEnd` for an attempt
+    /// that is about to be repeated (see `task_lifecycle.rs`). It is ignored for
+    /// non-failure statuses, which are always terminal.
+    pub fn new(
+        context: TaskContext,
+        result: &DaftResult<TaskStatus>,
+        worker_id: WorkerId,
+        retryable: bool,
+    ) -> Self {
         match result {
             Ok(task_status) => match task_status {
                 TaskStatus::Success { stats, .. } => Self::Completed {
@@ -71,25 +83,23 @@ impl TaskEvent {
                     context,
                     reason: error.to_string(),
                     worker_id: Some(worker_id),
-                    retryable: false,
+                    retryable,
                 },
                 TaskStatus::Cancelled => Self::Cancelled { context },
-                // WorkerDied and WorkerUnavailable are the only
-                // task statuses that get retried in the dispatcher
-                // src/daft-distributed/src/scheduling/dispatcher.rs
                 TaskStatus::WorkerDied => Self::Failed {
                     context,
                     reason: "Worker died".to_string(),
                     worker_id: Some(worker_id),
-                    retryable: true,
+                    retryable,
                 },
                 TaskStatus::WorkerUnavailable => Self::Failed {
                     context,
                     reason: "Worker unavailable".to_string(),
                     worker_id: Some(worker_id),
-                    retryable: true,
+                    retryable,
                 },
             },
+            // A panic in the result-awaiting task is never retried.
             Err(error) => Self::Failed {
                 context,
                 reason: error.to_string(),
@@ -198,6 +208,13 @@ impl StatisticsManager {
                     }
                 }
             }
+            // A retryable failure is not a finished task -- the dispatcher is about to
+            // re-enqueue it. Counting it here would decrement the operator's in-flight
+            // count without a matching increment, because retries re-enter the scheduler
+            // through `enqueue_tasks` and never emit a second `TaskEvent::Submitted`.
+            TaskEvent::Failed {
+                retryable: true, ..
+            } => {}
             TaskEvent::Completed { context, .. }
             | TaskEvent::Failed { context, .. }
             | TaskEvent::Cancelled { context } => {
