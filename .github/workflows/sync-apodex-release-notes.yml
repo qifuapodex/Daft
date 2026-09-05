@@ -32,6 +32,9 @@ jobs:
         - tag: apodex-0.7.24.3
           title: 0.7.24+apodex.3
           notes: .github/release-notes/apodex-0.7.24.3.md
+        - tag: apodex-0.7.24.4
+          title: 0.7.24+apodex.4
+          notes: .github/release-notes/apodex-0.7.24.4.md
     steps:
     - uses: actions/checkout@v7
     - name: Update GitHub Release title and notes
@@ -41,5 +44,9 @@ jobs:
         TITLE: ${{ matrix.title }}
         NOTES: ${{ matrix.notes }}
       run: |
+        if ! gh release view "$TAG" >/dev/null 2>&1; then
+          echo "Release $TAG does not exist yet; skipping until it is published."
+          exit 0
+        fi
         gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES"
         gh release view "$TAG" --json tagName,name,url
