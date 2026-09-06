@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pickle
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from traceback import TracebackException
@@ -8,6 +9,15 @@ if TYPE_CHECKING:
 
 class ExpressionTypeError(Exception):
     pass
+
+
+def _rebuild_udf_exception(
+    message: str, tb_info: TracebackException | None, cause: BaseException | None
+) -> UDFException:
+    """Reconstruct a `UDFException`, restoring the `__cause__` that pickling drops."""
+    exc = UDFException(message, tb_info)
+    exc.__cause__ = cause
+    return exc
 
 
 class UDFException(Exception):
@@ -29,6 +39,26 @@ class UDFException(Exception):
         """The original exception that was raised by the UDF."""
         # We except every creation of UDFException to be `raise UDFException(...) from ...`
         return self.__cause__
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # `__cause__` is a C-level slot that `BaseException.__reduce__` does not carry, so
+        # without this a UDFException that crosses a process boundary -- which is every Ray
+        # task -- arrives with `original_exception` == None and the original error's type
+        # gone. Two things depend on it surviving: `original_exception` / `__str__` here,
+        # and `DaftError::is_transient()` on the Rust side, which walks this chain to decide
+        # whether a failed task is worth retrying. Dropping it turns a retryable blip inside
+        # a UDF (a throttled S3 request, say) into a whole-query failure.
+        cause = self.__cause__
+        if cause is not None:
+            try:
+                pickle.dumps(cause)
+            except Exception:
+                # An unpicklable cause is dropped rather than allowed to fail the enclosing
+                # error's serialisation, which would replace the user's traceback with a
+                # pickling error. This mirrors what the process-pool path already does for
+                # its base exception (`daft/execution/udf.py`).
+                cause = None
+        return (_rebuild_udf_exception, (self.message, self.tb_info, cause))
 
     def __str__(self) -> str:
         if self.tb_info:

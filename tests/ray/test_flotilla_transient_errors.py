@@ -17,12 +17,14 @@ None of this needs a Ray cluster; the exception wrapping is pure Python.
 from __future__ import annotations
 
 import asyncio
+import pickle
 
 import pytest
 import ray
 from ray.exceptions import RayTaskError
 
 from daft import exceptions as daft_exceptions
+from daft.errors import UDFException
 from daft.exceptions import DaftTransientError, SocketError
 from daft.runners.flotilla import RaySwordfishTaskHandle
 
@@ -140,3 +142,79 @@ def test_actor_death_is_not_classified_as_transient():
     actor_died = ray.exceptions.ActorDiedError()
 
     assert not isinstance(actor_died, DaftTransientError)
+
+
+def test_udf_exception_keeps_its_cause_across_a_process_boundary():
+    """`raise ... from` must survive pickling, or a UDF's transient error is unclassifiable.
+
+    `__cause__` is a C-level slot that `BaseException.__reduce__` does not carry, so by
+    default a `UDFException` pickled to the driver arrives with `original_exception` ==
+    None -- the original error's *type* is gone, and with it the only thing the classifier
+    could have matched on. `UDFException.__reduce__` restores the link; this pins that it
+    does, because nothing else fails visibly when it stops working.
+    """
+    try:
+        try:
+            raise SocketError("connection reset")
+        except SocketError as user_error:
+            raise UDFException("User-defined function `f` failed") from user_error
+    except UDFException as e:
+        raised = e
+
+    delivered = pickle.loads(pickle.dumps(raised))
+
+    assert isinstance(delivered.__cause__, DaftTransientError)
+    assert isinstance(delivered.original_exception, DaftTransientError)
+    # The rest of the exception has to come through unchanged as well.
+    assert delivered.message == raised.message
+
+
+def test_transient_error_inside_a_udf_is_reachable_from_what_the_driver_receives():
+    """Pins the shape `DaftError::is_transient()` walks on the Ray path.
+
+    A UDF failure nests two wrappers: Ray's `RayTaskError` holds the `UDFException` on
+    `.cause`, and the error the user's code actually raised hangs off that on `__cause__`.
+    Neither of the two outer objects is a `DaftTransientError`, so a classifier that only
+    looks at the exception it is handed -- or only follows one link -- retries nothing.
+    This walks the same two links the Rust side does.
+    """
+    try:
+        try:
+            raise SocketError("throttled by S3")
+        except SocketError as user_error:
+            raise UDFException("User-defined function `f` failed") from user_error
+    except UDFException as e:
+        raised = e
+
+    delivered = RayTaskError("run_plan", "<traceback>", pickle.loads(pickle.dumps(raised)))
+
+    assert not isinstance(delivered, DaftTransientError)
+    assert not isinstance(delivered.cause, DaftTransientError)
+    assert isinstance(delivered.cause.__cause__, DaftTransientError)
+
+
+def test_an_unpicklable_cause_does_not_break_delivery_of_the_udf_error():
+    """A cause that cannot be pickled must be dropped, not allowed to fail the whole error.
+
+    Carrying `__cause__` means the user's exception is now part of what gets serialised.
+    If that throws, the query would surface a pickling error instead of the real failure
+    -- strictly worse than the missing-cause behaviour it replaced. So the cause is probed
+    first and dropped on failure, which just degrades to that older behaviour.
+    """
+
+    class Unpicklable(Exception):
+        def __reduce__(self):
+            raise TypeError("this exception cannot be pickled")
+
+    try:
+        try:
+            raise Unpicklable("user error")
+        except Unpicklable as user_error:
+            raise UDFException("User-defined function `f` failed") from user_error
+    except UDFException as e:
+        raised = e
+
+    delivered = pickle.loads(pickle.dumps(raised))
+
+    assert delivered.__cause__ is None
+    assert delivered.message == "User-defined function `f` failed"

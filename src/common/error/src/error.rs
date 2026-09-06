@@ -96,20 +96,43 @@ impl DaftError {
             // above is gone and the Python exception class is the only type information left.
             // `daft.exceptions.DaftTransientError` is the base class of exactly the six
             // variants above -- see the `From<DaftError> for PyErr` mapping in `python.rs` --
-            // so the two whitelists stay in sync by construction. Ray re-raises the original
-            // exception via `as_instanceof_cause()`, which both makes the result an instance
-            // of the original class and keeps the original on `.cause`; check both.
+            // so the two whitelists stay in sync by construction.
+            //
+            // The transient error can sit at any depth of a wrapping chain, so walk it:
+            //   - Ray re-raises via `as_instanceof_cause()`, which makes the result an
+            //     instance of the original class *and* keeps the original on `.cause`;
+            //   - `raise ... from` records the wrapped error in Python's `__cause__`, which
+            //     is how a UDF failure reaches us (`RayTaskError` -> `UDFException` -> the
+            //     error the user's code raised). `UDFException.__reduce__` in
+            //     `daft/errors.py` exists to keep that link alive across pickling.
+            // Depth is bounded so a self-referential chain cannot hang the dispatcher.
             #[cfg(feature = "python")]
             Self::PyO3Error(pyerr) => pyo3::Python::attach(|py| {
                 use pyo3::types::PyAnyMethods;
 
-                let value = pyerr.value(py);
-                value.is_instance_of::<crate::python::DaftTransientError>()
-                    || value
+                const MAX_CHAIN_DEPTH: usize = 4;
+
+                let mut value = pyerr.value(py).as_any().clone();
+                for _ in 0..=MAX_CHAIN_DEPTH {
+                    if value.is_instance_of::<crate::python::DaftTransientError>() {
+                        return true;
+                    }
+                    let next = value
                         .getattr(pyo3::intern!(py, "cause"))
-                        .is_ok_and(|cause| {
-                            cause.is_instance_of::<crate::python::DaftTransientError>()
-                        })
+                        .ok()
+                        .filter(|cause| !cause.is_none())
+                        .or_else(|| {
+                            value
+                                .getattr(pyo3::intern!(py, "__cause__"))
+                                .ok()
+                                .filter(|cause| !cause.is_none())
+                        });
+                    match next {
+                        Some(next) => value = next,
+                        None => return false,
+                    }
+                }
+                false
             }),
             _ => false,
         }
