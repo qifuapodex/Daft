@@ -8,7 +8,7 @@
 - **安装版本：** `daft==0.7.24+apodex.5`
 - **发布渠道：** 只挂在本 GitHub Release 的 Assets 上，**不会上传 pypi.org**
 
-本版继续跟踪 [Eventual-Inc/Daft#7464](https://github.com/Eventual-Inc/Daft/pull/7464) 和 [qifuapodex/Daft#1](https://github.com/qifuapodex/Daft/pull/1)，且仅列出相对上一版的增量。发布时，fork PR #1 的 head 仍为 `.4` 已合入的 `c909dd1a`，因此没有重复列出其历史修改；本版代码增量来自 #7464 的新提交 `e454a11f`。
+本版继续跟踪 [Eventual-Inc/Daft#7464](https://github.com/Eventual-Inc/Daft/pull/7464) 和 [qifuapodex/Daft#1](https://github.com/qifuapodex/Daft/pull/1)，且仅列出相对上一版的增量；后者是提交到 Apodex fork 的 PR，并非官方仓库 PR。本版代码增量分别来自 #7464 的 `e454a11f` 和 fork PR #1 的 `cdd77703`。
 
 ---
 
@@ -21,6 +21,14 @@
 - worker 按 shuffle 缓存已读取的共享文件索引区域，缓存上限为 64 MiB，并在 shuffle 释放时一并清除，减少不同 reduce task 对相同索引的重复读取。
 - 当大型集群中最窄 shuffle 的输出分区只能使用不到一半 CPU、且至少会闲置 64 个 CPU 时给出容量提示，避免 reduce 阶段的大量资源闲置。
 - 更新共享存储 durability 的实测说明，并扩充写入 durability、稀疏 cell 与 4096 分区生产形状的 benchmark。
+
+### qifuapodex/Daft#1 — 重试 UDF 内部抛出的 transient error
+
+- `UDFException` 序列化时显式保留可 pickle 的 `__cause__`，使 UDF 中的限流、DNS 或 socket 类瞬时错误跨进程和 Ray 传输后仍能保留原始异常类型；不可 pickle 的 cause 会安全丢弃，不会用序列化错误覆盖用户异常。
+- `DaftError::is_transient()` 现在以有限深度遍历 Ray 的 `.cause` 与 Python 的 `__cause__` 链，可识别 `RayTaskError → UDFException → DaftTransientError` 的两层包装并触发已有的退避重试。
+- 新增 3 个 Ray/Python contract tests，覆盖 cause 的 pickle 往返、两层异常链识别以及不可序列化 cause 的降级行为。
+
+`read_generator` 路径仍会更早丢失异常类型并以 `DaftCoreException` 到达 driver，不在本次修复范围内。
 
 ---
 
