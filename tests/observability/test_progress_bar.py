@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
 import threading
 
 import pytest
@@ -64,3 +68,47 @@ def test_swordfish_progress_bar_writes_from_single_stable_thread():
 
     assert len(write_threads) == 1
     assert write_threads.isdisjoint(caller_threads)
+
+
+# Non-regression test for a deadlock between the CPython GIL and indicatif's internal
+# MultiProgress lock. `IndicatifLogger::log` suspends the progress bars around the inner
+# logger, which holds indicatif's write lock while `pyo3_log` acquires the GIL. Meanwhile
+# `PyNativeExecutor::run` takes that same lock (via `MultiProgress::add`, when it builds the
+# bars for a query) with the GIL already held, so the two lock orders invert and both threads
+# wedge forever. It needs something logging frequently off a non-Python thread to hit, which
+# the dashboard subscriber does once a dashboard server is up.
+#
+# Runs in a subprocess because `dashboard.launch()` starts a process-global server that is
+# never torn down, and because a deadlocked run can only be detected as a timeout.
+_GIL_DEADLOCK_REPRO = textwrap.dedent("""
+    import tempfile
+
+    import daft
+    from daft.subscribers.dashboard import launch
+
+    launch(noop_if_initialized=True)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i in range(400):
+            df = daft.from_pydict({"id": list(range(i * 100, (i + 1) * 100))})
+            df.write_parquet(f"{tmpdir}/file_{i}.parquet")
+    print("no deadlock")
+""")
+
+
+def test_indicatif_logger_does_not_deadlock_against_the_gil():
+    """Rust logs emitted while the progress bar is live must not deadlock the executor."""
+    env = {**os.environ, "DAFT_RUNNER": "native", "DAFT_PROGRESS_BAR": "true"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _GIL_DEADLOCK_REPRO],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("writes deadlocked between the GIL and the indicatif progress bar lock")
+    assert proc.returncode == 0, proc.stderr
+    assert "no deadlock" in proc.stdout
