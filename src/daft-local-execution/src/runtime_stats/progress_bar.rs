@@ -56,9 +56,20 @@ impl<L: Log> Log for IndicatifLogger<L> {
     }
 
     fn log(&self, record: &log::Record) {
-        if self.inner.enabled(record.metadata()) {
-            self.pbar.suspend(|| self.inner.log(record));
+        if !self.inner.enabled(record.metadata()) {
+            return;
         }
+
+        // `MultiProgress::suspend` holds indicatif's internal write lock for the whole
+        // closure, and the inner logger (`pyo3_log`) acquires the GIL. Other threads take
+        // that same indicatif lock *while already holding the GIL*, e.g. `MultiProgress::add`
+        // below via `PyNativeExecutor::run`. Taking the two in the opposite order here would
+        // be a classic AB-BA deadlock, so always attach to the interpreter first and keep the
+        // lock order GIL -> indicatif everywhere.
+        #[cfg(feature = "python")]
+        pyo3::Python::attach(|_| self.pbar.suspend(|| self.inner.log(record)));
+        #[cfg(not(feature = "python"))]
+        self.pbar.suspend(|| self.inner.log(record));
     }
 
     fn flush(&self) {
