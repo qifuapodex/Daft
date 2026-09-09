@@ -361,10 +361,11 @@ class RaySwordfishActor:
                     yield mp
                     continue
                 buf.append(mp)
-                # An unknown size collapses to target_bytes so we flush immediately rather than
-                # buffering unboundedly when size metadata is missing.
-                buf_bytes += mp.size_bytes() or target_bytes
-                if buf_bytes >= target_bytes:
+                # Zero is a known size for an empty partition, not missing metadata.
+                # Unknown sizes flush immediately; the count cap also bounds empty buffers.
+                size = mp.size_bytes()
+                buf_bytes += target_bytes if size is None else size
+                if buf_bytes >= target_bytes or len(buf) >= 1024:
                     yield flush()
 
             # batch flight partition refs before sending the scheduler
