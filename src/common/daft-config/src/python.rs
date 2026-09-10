@@ -131,7 +131,7 @@ impl PyDaftExecutionConfig {
         flight_shuffle_recovery_max_inflight=None,
         flight_shuffle_recovery_max_consumer_failures=None,
         flight_shuffle_recovery_max_depth=None,
-        flight_shuffle_recovery_wait_timeout_ms=None,
+        flight_shuffle_recovery_wait_warn_ms=None,
         flight_shuffle_recovery_max_retained_maps=None,
         flight_shuffle_recovery_max_retained_bytes=None,
 
@@ -182,7 +182,7 @@ impl PyDaftExecutionConfig {
         flight_shuffle_recovery_max_inflight: Option<usize>,
         flight_shuffle_recovery_max_consumer_failures: Option<usize>,
         flight_shuffle_recovery_max_depth: Option<usize>,
-        flight_shuffle_recovery_wait_timeout_ms: Option<u64>,
+        flight_shuffle_recovery_wait_warn_ms: Option<u64>,
         flight_shuffle_recovery_max_retained_maps: Option<usize>,
         flight_shuffle_recovery_max_retained_bytes: Option<usize>,
 
@@ -216,8 +216,8 @@ impl PyDaftExecutionConfig {
             }
             config.flight_shuffle_recovery_max_depth = value;
         }
-        if let Some(value) = flight_shuffle_recovery_wait_timeout_ms {
-            config.flight_shuffle_recovery_wait_timeout_ms = value;
+        if let Some(value) = flight_shuffle_recovery_wait_warn_ms {
+            config.flight_shuffle_recovery_wait_warn_ms = value;
         }
         if let Some(value) = flight_shuffle_recovery_max_retained_maps {
             if value == 0 {
@@ -666,8 +666,8 @@ impl PyDaftExecutionConfig {
     }
 
     #[getter]
-    fn flight_shuffle_recovery_wait_timeout_ms(&self) -> PyResult<u64> {
-        Ok(self.config.flight_shuffle_recovery_wait_timeout_ms)
+    fn flight_shuffle_recovery_wait_warn_ms(&self) -> PyResult<u64> {
+        Ok(self.config.flight_shuffle_recovery_wait_warn_ms)
     }
 
     #[getter]

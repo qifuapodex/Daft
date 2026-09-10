@@ -168,7 +168,7 @@ pub struct DaftExecutionConfig {
     pub flight_shuffle_recovery_max_inflight: usize,
     pub flight_shuffle_recovery_max_consumer_failures: usize,
     pub flight_shuffle_recovery_max_depth: usize,
-    pub flight_shuffle_recovery_wait_timeout_ms: u64,
+    pub flight_shuffle_recovery_wait_warn_ms: u64,
     pub flight_shuffle_recovery_max_retained_maps: usize,
     pub flight_shuffle_recovery_max_retained_bytes: usize,
 
@@ -227,7 +227,7 @@ impl Default for DaftExecutionConfig {
             flight_shuffle_recovery_max_inflight: 4,
             flight_shuffle_recovery_max_consumer_failures: 64,
             flight_shuffle_recovery_max_depth: 16,
-            flight_shuffle_recovery_wait_timeout_ms: 0,
+            flight_shuffle_recovery_wait_warn_ms: 0,
             flight_shuffle_recovery_max_retained_maps: 10000,
             flight_shuffle_recovery_max_retained_bytes: 268435456,
 

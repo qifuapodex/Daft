@@ -75,9 +75,12 @@ pub(super) struct Dispatcher<W: Worker> {
 }
 
 impl<W: Worker> Dispatcher<W> {
-    pub fn new(statistics_manager: StatisticsManagerRef) -> Self {
+    pub fn new(
+        statistics_manager: StatisticsManagerRef,
+        recovery: Arc<super::shuffle_recovery::ShuffleRecovery>,
+    ) -> Self {
         Self {
-            recovery: Arc::new(super::shuffle_recovery::ShuffleRecovery::new()),
+            recovery,
             deferred: Vec::new(),
             task_result_joinset: JoinSet::new(),
             joinset_id_to_task: HashMap::new(),
@@ -102,16 +105,13 @@ impl<W: Worker> Dispatcher<W> {
         Self {
             max_transient_retries,
             max_infra_retries,
-            ..Self::new(statistics_manager)
+            ..Self::new(
+                statistics_manager,
+                Arc::new(super::shuffle_recovery::ShuffleRecovery::new()),
+            )
         }
     }
 
-    pub fn set_shuffle_recovery(
-        &mut self,
-        recovery: Arc<super::shuffle_recovery::ShuffleRecovery>,
-    ) {
-        self.recovery = recovery;
-    }
     pub fn take_deferred_tasks(&mut self) -> Vec<PendingTask<W::Task>> {
         std::mem::take(&mut self.deferred)
     }
@@ -123,28 +123,26 @@ impl<W: Worker> Dispatcher<W> {
     ) -> DaftResult<()> {
         let mut worker_to_tasks = HashMap::new();
         let mut task_context_to_task = HashMap::new();
-        let mut permits = HashMap::new();
 
         for mut scheduled_task in scheduled_tasks {
             if !scheduled_task.prepare_dispatch(&self.recovery) {
                 self.deferred.push(scheduled_task.defer());
                 continue;
             }
-            let permit = match scheduled_task.task().recovery_slot(&self.recovery) {
+            let permit = match scheduled_task.task_ref().recovery_slot(&self.recovery) {
                 Ok(permit) => permit,
                 Err(()) => {
                     self.deferred.push(scheduled_task.defer());
                     continue;
                 }
             };
-            permits.insert(scheduled_task.task().task_context(), permit);
             self.statistics_manager.handle_event(TaskEvent::Scheduled {
-                context: scheduled_task.task().task_context(),
+                context: scheduled_task.task_ref().task_context(),
                 worker_id: scheduled_task.worker_id(),
             })?;
             let worker_id = scheduled_task.worker_id();
             let task = scheduled_task.task();
-            task_context_to_task.insert(task.task_context(), scheduled_task);
+            task_context_to_task.insert(task.task_context(), (scheduled_task, permit));
             worker_to_tasks
                 .entry(worker_id)
                 .or_insert_with(Vec::new)
@@ -154,10 +152,9 @@ impl<W: Worker> Dispatcher<W> {
         let result_handles = worker_manager.submit_tasks_to_workers(worker_to_tasks)?;
 
         for result_handle in result_handles {
-            let scheduled_task = task_context_to_task
+            let (scheduled_task, permit) = task_context_to_task
                 .remove(&result_handle.task_context())
                 .expect("Task should be present in task_context_to_task");
-            let permit = permits.remove(&result_handle.task_context());
             let result_awaiter =
                 TaskResultAwaiter::new(result_handle, scheduled_task.cancel_token());
             let id = self.task_result_joinset.spawn(async move {
@@ -208,7 +205,8 @@ impl<W: Worker> Dispatcher<W> {
                 worker_manager.mark_task_finished(task.task_context(), worker_id.clone());
 
                 // Decide the disposition before emitting the event, so the event's
-                // `retryable` flag matches what actually happens to the task.
+                // `retryable` flag matches retries under this task ID. Shuffle
+                // recovery may submit a new physical task ID above this layer.
                 // `attempts` counts failures *before* this one, so the run that just
                 // finished is attempt number `attempts + 1`.
                 let disposition = match &task_result {
@@ -243,7 +241,7 @@ impl<W: Worker> Dispatcher<W> {
                             }
                         }
                         // Task failed. Transient errors get another attempt; everything
-                        // else goes straight upstream and fails the query.
+                        // else goes upstream for recovery or query failure.
                         TaskStatus::Failed { error } => match disposition {
                             TaskDisposition::Retry => {
                                 let backoff = retry_backoff(attempts);

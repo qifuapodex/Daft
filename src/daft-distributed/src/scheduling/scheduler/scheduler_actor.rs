@@ -54,8 +54,9 @@ where
         task_rx: SchedulerReceiver<W::Task>,
         worker_manager: Arc<dyn WorkerManager<Worker = W>>,
         statistics_manager: StatisticsManagerRef,
+        recovery: Arc<crate::scheduling::shuffle_recovery::ShuffleRecovery>,
     ) -> Self {
-        let dispatcher = Dispatcher::new(statistics_manager.clone());
+        let dispatcher = Dispatcher::new(statistics_manager.clone(), recovery);
         Self {
             scheduler,
             task_rx,
@@ -260,15 +261,13 @@ where
     let (scheduler_sender, scheduler_receiver) = create_unbounded_channel();
     let recovery_statistics = statistics_manager.clone();
     let mut handle = SchedulerHandle::new(scheduler_sender);
-    let mut loop_state = SchedulerLoop::new(
+    let loop_state = SchedulerLoop::new(
         scheduler,
         scheduler_receiver,
         worker_manager,
         statistics_manager,
+        handle.shuffle_recovery.clone(),
     );
-    loop_state
-        .dispatcher
-        .set_shuffle_recovery(handle.shuffle_recovery.clone());
     joinset.spawn(loop_state.run());
     handle.recovery_statistics = recovery_statistics;
     handle
@@ -544,14 +543,15 @@ mod tests {
         let mut joinset = JoinSet::new();
 
         let (scheduler_sender, scheduler_receiver) = create_unbounded_channel();
+        let scheduler_handle = SchedulerHandle::new(scheduler_sender);
         let loop_state = SchedulerLoop::new(
             DefaultScheduler::<MockTask>::default(),
             scheduler_receiver,
             worker_manager.clone(),
             StatisticsManagerRef::default(),
+            scheduler_handle.shuffle_recovery.clone(),
         );
         joinset.spawn(loop_state.run());
-        let scheduler_handle = SchedulerHandle::new(scheduler_sender);
 
         SchedulerActorTestContext {
             scheduler_handle_ref: Arc::new(scheduler_handle),

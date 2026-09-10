@@ -128,7 +128,8 @@ fn task_info_from_context(context: &TaskContext, name: Option<String>) -> Arc<Ta
         name: name
             .or_else(|| {
                 context
-                    .reconstruction_of
+                    .recovery
+                    .producer_id()
                     .map(|id| format!("Shuffle reconstruction of task {id}"))
             })
             .map(Arc::from),

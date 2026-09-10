@@ -822,15 +822,27 @@ def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, d
             from pathlib import Path
 
             from daft.daft import RayTaskResult
+            from daft.exceptions import DaftShuffleFetchError
             from daft.runners.flotilla import RaySwordfishTaskHandle
 
             original = RaySwordfishTaskHandle._get_result
-            state = {"deleted": [], "published": []}
+            state = {"deleted": [], "published": [], "wrapped": 0}
             actor_self._shuffle_recovery_test = (original, state)
             root = Path(shared_root)
 
+            class IncompleteFetchWrapper(DaftShuffleFetchError):
+                def __init__(self, cause):
+                    Exception.__init__(self, str(cause))
+                    self.cause = cause
+
             async def inject_after_publication(handle):
-                result = await original(handle)
+                try:
+                    result = await original(handle)
+                except DaftShuffleFetchError as error:
+                    if nested_builtin:
+                        state["wrapped"] += 1
+                        raise IncompleteFetchWrapper(error) from error
+                    raise
                 if isinstance(result, RayTaskResult.SuccessFlight) and result._0:
                     ref = result._0[0]
                     input_id = ref.partition_ref_id >> 32
@@ -875,6 +887,8 @@ def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, d
 
         assert len(state["deleted"]) == 1, "the test must actually remove a published map file"
         assert sorted(got) == rows
+        if nested_builtin:
+            assert state["wrapped"] > 0, "must exercise an incomplete wrapper around the original fetch exception"
         lost_shuffle = state["deleted"][0][0]
         same_shuffle = [entry for entry in state["published"] if entry[0] == lost_shuffle]
         # The simple input merges into one map; the nested projection retains two.

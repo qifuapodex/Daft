@@ -186,11 +186,15 @@ pub(super) struct ScheduledTask<T: Task> {
     cancel_token: CancellationToken,
     worker_id: WorkerId,
     attempts: u32,
+    not_before: Option<Instant>,
+    avoid_worker: Option<WorkerId>,
 }
 
 impl<T: Task> ScheduledTask<T> {
     pub fn new(pending_task: PendingTask<T>, worker_id: WorkerId) -> Self {
         let attempts = pending_task.attempts();
+        let not_before = pending_task.not_before;
+        let avoid_worker = pending_task.avoid_worker.clone();
         let (task, result_tx, cancel_token) = pending_task.into_inner();
         Self {
             task,
@@ -198,6 +202,8 @@ impl<T: Task> ScheduledTask<T> {
             cancel_token,
             worker_id,
             attempts,
+            not_before,
+            avoid_worker,
         }
     }
 
@@ -213,13 +219,17 @@ impl<T: Task> ScheduledTask<T> {
             result_tx: self.result_tx,
             cancel_token: self.cancel_token,
             attempts: self.attempts,
-            not_before: None,
-            avoid_worker: None,
+            not_before: self.not_before,
+            avoid_worker: self.avoid_worker,
         }
     }
 
     pub fn worker_id(&self) -> WorkerId {
         self.worker_id.clone()
+    }
+
+    pub fn task_ref(&self) -> &T {
+        &self.task
     }
 
     pub fn task(&self) -> T {
@@ -354,7 +364,7 @@ impl<W: Worker> From<&W> for WorkerSnapshot {
 #[cfg(test)]
 pub(super) mod test_utils {
 
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
     use super::*;
     use crate::scheduling::{
@@ -362,6 +372,28 @@ pub(super) mod test_utils {
         tests::{MockTask, MockTaskBuilder},
         worker::tests::MockWorker,
     };
+
+    #[test]
+    fn deferral_preserves_retry_backoff_and_worker_exclusion() {
+        let bad_worker: WorkerId = Arc::from("bad-worker");
+        let task = MockTaskBuilder::default().build();
+        let mut pending = PendingTask::retry(
+            task,
+            tokio::sync::oneshot::channel().0,
+            CancellationToken::new(),
+            3,
+            Duration::from_secs(30),
+            bad_worker.clone(),
+        );
+        let deadline = pending.not_before;
+        for _ in 0..3 {
+            pending = ScheduledTask::new(pending, Arc::from("healthy-worker")).defer();
+            assert_eq!(pending.not_before, deadline);
+            assert_eq!(pending.avoid_worker(), Some(&bad_worker));
+            assert!(!pending.is_ready(Instant::now()));
+            assert_eq!(pending.attempts(), 3);
+        }
+    }
 
     // Helper function to create workers with given configurations
     pub fn setup_workers(configs: &[(WorkerId, usize)]) -> HashMap<WorkerId, MockWorker> {

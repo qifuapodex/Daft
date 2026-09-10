@@ -475,8 +475,7 @@ fn rpc_stream_with_shared_fallback(
 // A failed alternate route must not erase the map identity needed by the
 // coordinator. Prefer the alternate route's identity when it has one.
 fn preserve_fetch_failure(original: &DaftError, fallback: DaftError) -> DaftError {
-    if !fallback.is_transient()
-        && fallback.shuffle_fetch_failure().is_none()
+    if fallback.shuffle_fetch_failure().is_none()
         && let Some(failure) = original.shuffle_fetch_failure()
     {
         DaftError::ShuffleFetchFailure(Box::new(failure))
@@ -575,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_fallback_keeps_transport_retry_classification() {
+    fn missing_output_identity_survives_transient_fallback() {
         let original =
             DaftError::ShuffleFetchFailure(Box::new(common_error::ShuffleFetchFailure {
                 shuffle_id: 1,
@@ -587,8 +586,8 @@ mod tests {
             }));
         let transient = DaftError::SocketError("connection reset".into());
         let error = preserve_fetch_failure(&original, transient);
-        assert!(error.is_transient());
-        assert!(error.shuffle_fetch_failure().is_none());
+        assert!(!error.is_transient());
+        assert_eq!(error.shuffle_fetch_failure().unwrap().input_id, 2);
         let error = preserve_fetch_failure(
             &original,
             DaftError::InternalError("fallback failed".into()),
@@ -742,8 +741,8 @@ mod tests {
         .await;
         let auto = auto.expect_err("both routes are down in this test");
         assert!(
-            !auto.to_string().contains("daft-shared-root"),
-            "auto should have moved on to gRPC, but reported the mount: {auto}"
+            auto.shuffle_fetch_failure().is_some(),
+            "the unavailable RPC route must not erase proven file loss: {auto}"
         );
     }
 

@@ -82,9 +82,11 @@ Permission/configuration errors and transient transport errors stay distinct.
 The payload survives local pipeline broadcasts, Flight status details and Python/Ray
 serialization; classification does not parse error strings.
 
-If the alternate route fails transiently, preserve that transient error for ordinary
-scheduler retries. Otherwise retain the original missing-output identity when the
-fallback has no structured fetch identity of its own.
+If both routes fail, retain the original missing-output identity when the fallback
+has no structured fetch identity of its own, including when that fallback fails
+transiently. This allows `auto` to reconstruct an output when the shared file is
+missing and the original writer is unreachable. Without evidence of a missing
+output, transport failures remain eligible for ordinary transient retries.
 
 ## Output directory, retention and binding
 
@@ -106,7 +108,9 @@ The directory caches rebinding by `(shuffle_id, original Arc address)` for the c
 directory version. Holding the original Arc prevents address reuse. All reducers
 sharing an original list also share one replacement `Arc<BTreeMap>`. Unchanged lists
 reuse their original Arc. Binding acquires the directory lock once, rather than once
-per map; a cache hit does not scan the map list.
+per map; a cache hit does not scan the map list. Binding updates input references
+in place without cloning the task or its input collection. Tasks without Flight
+shuffle inputs bypass the directory lock even after other outputs change.
 
 A reconstruction marks its failed output as being repaired before scheduling work.
 Dispatch defers consumers referencing that output until replacement publication.
@@ -122,14 +126,22 @@ outrank ordinary tasks; existing node/task ordering breaks ties. Earlier queries
 retain their priority. Tasks awaiting a dependency or execution permit are deferred.
 A reconstruction permit is acquired only at actual dispatch and released with the
 physical result, before recursive dependency recovery. Queueing holds no permit.
+Deferral preserves retry backoff and worker exclusion. A typed recovery role drives
+priority, naming and permit acquisition; worker event metadata is derived from it.
+The dispatcher receives the handle's directory in its constructor, so there is no
+second directory temporarily wired in by a setter.
 
-There is **no recovery deadline on producer or consumer queueing/execution**. An
-optional timeout applies only while waiting for another reconstruction owner; it is
-also disabled by default. Query cancellation remains the mechanism for stopping
-long-running physical work. Ownership wait timeout and dropped unfinished recovery
-futures do not consume a completed-attempt budget. Completed infrastructure failures
-consume budget, but transient errors do not mark a producer permanently terminal.
-Ordinary dispatcher transient/worker-loss retries still run first.
+There is **no recovery deadline on ownership waiting, queueing or execution**.
+An optional warning interval reports contention without abandoning the existing
+fair mutex waiter. Query cancellation remains the mechanism for stopping work.
+Dropped unfinished recovery futures do not consume a completed-attempt budget.
+Ordinary dispatcher transient/worker-loss retries run first. If a reconstruction
+still fails transiently, its owner spends one completed attempt and immediately
+uses any remaining map budget; it does not return the transient error to the
+consumer before that budget is exhausted. Transient failures never mark the map
+permanently terminal. Dependency or coordination failures do not charge or mark
+ancestor producers terminal. Deterministic execution and output-validation failures
+consume an attempt and mark the affected producer terminal.
 
 Configuration uses `DaftExecutionConfig` and `daft.set_execution_config`:
 
@@ -139,7 +151,7 @@ Configuration uses `DaftExecutionConfig` and `daft.set_execution_config`:
 | `flight_shuffle_recovery_max_inflight` | 4 | Concurrent physical reconstruction executions |
 | `flight_shuffle_recovery_max_consumer_failures` | 64 | Fetch recovery rounds per logical consumer |
 | `flight_shuffle_recovery_max_depth` | 16 | Maximum reconstruction dependency chain |
-| `flight_shuffle_recovery_wait_timeout_ms` | 0 | Ownership wait timeout; 0 disables it |
+| `flight_shuffle_recovery_wait_warn_ms` | 0 | Ownership wait warning interval; 0 disables warnings, never aborts waiting |
 | `flight_shuffle_recovery_max_retained_maps` | 10000 | Retained producer recipes per plan |
 | `flight_shuffle_recovery_max_retained_bytes` | 268435456 | Estimated retained input bytes per plan |
 
@@ -150,6 +162,13 @@ daft.set_execution_config(flight_shuffle_recovery_max_attempts=2)
 Dependency traversal rejects cycles and excessive depth. All aliases share the
 producer's attempt budget. Successful replacement selection is atomic under the
 directory lock. Partial/failed reconstruction outputs are never published.
+
+Bulk map loss is currently repaired one reported map at a time. This can reread
+consumer inputs repeatedly, and loss exceeding the configured consumer recovery
+round cap can still fail the query even when all maps have retained recipes.
+Batch discovery and repair are deferred: the coordinator cannot assume it mounts
+the workers' shared paths. A future storage-probe protocol should consolidate
+missing outputs and repairs without treating transport errors as file loss.
 
 ## Worker generations and lifecycle
 
@@ -174,6 +193,14 @@ the scheduler's Submitted event. Reconstruction task events identify the origina
 producer and node without reopening completed operators. Ordinary submissions store
 an inline oneshot receiver; only recovery futures require a Box allocation.
 
+The event stream still describes physical tasks: a failed fetch attempt receives
+a terminal event, and its recovery execution receives a new task ID. Consequently,
+a successful recovered query can contain failed tasks in the dashboard. The
+dispatcher's retryable-event contract covers retries under the same task ID.
+Logical-task/attempt links and corresponding dashboard aggregation are deferred;
+marking these new-ID attempts retryable by itself would leave unfinished task
+counts. This PR does not claim to resolve that presentation limitation.
+
 Remote cancellation and directory deletion follow the existing Ray protocol. This
 design does not add a distributed fence against an already-running worker completing
 a write after cancellation; stronger cleanup barriers are a separate extension.
@@ -187,12 +214,18 @@ recovery disabled. Additional review regressions cover:
 
 * 128 consumers queued with stale references, with consumer retries disabled,
   followed by prioritized repair and first-dispatch replacement binding.
-* Reconstruction queueing longer than the configured ownership timeout, and a
-  separate ownership timeout that leaves the producer budget usable.
+* Ownership wait, reconstruction queueing and execution longer than the warning
+  interval, with successful recovery and no premature budget consumption.
+* Missing shared output with an unreachable writer endpoint under both `auto`
+  and `rpc`, plus transient reconstruction failures that exhaust dispatcher
+  retries and succeed using the remaining map budget.
+* Nested dependency rejection without charging ancestors, deterministic output
+  validation failure becoming terminal, and deferral preserving retry constraints.
 * 8,000 bindings of a shared 10,000-map list retaining one replacement Arc.
 * Retention caps preserving successful map execution.
 * Replacement pipeline generation created before the old receiver finishes.
-* Transient fallback classification, configuration serialization, and rejection of
+* Fetch identity preservation through transient fallback and incomplete Python
+  exception wrappers, configuration serialization and typing, and rejection of
   snapshot requests after the statistics manager's final drain.
 
 End-to-end tests inject deletion in the Flotilla scheduler actor after real Ray
@@ -201,11 +234,12 @@ These are single-node tests. No multi-node storage-failure validation or large-s
 throughput/heap benchmark is claimed. Extending scan recovery requires snapshot
 validation; indeterminate output requires stage/descendant rollback.
 
-Final review validation (2026-09-10): 246 Rust tests passed across distributed
-(105), local execution (95), shuffle (44), and common error (2), with four existing
+Final review validation (2026-09-10): 250 Rust tests passed across distributed
+(109), local execution (95), shuffle (44), and common error (2), with four existing
 unit-test ignores and one ignored doctest. Python/Ray validation covered 97 passing
 cases across shuffle, generator retry, transient error, exception serialization and
-configuration tests; the nine nested cases passed after correcting the injection
-test's assumptions about physical map count. The repeated-deletion regression also
-passed 100 isolated runs after the statistics shutdown fix. `make build` passed with
-`DAFT_DASHBOARD_SKIP_BUILD=1`; Rust formatting and scoped Python lint checks passed.
+configuration tests, including nine nested cases with incomplete exception
+wrappers. `make build` passed with `DAFT_DASHBOARD_SKIP_BUILD=1`; the repository
+pinned pre-commit `mypy --strict` hook, Rust formatting and scoped Python lint
+checks passed. Tests use an unreachable old writer endpoint for the connection
+failure case; they do not claim to exercise actual multi-node worker death.

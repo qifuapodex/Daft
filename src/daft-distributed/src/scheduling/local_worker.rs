@@ -54,6 +54,7 @@ pub struct LocalSwordfishWorker {
     input_id_counter: Arc<AtomicU32>,
     shuffle_enabled: bool,
     execution_delay_ms: Arc<AtomicU32>,
+    transient_reconstruction_failures: Arc<AtomicU32>,
 }
 
 impl std::fmt::Debug for LocalSwordfishWorker {
@@ -75,6 +76,7 @@ impl LocalSwordfishWorker {
             input_id_counter: Arc::new(AtomicU32::new(0)),
             shuffle_enabled: false,
             execution_delay_ms: Arc::new(AtomicU32::new(0)),
+            transient_reconstruction_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -83,6 +85,11 @@ impl LocalSwordfishWorker {
         worker.executor = Arc::new(Mutex::new(NativeExecutor::new(true, "127.0.0.1")));
         worker.shuffle_enabled = true;
         worker
+    }
+
+    pub fn fail_reconstruction_executions(&self, count: u32) {
+        self.transient_reconstruction_failures
+            .store(count, Ordering::Relaxed);
     }
 
     pub fn set_execution_delay_ms(&self, millis: u32) {
@@ -160,6 +167,7 @@ pub struct LocalSwordfishTaskResultHandle {
     executor: Arc<Mutex<NativeExecutor>>,
     input_id: InputId,
     execution_delay_ms: u32,
+    transient_reconstruction_failures: Arc<AtomicU32>,
 }
 
 impl LocalSwordfishTaskResultHandle {
@@ -175,6 +183,7 @@ impl LocalSwordfishTaskResultHandle {
             executor: worker.executor.clone(),
             input_id,
             execution_delay_ms: worker.execution_delay_ms.load(Ordering::Relaxed),
+            transient_reconstruction_failures: worker.transient_reconstruction_failures.clone(),
         }
     }
 }
@@ -195,8 +204,21 @@ impl TaskResultHandle for LocalSwordfishTaskResultHandle {
         let executor = self.executor.clone();
         let input_id = self.input_id;
         let execution_delay_ms = self.execution_delay_ms;
+        let reconstruction = self.task.is_reconstruction();
+        let failures = self.transient_reconstruction_failures.clone();
 
         async move {
+            if reconstruction
+                && failures
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return TaskStatus::Failed {
+                    error: common_error::DaftError::SocketError(
+                        "injected reconstruction transport failure".into(),
+                    ),
+                };
+            }
             if execution_delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(u64::from(
                     execution_delay_ms,

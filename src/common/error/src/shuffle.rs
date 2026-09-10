@@ -41,14 +41,23 @@ impl DaftError {
                 let mut value = error.value(py).as_any().clone();
                 for _ in 0..=4 {
                     if value.is_instance_of::<crate::python::DaftShuffleFetchError>() {
-                        return Some(ShuffleFetchFailure {
-                            shuffle_id: value.getattr("shuffle_id").ok()?.extract().ok()?,
-                            input_id: value.getattr("input_id").ok()?.extract().ok()?,
-                            attempt: value.getattr("attempt").ok()?.extract().ok()?,
-                            partition_idx: value.getattr("partition_idx").ok()?.extract().ok()?,
-                            path: value.getattr("path").ok()?.extract().ok()?,
-                            message: value.getattr("message").ok()?.extract().ok()?,
-                        });
+                        let identity = (|| {
+                            Some(ShuffleFetchFailure {
+                                shuffle_id: value.getattr("shuffle_id").ok()?.extract().ok()?,
+                                input_id: value.getattr("input_id").ok()?.extract().ok()?,
+                                attempt: value.getattr("attempt").ok()?.extract().ok()?,
+                                partition_idx: value
+                                    .getattr("partition_idx")
+                                    .ok()?
+                                    .extract()
+                                    .ok()?,
+                                path: value.getattr("path").ok()?.extract().ok()?,
+                                message: value.getattr("message").ok()?.extract().ok()?,
+                            })
+                        })();
+                        if identity.is_some() {
+                            return identity;
+                        }
                     }
                     value = value
                         .getattr("cause")

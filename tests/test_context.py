@@ -390,13 +390,13 @@ def test_shuffle_recovery_configuration_roundtrip():
 
     config = PyDaftExecutionConfig()
     assert config.flight_shuffle_recovery_max_attempts == 0
-    assert config.flight_shuffle_recovery_wait_timeout_ms == 0
+    assert config.flight_shuffle_recovery_wait_warn_ms == 0
     options = {
         "flight_shuffle_recovery_max_attempts": 2,
         "flight_shuffle_recovery_max_inflight": 3,
         "flight_shuffle_recovery_max_consumer_failures": 7,
         "flight_shuffle_recovery_max_depth": 8,
-        "flight_shuffle_recovery_wait_timeout_ms": 50,
+        "flight_shuffle_recovery_wait_warn_ms": 50,
         "flight_shuffle_recovery_max_retained_maps": 100,
         "flight_shuffle_recovery_max_retained_bytes": 4096,
     }
@@ -404,6 +404,6 @@ def test_shuffle_recovery_configuration_roundtrip():
     restored = pickle.loads(pickle.dumps(configured))
     for key, value in options.items():
         assert getattr(restored, key) == value
-    for key in options.keys() - {"flight_shuffle_recovery_max_attempts", "flight_shuffle_recovery_wait_timeout_ms"}:
+    for key in options.keys() - {"flight_shuffle_recovery_max_attempts", "flight_shuffle_recovery_wait_warn_ms"}:
         with pytest.raises(ValueError, match="must be positive"):
             config.with_config_values(**{key: 0})

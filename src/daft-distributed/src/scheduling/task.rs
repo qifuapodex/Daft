@@ -46,6 +46,31 @@ impl TaskResourceRequest {
 pub(crate) type TaskID = u32;
 pub(crate) type TaskName = String;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum RecoveryRole {
+    #[default]
+    Ordinary,
+    ConsumerRetry,
+    Reconstruction {
+        producer_id: TaskID,
+    },
+}
+impl RecoveryRole {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Ordinary => 0,
+            Self::ConsumerRetry => 1,
+            Self::Reconstruction { .. } => 2,
+        }
+    }
+    pub fn producer_id(self) -> Option<TaskID> {
+        match self {
+            Self::Reconstruction { producer_id } => Some(producer_id),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[allow(clippy::struct_field_names)]
 pub(crate) struct TaskContext {
@@ -61,7 +86,7 @@ pub(crate) struct TaskContext {
     /// Assigned by pipeline nodes: tasks with the same fingerprint have structurally
     /// identical plans and can share a single pipeline for execution.
     pub plan_fingerprint: PlanFingerprint,
-    pub reconstruction_of: Option<TaskID>,
+    pub recovery: RecoveryRole,
 }
 
 impl TaskContext {
@@ -78,7 +103,7 @@ impl TaskContext {
             task_id,
             node_ids,
             plan_fingerprint,
-            reconstruction_of: None,
+            recovery: RecoveryRole::Ordinary,
         }
     }
 }
@@ -312,6 +337,7 @@ impl SwordfishTask {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_recovery_inputs(&self, inputs: HashMap<SourceId, Input>) -> Self {
         Self {
             inputs,
@@ -319,30 +345,40 @@ impl SwordfishTask {
         }
     }
 
-    /// A reconstruction is a new physical execution, not another completion of
-    /// the original producer. Worker generations isolate failed pipelines.
-    pub(crate) fn recovery_attempt(&self, task_id: TaskID, producer: bool) -> Self {
+    pub(crate) fn recovery_attempt(&self, task_id: TaskID) -> Self {
+        let role = if self.is_reconstruction() {
+            self.task_context.recovery
+        } else {
+            RecoveryRole::ConsumerRetry
+        };
+        self.with_recovery_role(task_id, role)
+    }
+
+    pub(crate) fn reconstruction_attempt(&self, task_id: TaskID) -> Self {
+        self.with_recovery_role(
+            task_id,
+            RecoveryRole::Reconstruction {
+                producer_id: self
+                    .task_context
+                    .recovery
+                    .producer_id()
+                    .unwrap_or(self.task_context.task_id),
+            },
+        )
+    }
+
+    fn with_recovery_role(&self, task_id: TaskID, role: RecoveryRole) -> Self {
         let mut task = self.clone();
         task.task_context.task_id = task_id;
-        // Worker execution generations isolate failed state while keeping the
-        // logical fingerprint reusable by all consumers of this pipeline.
-        if producer {
-            // The original operator already completed. Reconstruction work has
-            // task-level telemetry but does not reopen its logical lifecycle.
+        task.task_context.recovery = role;
+        if role.producer_id().is_some() {
             task.task_context.node_ids.clear();
-            task.task_context.reconstruction_of = Some(
-                self.task_context
-                    .reconstruction_of
-                    .unwrap_or(self.task_context.task_id),
-            );
-            task.context
-                .insert("shuffle_reconstruction".into(), "true".into());
         }
-        if producer {
-            task.context.insert(
-                "shuffle_reconstruction_of".into(),
-                task.task_context.reconstruction_of.unwrap().to_string(),
-            );
+        // These values are a projection for worker event serialization only.
+        // Scheduling, naming and permit decisions use the typed role above.
+        if let Some(producer_id) = task.task_context.recovery.producer_id() {
+            task.context
+                .insert("shuffle_reconstruction_of".into(), producer_id.to_string());
             task.context.insert(
                 "shuffle_reconstruction_node".into(),
                 task.task_context.last_node_id.to_string(),
@@ -353,15 +389,11 @@ impl SwordfishTask {
             "plan_fingerprint".into(),
             task.task_context.plan_fingerprint.to_string(),
         );
-        task.context.insert(
-            "shuffle_recovery_of".into(),
-            self.task_context.task_id.to_string(),
-        );
         task
     }
 
     pub(crate) fn is_reconstruction(&self) -> bool {
-        self.context.contains_key("shuffle_reconstruction")
+        self.task_context.recovery.producer_id().is_some()
     }
 
     pub fn plan(&self) -> LocalPhysicalPlanRef {
@@ -370,6 +402,10 @@ impl SwordfishTask {
 
     pub fn config(&self) -> &Arc<DaftExecutionConfig> {
         &self.config
+    }
+
+    pub(crate) fn inputs_mut(&mut self) -> &mut HashMap<SourceId, Input> {
+        &mut self.inputs
     }
 
     pub fn inputs(&self) -> &HashMap<SourceId, Input> {
@@ -397,15 +433,7 @@ impl Task for SwordfishTask {
         super::shuffle_recovery::submit(task, scheduler)
     }
     fn prepare_dispatch(&mut self, recovery: &super::shuffle_recovery::ShuffleRecovery) -> bool {
-        if !recovery.has_updates() {
-            return true;
-        }
-        if let Some(bound) = recovery.bind(self) {
-            *self = bound;
-            true
-        } else {
-            false
-        }
+        recovery.bind(self)
     }
     fn recovery_slot(
         &self,
@@ -422,7 +450,7 @@ impl Task for SwordfishTask {
         if self.is_reconstruction() {
             format!(
                 "Shuffle reconstruction of task {}: {}",
-                self.context["shuffle_reconstruction_of"],
+                self.task_context.recovery.producer_id().unwrap(),
                 self.name()
             )
         } else {
@@ -443,11 +471,7 @@ impl Task for SwordfishTask {
             query_idx: self.task_context.query_idx,
             node_id: self.task_context.last_node_id,
             task_id: self.task_context.task_id,
-            recovery: if self.is_reconstruction() {
-                2
-            } else {
-                u8::from(self.context.contains_key("shuffle_recovery_of"))
-            },
+            recovery: self.task_context.recovery.priority(),
         }
     }
 
@@ -735,7 +759,7 @@ impl SwordfishTaskBuilder {
 
         let task_id = task_id_counter.next();
         let task_context = TaskContext {
-            reconstruction_of: None,
+            recovery: RecoveryRole::Ordinary,
             query_idx,
             last_node_id: *self
                 .pending_node_ids

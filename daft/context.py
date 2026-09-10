@@ -253,7 +253,7 @@ def set_execution_config(
     flight_shuffle_recovery_max_inflight: int | None = None,
     flight_shuffle_recovery_max_consumer_failures: int | None = None,
     flight_shuffle_recovery_max_depth: int | None = None,
-    flight_shuffle_recovery_wait_timeout_ms: int | None = None,
+    flight_shuffle_recovery_wait_warn_ms: int | None = None,
     flight_shuffle_recovery_max_retained_maps: int | None = None,
     flight_shuffle_recovery_max_retained_bytes: int | None = None,
     enable_multi_glob_path_tasks: bool | None = None,
@@ -313,7 +313,7 @@ def set_execution_config(
         flight_shuffle_recovery_max_inflight: Maximum concurrently executing reconstruction tasks per query. Defaults to 4.
         flight_shuffle_recovery_max_consumer_failures: Maximum fetch recovery rounds per consumer. Defaults to 64.
         flight_shuffle_recovery_max_depth: Maximum reconstruction dependency depth. Defaults to 16.
-        flight_shuffle_recovery_wait_timeout_ms: Timeout for waiting for another repair owner. Does not limit task queuing or execution. Defaults to 0 (no ownership-wait deadline).
+        flight_shuffle_recovery_wait_warn_ms: Interval for warnings while waiting for another repair owner. Never aborts recovery or limits execution. Defaults to 0 (disabled).
         flight_shuffle_recovery_max_retained_maps: Maximum retained producer recipes per query. Defaults to 10000. Additional producers remain executable but are not recoverable.
         flight_shuffle_recovery_max_retained_bytes: Conservative retained input byte budget per query. Defaults to 256 MiB. Shared references may be charged more than once; producers beyond the budget are not recoverable.
         flight_shuffle_read_source: How this worker fetches shuffle partitions written by other workers. "auto" (the default) reads the shared directory directly when the data is there and otherwise uses gRPC; "rpc" always tries gRPC first; "shared" always reads the shared directory for shuffles written there and requires `flight_shuffle_placement="shared_only"` (gather and into_partitions are always node-local and are read over gRPC regardless). "auto" and "rpc" both fall back to the shared directory if the gRPC fetch fails before returning data.
@@ -377,7 +377,7 @@ def set_execution_config(
             flight_shuffle_recovery_max_inflight=flight_shuffle_recovery_max_inflight,
             flight_shuffle_recovery_max_consumer_failures=flight_shuffle_recovery_max_consumer_failures,
             flight_shuffle_recovery_max_depth=flight_shuffle_recovery_max_depth,
-            flight_shuffle_recovery_wait_timeout_ms=flight_shuffle_recovery_wait_timeout_ms,
+            flight_shuffle_recovery_wait_warn_ms=flight_shuffle_recovery_wait_warn_ms,
             flight_shuffle_recovery_max_retained_maps=flight_shuffle_recovery_max_retained_maps,
             flight_shuffle_recovery_max_retained_bytes=flight_shuffle_recovery_max_retained_bytes,
             enable_multi_glob_path_tasks=enable_multi_glob_path_tasks,

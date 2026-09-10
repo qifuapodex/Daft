@@ -248,9 +248,9 @@ impl ShuffleFlightServer {
 
         // Group ranged reads by file path so each physical file is read from a single FD.
         let mut specs: Vec<FileReadSpec> = Vec::new();
-        let mut ranges_by_path: HashMap<String, Vec<RangeSpec>> = HashMap::new();
+        let mut ranges_by_path: HashMap<String, (Vec<RangeSpec>, ShuffleFetchFailure)> =
+            HashMap::new();
         let mut order: Vec<String> = Vec::new();
-        let mut identities = HashMap::new();
 
         for (cache, (attempt, partition_ref_id)) in caches.into_iter().zip(refs) {
             let identity = |path: &String| ShuffleFetchFailure {
@@ -266,12 +266,9 @@ impl ShuffleFlightServer {
                     for (idx, (path, (start, end))) in
                         cache.file_paths.iter().zip(ranges.iter()).enumerate()
                     {
-                        identities
-                            .entry(path.clone())
-                            .or_insert_with(|| identity(path));
-                        let entry = ranges_by_path.entry(path.clone()).or_insert_with(|| {
+                        let (entry, _) = ranges_by_path.entry(path.clone()).or_insert_with(|| {
                             order.push(path.clone());
-                            Vec::new()
+                            (Vec::new(), identity(path))
                         });
                         entry.push(RangeSpec {
                             start: *start,
@@ -292,12 +289,11 @@ impl ShuffleFlightServer {
         }
 
         for path in order {
-            let mut ranges = ranges_by_path.remove(&path).unwrap_or_default();
+            let Some((mut ranges, failure)) = ranges_by_path.remove(&path) else {
+                return Err(refs.to_vec());
+            };
             // Sort by start so sequential reads stay forward-going (kind to readahead).
             ranges.sort_unstable_by_key(|r| r.start);
-            let failure = identities
-                .remove(&path)
-                .expect("ranged read has an identity");
             specs.push(FileReadSpec::Ranges {
                 path,
                 ranges,
