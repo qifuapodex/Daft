@@ -141,14 +141,6 @@ pub struct DaftExecutionConfig {
     pub read_sql_partition_size_bytes: usize,
     pub default_morsel_size: NonZeroUsize,
     pub shuffle_algorithm: String,
-    /// Opt-in coalescing of eligible internal Flight exchanges.
-    #[serde(default)]
-    pub experimental_shuffle_aqe: bool,
-    #[serde(default = "default_shuffle_aqe_target_bytes")]
-    pub experimental_shuffle_aqe_target_bytes: usize,
-    /// None uses the cluster CPU snapshot; Some overrides the task floor.
-    #[serde(default)]
-    pub experimental_shuffle_aqe_min_partitions: Option<usize>,
     pub pre_shuffle_merge_threshold: usize,
     pub pre_shuffle_merge_partition_threshold: usize,
     pub scantask_max_parallel: usize,
@@ -172,6 +164,16 @@ pub struct DaftExecutionConfig {
     /// Map files a reduce task reads from the shared mount at once.
     pub flight_shuffle_shared_read_concurrency: usize,
     pub enable_multi_glob_path_tasks: bool,
+    // Defaults apply to tagged formats, not bincode. Python pickle uses a
+    // versioned factory and rejects pre-AQE positional payloads.
+    /// Opt-in coalescing of eligible internal Flight exchanges.
+    #[serde(default)]
+    pub experimental_shuffle_aqe: bool,
+    #[serde(default = "default_shuffle_aqe_target_bytes")]
+    pub experimental_shuffle_aqe_target_bytes: usize,
+    /// None uses the cluster CPU snapshot; Some overrides the task floor.
+    #[serde(default)]
+    pub experimental_shuffle_aqe_min_partitions: Option<usize>,
 }
 
 #[cfg(not(debug_assertions))]

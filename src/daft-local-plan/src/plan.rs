@@ -2529,14 +2529,15 @@ pub struct FlightMapOutput {
 pub struct FlightShuffleReadInput {
     pub shuffle_id: u64,
     pub partition_idx: u32,
-    /// Set only by an eligible, explicitly enabled AQE exchange.
-    #[serde(default)]
-    pub coalesce_ranges: bool,
     pub inputs_by_server: Arc<BTreeMap<String, Vec<FlightMapOutput>>>,
     /// Shared mount holding this shuffle's map files, when it was written with
     /// shared placement. A per-shuffle constant, shared by `Arc` across every
     /// reduce task so the coordinator holds one copy rather than one per input.
     pub shared_root: Option<Arc<str>>,
+    // Bincode is positional: compatibility is enforced by PyInput's versioned pickle factory.
+    /// Set only by an eligible, explicitly enabled AQE exchange.
+    #[serde(default)]
+    pub coalesce_ranges: bool,
 }
 
 #[cfg(test)]

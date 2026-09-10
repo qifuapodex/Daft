@@ -43,7 +43,7 @@ pub(crate) fn coalesce_partitions(
     sizes: &[usize],
     target: usize,
     min_partitions: usize,
-) -> DaftResult<Vec<Range<usize>>> {
+) -> DaftResult<(Vec<Range<usize>>, usize)> {
     if target == 0 || min_partitions == 0 {
         return Err(DaftError::ValueError(
             "Shuffle AQE target bytes and minimum partitions must be greater than 0".into(),
@@ -70,6 +70,7 @@ pub(crate) fn coalesce_partitions(
     }
     // Split only at original bucket boundaries to retain both byte/width caps.
     // Splitting the widest group first avoids leaving a long tail of singletons.
+    let before_floor = groups.len();
     let minimum = min_partitions.min(sizes.len());
     if groups.len() < minimum {
         let mut heap: BinaryHeap<_> = groups
@@ -85,7 +86,7 @@ pub(crate) fn coalesce_partitions(
         groups = heap.into_iter().map(|(_, start, end)| start..end).collect();
         groups.sort_unstable_by_key(|r| r.start);
     }
-    Ok(groups)
+    Ok((groups, before_floor))
 }
 
 #[cfg(test)]
@@ -93,19 +94,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn floor_status_requires_a_real_change_to_greedy_groups() {
+        let (large, before) = coalesce_partitions(&[500; 4], 100, 20).unwrap();
+        assert_eq!(large.len(), before);
+        let (small, before) = coalesce_partitions(&[1; 4], 100, 20).unwrap();
+        assert_eq!(small.len(), 4);
+        assert_eq!(before, 1);
+    }
+
+    #[test]
     fn coalescing_preserves_coverage_and_large_buckets() {
         assert_eq!(
-            coalesce_partitions(&[20, 30, 0, 80, 200, 10], 100, 1).unwrap(),
+            coalesce_partitions(&[20, 30, 0, 80, 200, 10], 100, 1)
+                .unwrap()
+                .0,
             vec![0..3, 3..4, 4..5, 5..6]
         );
-        assert_eq!(coalesce_partitions(&[0, 0, 0], 100, 1).unwrap(), vec![0..3]);
         assert_eq!(
-            coalesce_partitions(&[usize::MAX, 1], 100, 1).unwrap(),
+            coalesce_partitions(&[0, 0, 0], 100, 1).unwrap().0,
+            vec![0..3]
+        );
+        assert_eq!(
+            coalesce_partitions(&[usize::MAX, 1], 100, 1).unwrap().0,
             vec![0..1, 1..2]
         );
-        assert!(coalesce_partitions(&[], 100, 1).unwrap().is_empty());
+        assert!(coalesce_partitions(&[], 100, 1).unwrap().0.is_empty());
         assert_eq!(
-            coalesce_partitions(&[0; 130], 100, 1).unwrap(),
+            coalesce_partitions(&[0; 130], 100, 1).unwrap().0,
             vec![0..64, 64..128, 128..130]
         );
     }
@@ -115,14 +130,14 @@ mod tests {
         assert!(coalesce_partitions(&[1], 0, 1).is_err());
         assert!(coalesce_partitions(&[1], 100, 0).is_err());
         for floor in [1, 2, 6, 10, 20, usize::MAX] {
-            let groups = coalesce_partitions(&[1; 10], 100, floor).unwrap();
+            let groups = coalesce_partitions(&[1; 10], 100, floor).unwrap().0;
             assert_eq!(groups.len(), floor.min(10));
             assert_eq!(
                 groups.into_iter().flatten().collect::<Vec<_>>(),
                 (0..10).collect::<Vec<_>>()
             );
         }
-        assert_eq!(coalesce_partitions(&[0; 130], 100, 20).unwrap().len(), 20);
+        assert_eq!(coalesce_partitions(&[0; 130], 100, 20).unwrap().0.len(), 20);
     }
 
     #[test]

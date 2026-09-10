@@ -142,14 +142,14 @@ impl ShuffleReadSource {
         for (shuffle_id, address, refs) in requests {
             let shared_root = shared_roots.get(&shuffle_id).cloned();
 
-            // Explicit shared reads also exercise the mount for local output.
+            // Only opted-in adaptive reads override the existing local shortcut.
             // Otherwise, this worker wrote it: serve in-process and skip both the network and
             // the on-disk index, since the byte ranges are already in memory. The
             // registry is keyed by attempt, so this returns exactly the attempt the
             // coordinator selected even if another attempt of the same task also
             // registered here.
             if address == local_address
-                && !(read_route == ReadRoute::Shared && shared_root.is_some())
+                && !(coalesce_ranges && read_route == ReadRoute::Shared && shared_root.is_some())
             {
                 local_refs += refs.len();
                 streams.push(local_server.get_partition_local(shuffle_id, &refs).await?);
@@ -527,24 +527,30 @@ async fn forward_partition_stream(
     shuffle_ids: Vec<u64>,
 ) -> DaftResult<InputId> {
     let mut emitted_any = false;
-    let started = std::time::Instant::now();
+    let diagnostics = tracing::enabled!(tracing::Level::INFO);
+    let started = diagnostics.then(std::time::Instant::now);
     let mut read_poll_us = 0u64;
     let mut downstream_wait_us = 0u64;
     let mut rows = 0usize;
     let mut uncompressed_bytes = 0usize;
     loop {
-        let poll_started = std::time::Instant::now();
+        let poll_started = diagnostics.then(std::time::Instant::now);
         let batch = stream.next().await;
-        read_poll_us += poll_started.elapsed().as_micros() as u64;
+        if let Some(t) = poll_started {
+            read_poll_us =
+                read_poll_us.saturating_add(t.elapsed().as_micros().min(u64::MAX as u128) as u64);
+        }
         let Some(batch) = batch else {
             break;
         };
         let batch = batch?;
-        rows += batch.len();
-        uncompressed_bytes += batch.size_bytes();
+        if diagnostics {
+            rows = rows.saturating_add(batch.len());
+            uncompressed_bytes = uncompressed_bytes.saturating_add(batch.size_bytes());
+        }
         let mp = MicroPartition::new_loaded(schema.clone(), vec![batch].into(), None);
         emitted_any = true;
-        let send_started = std::time::Instant::now();
+        let send_started = diagnostics.then(std::time::Instant::now);
         if sender
             .send(PipelineMessage::Morsel {
                 input_id,
@@ -555,18 +561,25 @@ async fn forward_partition_stream(
         {
             return Ok(input_id);
         }
-        downstream_wait_us += send_started.elapsed().as_micros() as u64;
+        if let Some(t) = send_started {
+            downstream_wait_us = downstream_wait_us
+                .saturating_add(t.elapsed().as_micros().min(u64::MAX as u128) as u64);
+        }
     }
-    tracing::info!(
-        ?input_id,
-        ?shuffle_ids,
-        rows,
-        uncompressed_bytes,
-        read_poll_us,
-        downstream_wait_us,
-        wall_us = started.elapsed().as_micros() as u64,
-        "Shuffle source consumption statistics"
-    );
+    if diagnostics {
+        tracing::info!(
+            ?input_id,
+            ?shuffle_ids,
+            rows,
+            uncompressed_bytes,
+            read_poll_us,
+            downstream_wait_us,
+            wall_us = started
+                .map(|t| t.elapsed().as_micros().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+            "Shuffle source consumption statistics"
+        );
+    }
     // If the stream produced no batches (no read inputs, or all refs were
     // zero-row / file-less), still emit a single empty `MicroPartition` so the
     // downstream pipeline sees one output per input.

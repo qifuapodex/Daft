@@ -189,6 +189,12 @@ If you're unsure whether your shuffle has crossed the thresholds, run it once wi
 ## Shuffle diagnostics and experimental AQE
 
 Flight repartition exchanges emit structured `INFO` summaries independently of AQE.
+When neither AQE nor INFO diagnostics are enabled, the coordinator inspects only
+the first ref and the ref count per map; it does not scan every bucket or sort size
+statistics. Per-message timers/counters and source batch-byte measurements are also
+disabled without the corresponding INFO subscriber. Full bucket inspection costs
+O(map tasks × buckets) when requested by AQE or diagnostics.
+
 Per-map write events use the dedicated `daft_shuffle_diagnostics` target so enabling
 `daft_shuffles=info` alone does not emit a log for every map attempt.
 To retain the fields for analysis, set these variables on the driver **and Ray workers**
@@ -225,11 +231,11 @@ shared-mount breakdown; use routing and source consumption to avoid attributing 
 costs to shared reads. These summaries do not measure process RSS or filesystem cache
 hits. Use storage/cgroup measurements alongside them.
 
-Experimental adaptive coalescing is **off by default**. It reduces task count;
-file-open reuse is currently available only for direct shared-mount reads. With
-the default `local_only` placement, RPC and in-process paths still open each
-original (map, bucket) range separately: grouping tasks does not reduce that total.
-Map writes and the number of map files are unchanged on every route.
+Experimental adaptive coalescing is **off by default**. It reduces task count. The new bounded
+cross-bucket prefetch is specific to direct shared-mount reads. RPC and in-process
+readers retain their existing grouping of ranges by file; task counts alone do not
+establish a storage-request or throughput improvement on those routes. Map writes
+and the number of map files are unchanged on every route.
 
 Enable task coalescing explicitly:
 
@@ -247,7 +253,7 @@ The initial implementation coalesces adjacent buckets of **internal aggregation 
 distinct exchanges**, using actual uncompressed map-output sizes after all maps finish.
 It never splits an oversized bucket. The target is advisory input size, not a bound on
 hash-table or aggregate memory. Each task takes at most 64 original buckets to bound
-ref reconstruction even when buckets are empty. Coordinator statistics remain
+ref reconstruction even when buckets are empty. Coordinator memory remains
 O(map tasks + original buckets); full map-by-bucket matrices are not retained.
 
 The task-count floor defaults to the number of CPUs reported by the worker manager
@@ -267,11 +273,13 @@ random row shuffles and non-Flight backends retain their existing execution beha
 An internal aggregation partition count derived from configuration is not a user
 `repartition` contract.
 
-`explain(show_all=True)` shows eligibility or the skip reason. Runtime decision logs
+`explain(show_all=True)` shows eligibility or the skip reason only when AQE is enabled. Runtime decision logs
 report `disabled`, `join_input`, `user_partition_contract`, `unsupported_backend`,
 `unsupported_operator`, `coalesced`, `parallelism_floor`, or `no_small_partitions`. Planning-time partition
 counts for eligible exchanges remain upper bounds; inspect the runtime decision
-event for the actual number of reduce tasks.
+event for the actual number of reduce tasks. `reduce_tasks_before_floor` reports
+the greedy grouping count before the task floor is applied; `parallelism_floor`
+is only reported when that floor prevents an otherwise possible reduction.
 
 Eligible exchanges advertise `Unknown` clustering before execution, and aggregation,
 projection and distinct preserve that uncertainty. Consequently a downstream distinct
@@ -291,11 +299,15 @@ it does not preserve the previous I/O concurrency. Tune
 `flight_shuffle_shared_read_concurrency` against task count, buffer memory and measured
 storage latency; no cluster performance A/B currently establishes the right setting.
 Original per-bucket length/CRC checks and selected map attempts are preserved. The
-RPC/in-process paths and RPC-to-shared fallback retain their existing read layout.
+RPC/in-process paths and RPC-to-shared fallback retain their existing readers.
+Large RPC requests are split into sequential tickets of at most 64K refs, below
+tonic's 4 MiB decode limit even for worst-case integer encodings. Errors from a later
+ticket propagate; already emitted rows are never replayed by shared fallback.
 To exercise direct shared reads, configure `flight_shuffle_placement="shared_only"`,
 `flight_shuffle_shared_dir`, and `flight_shuffle_read_source="shared"` together. Explicit
-`shared` also reads this worker's own shared output through the mount; `auto` retains
-its in-process shortcut. Local temporary directories in tests exercise this route,
+`shared` reads this worker's own shared output through the mount only for opted-in
+adaptive exchanges. With AQE off (or an excluded exchange), the existing in-process
+shortcut remains in effect; `auto` always retains that shortcut. Local temporary directories in tests exercise this route,
 but are not evidence for Lustre/NFS performance.
 
 The ordinary single-bucket path retains its existing `CheckedRange` buffer; only the
@@ -306,3 +318,15 @@ changing the prefetch policy for all default reads.
 
 AQE does not merge already-written map files, automatically choose a different
 shuffle algorithm, resize the cluster, or compact final Parquet files.
+
+
+### Binary compatibility of this experimental build
+
+The affected config, distributed-plan and shuffle-input pickles use the versioned
+`_from_serialized_shuffle_aqe_v1` reconstruction entry point. Old builds cannot load
+these pickles; this build rejects their legacy `_from_serialized` payloads before
+bincode decoding. **Driver and workers must use identical builds.** Recreate affected
+persisted configs/plans with this build; automatic legacy-pickle migration and mixed
+version Ray execution are not supported. Python positional-argument compatibility
+is separate from binary compatibility. `serde(default)` only supplies missing fields
+in tagged formats and does not make positional bincode payloads compatible.

@@ -123,8 +123,14 @@ pub(crate) async fn fold_outputs_from_stream(
     target_bytes: usize,
     min_partitions: usize,
 ) -> DaftResult<Vec<Vec<FlightShuffleReadInput>>> {
-    let started = std::time::Instant::now();
-    let mut sizes = vec![0usize; num_partitions];
+    let diagnostics = tracing::enabled!(tracing::Level::INFO);
+    let inspect_refs = aqe_skip_reason.is_none() || diagnostics;
+    let started = diagnostics.then(std::time::Instant::now);
+    let mut sizes = if inspect_refs {
+        vec![0usize; num_partitions]
+    } else {
+        Vec::new()
+    };
     let mut rows = 0usize;
     let mut nonempty_fragments = 0usize;
     let mut small_fragments = 0usize;
@@ -133,9 +139,9 @@ pub(crate) async fn fold_outputs_from_stream(
 
     while let Some(output) = materialized_stream.next().await {
         let partitions = output?.into_inner().0;
-        let Some(partition) = partitions.first() else {
-            continue;
-        };
+        let partition = partitions.first().ok_or_else(|| DaftError::InternalError(
+            format!("Shuffle {shuffle_id} received an empty map output: expected {num_partitions} partition refs, got 0")
+        ))?;
         let flight_ref = as_flight_ref(partition)?;
         let map_output = map_output_from_ref(flight_ref);
         if !seen_inputs.insert(map_output.input_id) {
@@ -153,30 +159,34 @@ pub(crate) async fn fold_outputs_from_stream(
                 partitions.len()
             )));
         }
-        for (idx, partition) in partitions.iter().enumerate() {
-            let part = as_flight_ref(partition)?;
-            if partition_idx_from_ref(part) as usize != idx
-                || map_output_from_ref(part) != map_output
-                || part.shuffle_id != shuffle_id
-                || part.server_address != flight_ref.server_address
-            {
-                return Err(DaftError::InternalError(format!(
-                    "Shuffle {shuffle_id} map {} attempt {} slot {idx}: expected partition {idx}, shuffle {shuffle_id}, server {}; got partition {}, shuffle {}, map {} attempt {}, server {}",
-                    map_output.input_id,
-                    map_output.attempt,
-                    flight_ref.server_address,
-                    partition_idx_from_ref(part),
-                    part.shuffle_id,
-                    map_output_from_ref(part).input_id,
-                    map_output_from_ref(part).attempt,
-                    part.server_address
-                )));
-            }
-            sizes[idx] = sizes[idx].saturating_add(part.size_bytes);
-            rows = rows.saturating_add(part.num_rows);
-            if part.num_rows > 0 {
-                nonempty_fragments += 1;
-                small_fragments += usize::from(part.size_bytes < 64 * 1024);
+        // Default execution examines only the first ref and the O(1) count.
+        // Full statistics/validation costs O(maps * buckets), only on opt-in.
+        if inspect_refs {
+            for (idx, partition) in partitions.iter().enumerate() {
+                let part = as_flight_ref(partition)?;
+                if partition_idx_from_ref(part) as usize != idx
+                    || map_output_from_ref(part) != map_output
+                    || part.shuffle_id != shuffle_id
+                    || part.server_address != flight_ref.server_address
+                {
+                    return Err(DaftError::InternalError(format!(
+                        "Shuffle {shuffle_id} map {} attempt {} slot {idx}: expected partition {idx}, shuffle {shuffle_id}, server {}; got partition {}, shuffle {}, map {} attempt {}, server {}",
+                        map_output.input_id,
+                        map_output.attempt,
+                        flight_ref.server_address,
+                        partition_idx_from_ref(part),
+                        part.shuffle_id,
+                        map_output_from_ref(part).input_id,
+                        map_output_from_ref(part).attempt,
+                        part.server_address
+                    )));
+                }
+                sizes[idx] = sizes[idx].saturating_add(part.size_bytes);
+                rows = rows.saturating_add(part.num_rows);
+                if part.num_rows > 0 {
+                    nonempty_fragments += 1;
+                    small_fragments += usize::from(part.size_bytes < 64 * 1024);
+                }
             }
         }
         inputs_by_server
@@ -185,44 +195,52 @@ pub(crate) async fn fold_outputs_from_stream(
             .push(map_output);
     }
 
-    let groups = if aqe_skip_reason.is_none() {
+    let (groups, before_floor) = if aqe_skip_reason.is_none() {
         coalesce_partitions(&sizes, target_bytes, min_partitions)?
     } else {
-        (0..num_partitions).map(|idx| idx..idx + 1).collect()
+        (
+            (0..num_partitions).map(|idx| idx..idx + 1).collect(),
+            num_partitions,
+        )
     };
-    let total_bytes: usize = sizes.iter().copied().fold(0usize, usize::saturating_add);
-    let mut sorted_sizes = sizes.clone();
-    sorted_sizes.sort_unstable();
-    tracing::info!(
-        shuffle_id,
-        map_tasks = seen_inputs.len(),
-        original_partitions = num_partitions,
-        reduce_tasks = groups.len(),
-        rows,
-        uncompressed_bytes = total_bytes,
-        nonempty_fragments,
-        fragments_under_64k_uncompressed = small_fragments,
-        partition_p50_bytes = sorted_sizes
-            .get((sorted_sizes.len() * 50).div_ceil(100).saturating_sub(1))
-            .copied()
-            .unwrap_or(0),
-        partition_p95_bytes = sorted_sizes
-            .get((sorted_sizes.len() * 95).div_ceil(100).saturating_sub(1))
-            .copied()
-            .unwrap_or(0),
-        partition_max_bytes = sorted_sizes.last().copied().unwrap_or(0),
-        map_stage_wait_ms = started.elapsed().as_millis() as u64,
-        aqe_status = aqe_skip_reason.unwrap_or(if groups.len() < num_partitions {
-            "coalesced"
-        } else if min_partitions >= num_partitions {
-            "parallelism_floor"
-        } else {
-            "no_small_partitions"
-        }),
-        target_bytes,
-        min_partitions = min_partitions.min(num_partitions),
-        "Shuffle map statistics and AQE decision"
-    );
+    if diagnostics {
+        let total_bytes: usize = sizes.iter().copied().fold(0usize, usize::saturating_add);
+        let mut sorted_sizes = sizes.clone();
+        sorted_sizes.sort_unstable();
+        tracing::info!(
+            shuffle_id,
+            map_tasks = seen_inputs.len(),
+            original_partitions = num_partitions,
+            reduce_tasks = groups.len(),
+            reduce_tasks_before_floor = before_floor,
+            rows,
+            uncompressed_bytes = total_bytes,
+            nonempty_fragments,
+            fragments_under_64k_uncompressed = small_fragments,
+            partition_p50_bytes = sorted_sizes
+                .get((sorted_sizes.len() * 50).div_ceil(100).saturating_sub(1))
+                .copied()
+                .unwrap_or(0),
+            partition_p95_bytes = sorted_sizes
+                .get((sorted_sizes.len() * 95).div_ceil(100).saturating_sub(1))
+                .copied()
+                .unwrap_or(0),
+            partition_max_bytes = sorted_sizes.last().copied().unwrap_or(0),
+            map_stage_wait_ms = started
+                .map(|t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+            aqe_status = aqe_skip_reason.unwrap_or(if groups.len() < num_partitions {
+                "coalesced"
+            } else if before_floor < groups.len() {
+                "parallelism_floor"
+            } else {
+                "no_small_partitions"
+            }),
+            target_bytes,
+            min_partitions = min_partitions.min(num_partitions),
+            "Shuffle map statistics and AQE decision"
+        );
+    }
     let inputs_by_server = Arc::new(inputs_by_server);
     let shared_root: Option<Arc<str>> = shared_root.map(Arc::from);
     Ok(groups
@@ -319,6 +337,43 @@ mod tests {
             })
             .collect();
         MaterializedOutput::new(refs, Arc::from("worker"), "127.0.0.1".into(), input_id)
+    }
+
+    #[tokio::test]
+    async fn disabled_without_diagnostics_does_not_inspect_all_refs() -> DaftResult<()> {
+        let _guard = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+        for reason in [Some("disabled"), None] {
+            let mut parts = output(0, &[1; 2]).into_inner().0;
+            parts[1] = Arc::new(FlightPartitionRef {
+                shuffle_id: 999,
+                server_address: "wrong".into(),
+                partition_ref_id: 1,
+                attempt: 99,
+                num_rows: 1,
+                size_bytes: 1,
+            });
+            let stream = futures::stream::iter([Ok(MaterializedOutput::new(
+                parts,
+                Arc::from("worker"),
+                "127.0.0.1".into(),
+                0,
+            ))]);
+            let result = fold_outputs_from_stream(stream, 2, 7, None, reason, 256, 1).await;
+            assert_eq!(result.is_ok(), reason.is_some());
+        }
+        // Even the cheap path must reject a missing map result.
+        let result = fold_outputs_from_stream(
+            futures::stream::iter([Ok(output(0, &[]))]),
+            2,
+            7,
+            None,
+            Some("disabled"),
+            256,
+            1,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("got 0"));
+        Ok(())
     }
 
     #[tokio::test]

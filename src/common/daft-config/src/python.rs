@@ -636,7 +636,10 @@ impl PyDaftExecutionConfig {
     }
 }
 
-impl_bincode_py_state_serialization!(PyDaftExecutionConfig);
+common_py_serde::impl_versioned_bincode_py_state_serialization!(
+    PyDaftExecutionConfig,
+    _from_serialized_shuffle_aqe_v1
+);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[pyclass(module = "daft.daft", from_py_object)]

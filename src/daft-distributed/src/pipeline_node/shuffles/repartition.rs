@@ -198,15 +198,17 @@ impl PipelineNodeImpl for RepartitionNode {
             self.repartition_spec.var_name()
         )];
         res.extend(self.repartition_spec.multiline_display());
-        res.push(match self.aqe_skip_reason {
-            Some(reason) => format!("Experimental AQE: skipped ({reason})"),
-            None => format!(
-                "Experimental AQE: coalesce, target {} bytes (uncompressed)",
-                self.config
-                    .execution_config
-                    .experimental_shuffle_aqe_target_bytes
-            ),
-        });
+        if self.config.execution_config.experimental_shuffle_aqe {
+            res.push(match self.aqe_skip_reason {
+                Some(reason) => format!("Experimental AQE: skipped ({reason})"),
+                None => format!(
+                    "Experimental AQE: coalesce, target {} bytes (uncompressed)",
+                    self.config
+                        .execution_config
+                        .experimental_shuffle_aqe_target_bytes
+                ),
+            });
+        }
         res
     }
 }

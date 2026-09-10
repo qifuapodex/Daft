@@ -33,7 +33,7 @@ use tokio::{
 
 use super::{
     index,
-    read_stats::{ReadStats, add, elapsed_us},
+    read_stats::{ReadStats, elapsed_us},
     shared_map_file,
     verify::CheckedRange,
 };
@@ -226,21 +226,21 @@ fn read_one_map_file(
         // Held for the whole file — open, index, and data — because the file
         // handle is what the cap is about. Acquired before the open so a caller
         // waits here rather than in the kernel's descriptor table.
-        let started = Instant::now();
+        let started = stats.enabled.then(Instant::now);
         let _slot = SHARED_READ_SLOTS.acquire().await.map_err(|e| {
             DaftError::InternalError(format!("shared read semaphore closed: {}", e))
         })?;
 
-        add(&stats.slot_wait_us, elapsed_us(started));
+        stats.add(&stats.slot_wait_us, elapsed_us(started));
         // TODO: recompute from lineage instead of failing. A missing file here
         // means the selected map attempt died before its commit rename landed, so
         // there is no copy anywhere and the only correct recovery is to re-run
         // that map task. Flotilla has no lineage-recompute path today, so the
         // query fails.
-        let started = Instant::now();
-        add(&stats.opens, 1);
+        let started = stats.enabled.then(Instant::now);
+        stats.add(&stats.opens, 1);
         let opened = File::open(&path).await;
-        add(&stats.open_us, elapsed_us(started));
+        stats.add(&stats.open_us, elapsed_us(started));
         let mut file = opened.map_err(|e| {
             DaftError::External(
                 format!("Failed to open shared shuffle map file {}: {}", path, e).into(),
@@ -250,11 +250,11 @@ fn read_one_map_file(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(shuffle_id, &path);
-        let started = Instant::now();
+        let started = stats.enabled.then(Instant::now);
         let region = match cached {
-            Some(region) => { add(&stats.index_hits, 1); region },
+            Some(region) => { stats.add(&stats.index_hits, 1); region },
             None => {
-                add(&stats.index_misses, 1);
+                stats.add(&stats.index_misses, 1);
                 let expected = remembered_partition_count(shuffle_id);
                 let (region, num_partitions) =
                     read_index_region(&mut file, &path, expected).await?;
@@ -269,7 +269,7 @@ fn read_one_map_file(
                 region
             }
         };
-        add(&stats.index_us, elapsed_us(started));
+        stats.add(&stats.index_us, elapsed_us(started));
         let partition_indices = partition_indices.as_slice();
         let first_idx = partition_indices.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
         let first_entry = index::partition_entry(&region, *first_idx as usize, &path)?;
@@ -280,8 +280,8 @@ fn read_one_map_file(
                 .collect::<DaftResult<Vec<_>>>()?)
         };
         if entries.iter().all(|entry| entry.is_empty()) {
-            add(&stats.empty_ranges, entries.len() as u64);
-            add(&stats.completed_files, 1);
+            stats.add(&stats.empty_ranges, entries.len() as u64);
+            stats.add(&stats.completed_files, 1);
             return;
         }
         let first = entries.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
@@ -296,13 +296,13 @@ fn read_one_map_file(
         let mut position = first.start;
         for (&partition_idx, entry) in partition_indices.iter().zip(entries.iter()) {
             if entry.is_empty() {
-                add(&stats.empty_ranges, 1);
+                stats.add(&stats.empty_ranges, 1);
                 continue;
             }
-            add(&stats.ranges, 1);
-            add(&stats.indexed_bytes, entry.len());
-            add(&stats.ranges_under_64k, u64::from(entry.len() < 64 * 1024));
-            add(&stats.ranges_under_1m, u64::from(entry.len() < 1024 * 1024));
+            stats.add(&stats.ranges, 1);
+            stats.add(&stats.indexed_bytes, entry.len());
+            stats.add(&stats.ranges_under_64k, u64::from(entry.len() < 64 * 1024));
+            stats.add(&stats.ranges_under_1m, u64::from(entry.len() < 1024 * 1024));
             if position != entry.start {
                 file.seek(SeekFrom::Start(entry.start)).await.map_err(DaftError::IoError)?;
             }
@@ -313,18 +313,18 @@ fn read_one_map_file(
                 format!("shuffle map file {} partition {}", path, partition_idx),
             );
             loop {
-                let started = Instant::now();
+                let started = stats.enabled.then(Instant::now);
                 let message = range.next().await;
-                add(&stats.read_poll_us, elapsed_us(started));
+                stats.add(&stats.read_poll_us, elapsed_us(started));
                 let Some(message) = message? else { break; };
-                add(&stats.messages, 1);
+                stats.add(&stats.messages, 1);
                 yield message;
             }
             range.finish()?;
-            add(&stats.verified_bytes, entry.len());
+            stats.add(&stats.verified_bytes, entry.len());
             position = entry.end;
         }
-        add(&stats.completed_files, 1);
+        stats.add(&stats.completed_files, 1);
     })
 }
 
@@ -414,7 +414,9 @@ fn read_ranges_stream(
     stats.coalesced = paths
         .iter()
         .any(|(_, indices)| indices.as_slice().len() > 1);
-    stats.started = Some(Instant::now());
+    stats.enabled =
+        tracing::enabled!(target: "daft_shuffles::store::read_stats", tracing::Level::INFO);
+    stats.started = stats.enabled.then(Instant::now);
     let stats = Arc::new(stats);
 
     let arrow_schema = schema.to_arrow()?;
@@ -533,6 +535,36 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_diagnostics_leave_counters_untouched() -> DaftResult<()> {
+        let dir = tempdir("stats_disabled");
+        let root = dir.to_str().unwrap();
+        let shuffle_id = rand::random();
+        let input = MapInput {
+            input_id: 7,
+            attempt: 99,
+        };
+        write_shared(root, shuffle_id, input, dummy_schema(), None, 50).await?;
+        let stats = Arc::new(ReadStats::default());
+        let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
+        let messages: Vec<_> =
+            read_one_map_file(shuffle_id, path, PartitionIndices::Single(0), stats.clone())
+                .try_collect()
+                .await?;
+        assert!(!messages.is_empty());
+        assert_eq!(stats.messages.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(stats.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            stats
+                .read_poll_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        super::super::forget_shuffle(shuffle_id);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn coalesced_reads_reuse_opens_and_preserve_empty_and_compressed_ranges() -> DaftResult<()>
     {
         for compression in [
@@ -550,7 +582,9 @@ pub(super) mod tests {
             let schema = dummy_schema();
             write_shared(root, shuffle_id, input, schema.clone(), compression, 50).await?;
             let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
-            let stats = Arc::new(ReadStats::default());
+            let mut stats = ReadStats::default();
+            stats.enabled = true;
+            let stats = Arc::new(stats);
             let messages: Vec<_> = read_one_map_file(
                 shuffle_id,
                 path.clone(),

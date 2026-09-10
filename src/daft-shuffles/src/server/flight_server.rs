@@ -579,6 +579,69 @@ mod tests {
     }
 
     #[test]
+    fn bounded_rpc_tickets_cover_large_requests_and_later_errors() -> DaftResult<()> {
+        use futures::StreamExt;
+
+        use crate::client::{FlightClientManager, flight_client::MAX_TICKET_REFS};
+        let server = Arc::new(ShuffleFlightServer::new());
+        let mut handle = start_server_loop("127.0.0.1", server.clone());
+        let dir = tempdir("rpc_chunks");
+        let result = common_runtime::get_io_runtime(true).block_on_current_thread(async {
+            let (shuffle_id, attempt) = (5, 0xaa);
+            let (_, caches) = local_map_file(&server, &dir, shuffle_id, attempt, 8).await;
+            let mut empty = caches[0].clone();
+            empty.partition_ref_id = u64::MAX;
+            empty.file_paths.clear();
+            empty.bytes_per_file.clear();
+            empty.byte_ranges = Some(vec![]);
+            empty.crc32s = Some(vec![]);
+            empty.num_rows = 0;
+            empty.size_bytes = 0;
+            server.register_shuffle_partitions(shuffle_id, u64::MAX, vec![empty])?;
+            let mut refs = vec![(u64::MAX, u64::MAX); 4 * MAX_TICKET_REFS];
+            refs.push((attempt, partition_ref_id(0, 0)));
+            assert!(encode_ticket(shuffle_id, &refs).len() > 4 * 1024 * 1024);
+            // Worst-case unique attempts still fit with protobuf framing headroom.
+            let worst: Vec<_> = (0..MAX_TICKET_REFS)
+                .map(|i| (u64::MAX - i as u64, u64::MAX))
+                .collect();
+            assert!(encode_ticket(u64::MAX, &worst).len() < 3 * 1024 * 1024);
+            let client = FlightClientManager::new();
+            let batches: Vec<_> = client
+                .fetch_partition(shuffle_id, &handle.shuffle_address(), &refs, u8_schema())
+                .await?
+                .try_collect()
+                .await?;
+            assert_eq!(batches.iter().map(RecordBatch::len).sum::<usize>(), 8);
+            // Yield real data from the first chunk, then fail in the second:
+            // an error must remain visible after previously emitted rows.
+            refs.truncate(MAX_TICKET_REFS + 1);
+            refs[0] = (attempt, partition_ref_id(0, 0));
+            refs[MAX_TICKET_REFS] = (0xdead, 123);
+            let mut stream = client
+                .fetch_partition(shuffle_id, &handle.shuffle_address(), &refs, u8_schema())
+                .await?;
+            let mut rows = 0;
+            let mut failed = false;
+            while let Some(batch) = stream.next().await {
+                match batch {
+                    Ok(batch) => rows += batch.len(),
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            assert_eq!(rows, 8);
+            assert!(failed);
+            DaftResult::Ok(())
+        });
+        handle.shutdown()?;
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[test]
     fn unregistering_drops_only_the_named_shuffles() {
         let server = ShuffleFlightServer::new();
         server

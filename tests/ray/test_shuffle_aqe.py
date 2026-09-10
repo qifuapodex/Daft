@@ -71,7 +71,9 @@ def test_shuffle_aqe_opt_in_coalesces_and_preserves_rows(tmp_path, operation, pl
         ):
             result = df.groupby("k").agg(daft.col("v").sum()) if operation == "aggregate" else df.select("k").distinct()
             text = plan_text(result)
-            assert ("Experimental AQE: coalesce" if enabled else "Experimental AQE: skipped (disabled)") in text
+            assert ("Experimental AQE: coalesce" in text) == enabled
+            if not enabled:
+                assert "Experimental AQE:" not in text
             result.collect()
             counts.append(result._result_cache.num_partitions())
             answers.append(sorted(zip(*result.to_pydict().values())))
@@ -200,8 +202,6 @@ def test_shuffle_aqe_shared_downstream_operators(tmp_path, downstream):
 
 @pytest.mark.parametrize("minimum", [None, 3, 100000])
 def test_shuffle_aqe_task_floor(tmp_path, minimum):
-    import ray
-
     df = source().into_partitions(8)
     counts = []
     for enabled in [False, True]:
@@ -213,5 +213,33 @@ def test_shuffle_aqe_task_floor(tmp_path, minimum):
         ):
             result = df.groupby("k").agg(daft.col("v").sum()).collect()
             counts.append(result._result_cache.num_partitions())
-    floor = minimum if minimum is not None else int(ray.cluster_resources()["CPU"])
+    # The automatic floor uses worker-manager capacity, not Ray's advertised
+    # resource total; only capacity-independent bounds are asserted here.
+    floor = minimum if minimum is not None else 1
     assert min(floor, counts[0]) <= counts[1] <= counts[0]
+
+
+@pytest.mark.parametrize("class_name", ["PyDaftExecutionConfig", "Input", "DistributedPhysicalPlan"])
+def test_shuffle_pickle_rejects_legacy_and_malformed_payloads(class_name):
+    import daft.daft as native
+
+    cls = getattr(native, class_name)
+    with pytest.raises(ValueError, match="Legacy .* pickle is incompatible"):
+        cls._from_serialized(b"old positional payload")
+    with pytest.raises(ValueError, match="Invalid versioned"):
+        cls._from_serialized_shuffle_aqe_v1(b"")
+
+
+def test_shuffle_config_versioned_pickle_roundtrip():
+    import pickle
+
+    with daft.execution_config_ctx(experimental_shuffle_aqe=True, experimental_shuffle_aqe_min_partitions=3):
+        config = get_context().daft_execution_config
+        factory, (payload,) = config.__reduce__()
+        assert factory.__name__ == "_from_serialized_shuffle_aqe_v1"
+        restored = pickle.loads(pickle.dumps(config))
+        assert restored.experimental_shuffle_aqe is True
+        assert restored.experimental_shuffle_aqe_min_partitions == 3
+        assert restored.pre_shuffle_merge_threshold == config.pre_shuffle_merge_threshold
+        with pytest.raises(ValueError, match="Trailing bytes"):
+            factory(payload + b"extra")
