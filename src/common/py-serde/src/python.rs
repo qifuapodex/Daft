@@ -198,3 +198,42 @@ impl<H: Hasher> Write for HashWriter<'_, H> {
         Ok(())
     }
 }
+
+/// Use for intentionally incompatible positional bincode layouts. The factory
+/// name versions the pickle itself, before either side attempts binary decoding.
+/// This rejects legacy pickles; it is not a migration or rolling-upgrade protocol.
+#[macro_export]
+macro_rules! impl_versioned_bincode_py_state_serialization {
+    ($ty:ty, $factory:ident) => {
+        #[cfg(feature = "python")]
+        #[pymethods]
+        impl $ty {
+            pub fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<(
+                pyo3::Py<pyo3::PyAny>, (pyo3::Bound<'py, pyo3::types::PyBytes>,),
+            )> {
+                use pyo3::{PyTypeInfo, types::{PyAnyMethods, PyBytes}};
+                let bytes = $crate::bincode::serde::encode_to_vec(self, $crate::bincode::config::legacy())
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize {}: {e}", stringify!($ty))))?;
+                Ok((Self::type_object(py).getattr(stringify!($factory))?.into(), (PyBytes::new(py, &bytes),)))
+            }
+
+            #[staticmethod]
+            pub fn $factory(serialized: &[u8]) -> PyResult<Self> {
+                let (value, consumed) = $crate::bincode::serde::decode_from_slice(serialized, $crate::bincode::config::legacy())
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid versioned {} pickle: {e}", stringify!($ty))))?;
+                if consumed != serialized.len() {
+                    return Err(pyo3::exceptions::PyValueError::new_err("Trailing bytes in versioned pickle; use identical Daft builds on driver and workers"));
+                }
+                Ok(value)
+            }
+
+            #[staticmethod]
+            pub fn _from_serialized(_serialized: &[u8]) -> PyResult<Self> {
+                Err(pyo3::exceptions::PyValueError::new_err(concat!(
+                    "Legacy ", stringify!($ty), " pickle is incompatible with this experimental shuffle build. ",
+                    "Use identical Daft builds on driver and workers; recreate persisted configs/plans with this build."
+                )))
+            }
+        }
+    };
+}

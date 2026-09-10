@@ -7,7 +7,6 @@ use common_daft_config::PyDaftExecutionConfig;
 use common_display::{DisplayLevel, tree::TreeDisplay};
 use common_metrics::Meter;
 use common_partitioning::Partition;
-use common_py_serde::impl_bincode_py_state_serialization;
 use daft_local_plan::python::PyExecutionStats;
 use daft_logical_plan::PyLogicalPlanBuilder;
 use daft_partition_refs::RayPartitionRef;
@@ -231,7 +230,10 @@ impl PyDistributedPhysicalPlan {
         Ok(serde_json::to_string(&translation.root.repr_json()).unwrap())
     }
 }
-impl_bincode_py_state_serialization!(PyDistributedPhysicalPlan);
+common_py_serde::impl_versioned_bincode_py_state_serialization!(
+    PyDistributedPhysicalPlan,
+    _from_serialized_shuffle_aqe_v1
+);
 
 #[pyclass(module = "daft.daft", name = "DistributedPhysicalPlanRunner", frozen)]
 struct PyDistributedPhysicalPlanRunner {

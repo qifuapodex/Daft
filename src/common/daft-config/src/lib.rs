@@ -173,6 +173,16 @@ pub struct DaftExecutionConfig {
     pub flight_shuffle_recovery_max_retained_bytes: usize,
 
     pub enable_multi_glob_path_tasks: bool,
+    // Defaults apply to tagged formats, not bincode. Python pickle uses a
+    // versioned factory and rejects pre-AQE positional payloads.
+    /// Opt-in coalescing of eligible internal Flight exchanges.
+    #[serde(default)]
+    pub experimental_shuffle_aqe: bool,
+    #[serde(default = "default_shuffle_aqe_target_bytes")]
+    pub experimental_shuffle_aqe_target_bytes: usize,
+    /// None uses the cluster CPU snapshot; Some overrides the task floor.
+    #[serde(default)]
+    pub experimental_shuffle_aqe_min_partitions: Option<usize>,
 }
 
 #[cfg(not(debug_assertions))]
@@ -180,6 +190,10 @@ impl std::fmt::Debug for DaftExecutionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaftExecutionConfig").finish()
     }
+}
+
+fn default_shuffle_aqe_target_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 impl Default for DaftExecutionConfig {
@@ -208,6 +222,9 @@ impl Default for DaftExecutionConfig {
             read_sql_partition_size_bytes: 512 * 1024 * 1024, // 512MB
             default_morsel_size: NonZeroUsize::new(128 * 1024).unwrap(),
             shuffle_algorithm: "auto".to_string(),
+            experimental_shuffle_aqe: false,
+            experimental_shuffle_aqe_target_bytes: default_shuffle_aqe_target_bytes(),
+            experimental_shuffle_aqe_min_partitions: None,
             pre_shuffle_merge_threshold: 1024 * 1024 * 1024, // 1GB
             pre_shuffle_merge_partition_threshold: 200,
             scantask_max_parallel: 8,

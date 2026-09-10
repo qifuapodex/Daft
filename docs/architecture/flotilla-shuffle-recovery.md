@@ -80,7 +80,10 @@ missing unretained producers return an explicit unsupported-recovery error.
 and diagnostic path. Only a shared map open returning `NotFound` creates it.
 Permission/configuration errors and transient transport errors stay distinct.
 The payload survives local pipeline broadcasts, Flight status details and Python/Ray
-serialization; classification does not parse error strings.
+serialization; classification does not parse error strings. Coalesced multi-bucket
+reads retain the same map/attempt identity and report one requested bucket when
+the map cannot be opened. Reconstruction replaces the whole map, and the consumer
+restarts every requested bucket. Read diagnostics remain active on this path.
 
 If both routes fail, retain the original missing-output identity when the fallback
 has no structured fetch identity of its own, including when that fallback fails
@@ -216,6 +219,8 @@ recovery disabled. Additional review regressions cover:
   followed by prioritized repair and first-dispatch replacement binding.
 * Ownership wait, reconstruction queueing and execution longer than the warning
   interval, with successful recovery and no premature budget consumption.
+* Single-bucket and coalesced-reader fetch identity, plus exact rows after a
+  coalesced consumer reconstructs its missing map.
 * Missing shared output with an unreachable writer endpoint under both `auto`
   and `rpc`, plus transient reconstruction failures that exhaust dispatcher
   retries and succeed using the remaining map budget.
@@ -234,10 +239,11 @@ These are single-node tests. No multi-node storage-failure validation or large-s
 throughput/heap benchmark is claimed. Extending scan recovery requires snapshot
 validation; indeterminate output requires stage/descendant rollback.
 
-Final review validation (2026-09-10): 250 Rust tests passed across distributed
-(109), local execution (95), shuffle (44), and common error (2), with four existing
-unit-test ignores and one ignored doctest. Python/Ray validation covered 97 passing
-cases across shuffle, generator retry, transient error, exception serialization and
+Final integration validation (2026-09-10), including the release branch's shuffle
+diagnostics and opt-in task coalescing: 266 Rust tests passed across distributed
+(118), local execution (96), shuffle (50), and common error (2), with four existing
+unit-test ignores and one ignored doctest. Python/Ray validation covered 118 passing
+cases across shuffle, AQE, generator retry, transient error, exception serialization and
 configuration tests, including nine nested cases with incomplete exception
 wrappers. `make build` passed with `DAFT_DASHBOARD_SKIP_BUILD=1`; the repository
 pinned pre-commit `mypy --strict` hook, Rust formatting and scoped Python lint

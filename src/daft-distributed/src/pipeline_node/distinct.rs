@@ -6,9 +6,7 @@ use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan};
 use daft_logical_plan::stats::StatsState;
 use daft_schema::schema::SchemaRef;
 
-use super::{
-    DistributedPipelineNode, PipelineNodeImpl, TaskBuilderStream, clustering::BoundClusteringSpec,
-};
+use super::{DistributedPipelineNode, PipelineNodeImpl, TaskBuilderStream};
 use crate::{
     pipeline_node::{ClusteringStrategy, NodeID, PipelineNodeConfig, PipelineNodeContext},
     plan::{PlanConfig, PlanExecutionContext},
@@ -43,10 +41,7 @@ impl DistinctNode {
         let config = PipelineNodeConfig::new(
             schema,
             plan_config.config.clone(),
-            ClusteringStrategy::Explicit(BoundClusteringSpec::hash(
-                child.config().clustering_spec.num_partitions(),
-                columns.clone(),
-            )),
+            ClusteringStrategy::Passthrough { child: &child },
         );
         Self {
             config,

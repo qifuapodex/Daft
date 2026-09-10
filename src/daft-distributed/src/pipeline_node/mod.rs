@@ -563,6 +563,27 @@ pub(crate) mod tests {
     use super::*;
     use crate::scheduling::task::SwordfishTaskBuilder;
 
+    #[test]
+    fn distinct_preserves_unknown_and_existing_hash_clustering() {
+        let meter = Meter::test_scope("distinct_clustering");
+        let plan = crate::plan::PlanConfig::new(
+            0,
+            QueryID::default(),
+            Arc::new(DaftExecutionConfig::default()),
+        );
+        for spec in [
+            BoundClusteringSpec::unknown(7),
+            BoundClusteringSpec::hash(7, vec![]),
+        ] {
+            let mut source = MockNode::new(0);
+            source.config.clustering_spec = spec.clone();
+            let child = DistributedPipelineNode::new(Arc::new(source), &meter);
+            let distinct =
+                distinct::DistinctNode::new(1, &plan, vec![], Arc::new(Schema::empty()), child);
+            assert_eq!(distinct.config().clustering_spec, spec);
+        }
+    }
+
     /// Mock pipeline node for tests. Implements PipelineNodeImpl with minimal setup.
     pub struct MockNode {
         config: PipelineNodeConfig,

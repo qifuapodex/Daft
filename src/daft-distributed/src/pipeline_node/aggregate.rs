@@ -19,7 +19,7 @@ use daft_schema::{
     schema::{Schema, SchemaRef},
 };
 
-use super::PipelineNodeImpl;
+use super::{PipelineNodeImpl, shuffles::aqe::ShuffleOrigin};
 use crate::{
     pipeline_node::{
         ClusteringStrategy, DistributedPipelineNode, NodeID, PipelineNodeConfig,
@@ -255,6 +255,7 @@ impl LogicalPlanToPipelineNodeTranslator {
             self.gen_gather_node(input_node, input_size_bytes)
         } else {
             self.gen_repartition_node(
+                ShuffleOrigin::Aggregate,
                 RepartitionSpec::Hash(HashRepartitionConfig::new(
                     None,
                     partition_by.into_iter().map(|e| e.into()).collect(),
@@ -313,6 +314,7 @@ impl LogicalPlanToPipelineNodeTranslator {
             self.gen_gather_node(initial_agg, input_size_bytes)
         } else {
             self.gen_repartition_node(
+                ShuffleOrigin::Aggregate,
                 RepartitionSpec::Hash(HashRepartitionConfig::new(
                     Some(num_partitions),
                     split_details

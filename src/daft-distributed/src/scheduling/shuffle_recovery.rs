@@ -827,6 +827,7 @@ mod tests {
                 partition_idx,
                 inputs_by_server: Arc::new(maps),
                 shared_root: Some(Arc::from(self.root.path().to_str().unwrap())),
+                coalesce_ranges: false,
             }];
             SwordfishTask::for_recovery_test(
                 plan,
@@ -881,6 +882,35 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn coalesced_consumer_recovers_all_buckets_after_map_loss() -> DaftResult<()> {
+        let mut harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        Arc::make_mut(&mut harness.config).flight_shuffle_read_source = "shared".into();
+        let original = harness.execute(harness.producer(0, "none", false)).await?;
+        let mut consumer = harness.consumer(std::slice::from_ref(&original), 0);
+        let Input::FlightShuffle(reads) = consumer.inputs_mut().get_mut(&0).unwrap() else {
+            unreachable!()
+        };
+        let read = reads[0].clone();
+        *reads = (0..3)
+            .map(|partition_idx| FlightShuffleReadInput {
+                partition_idx,
+                coalesce_ranges: true,
+                ..read.clone()
+            })
+            .collect();
+        let expected: Vec<_> = (0..90).collect();
+        let mut before = values(&harness.execute(consumer.clone()).await?);
+        before.sort_unstable();
+        assert_eq!(before, expected);
+        harness.remove(&output_location(&original, harness.shuffle_id, 3)?);
+        let mut after = values(&harness.execute(consumer).await?);
+        after.sort_unstable();
+        assert_eq!(after, expected);
+        harness.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]

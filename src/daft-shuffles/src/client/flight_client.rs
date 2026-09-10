@@ -14,6 +14,10 @@ use tonic::transport::Endpoint;
 
 use crate::server::flight_server::encode_ticket;
 
+// Worst case per ref: 16 hex attempt + '=' + 20 decimal id + ';' = 38 bytes.
+// 64K refs plus the shuffle ID and protobuf overhead stay below tonic's 4 MiB.
+pub(crate) const MAX_TICKET_REFS: usize = 64 * 1024;
+
 #[allow(clippy::large_enum_variant)]
 enum ClientState {
     // The address of the flight server
@@ -66,6 +70,12 @@ impl ShuffleFlightClient {
         refs: &[(u64, u64)],
         schema: SchemaRef,
     ) -> DaftResult<FlightRecordBatchStreamToDaftRecordBatchStream> {
+        if refs.len() > MAX_TICKET_REFS {
+            return Err(DaftError::ValueError(
+                "Shuffle RPC request exceeds the bounded ticket size; split refs before sending"
+                    .into(),
+            ));
+        }
         let ticket = Ticket::new(encode_ticket(shuffle_id, refs));
         let (_, client) = self.connect().await?;
         let stream = client

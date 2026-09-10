@@ -257,6 +257,9 @@ def set_execution_config(
     flight_shuffle_recovery_max_retained_maps: int | None = None,
     flight_shuffle_recovery_max_retained_bytes: int | None = None,
     enable_multi_glob_path_tasks: bool | None = None,
+    experimental_shuffle_aqe: bool | None = None,
+    experimental_shuffle_aqe_target_bytes: int | None = None,
+    experimental_shuffle_aqe_min_partitions: int | None = None,
 ) -> DaftContext:
     """Globally sets various configuration parameters which control various aspects of Daft execution.
 
@@ -294,6 +297,9 @@ def set_execution_config(
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
         default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
         shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
+        experimental_shuffle_aqe: Opt-in coalescing of internal Flight aggregation and distinct exchanges. Defaults to False. User repartitions and join inputs are excluded.
+        experimental_shuffle_aqe_min_partitions: Minimum reduce tasks, capped by original buckets. Defaults to the CPU count at query start; unavailable capacity preserves the original count. Set a positive value to override.
+        experimental_shuffle_aqe_target_bytes: Advisory uncompressed input bytes per coalesced task; defaults to 256 MiB. This is not a peak-memory limit.
         pre_shuffle_merge_threshold: Memory threshold in bytes for pre-shuffle merge. Defaults to 1GB
         pre_shuffle_merge_partition_threshold: Number of partitions threshold to enable pre-shuffle merge when shuffle_algorithm is "auto". Defaults to 200.
         scantask_max_parallel: Set the max parallelism for running scan tasks simultaneously. Currently, this only works for Native Runner. If set to 0, all available CPUs will be used. Defaults to 8.
@@ -316,7 +322,7 @@ def set_execution_config(
         flight_shuffle_recovery_wait_warn_ms: Interval for warnings while waiting for another repair owner. Never aborts recovery or limits execution. Defaults to 0 (disabled).
         flight_shuffle_recovery_max_retained_maps: Maximum retained producer recipes per query. Defaults to 10000. Additional producers remain executable but are not recoverable.
         flight_shuffle_recovery_max_retained_bytes: Conservative retained input byte budget per query. Defaults to 256 MiB. Shared references may be charged more than once; producers beyond the budget are not recoverable.
-        flight_shuffle_read_source: How this worker fetches shuffle partitions written by other workers. "auto" (the default) reads the shared directory directly when the data is there and otherwise uses gRPC; "rpc" always tries gRPC first; "shared" always reads the shared directory for shuffles written there and requires `flight_shuffle_placement="shared_only"` (gather and into_partitions are always node-local and are read over gRPC regardless). "auto" and "rpc" both fall back to the shared directory if the gRPC fetch fails before returning data.
+        flight_shuffle_read_source: How this worker fetches shuffle partitions. "auto" (the default) reads the shared directory directly when the data is there and otherwise uses gRPC; "rpc" always tries gRPC first; "shared" reads the shared directory for remote output and for this worker's own AQE-eligible output and requires `flight_shuffle_placement="shared_only"` (gather and into_partitions are always node-local and are read over gRPC regardless). "auto" and "rpc" both fall back to the shared directory if the gRPC fetch fails before returning data.
         flight_shuffle_shared_read_concurrency: How many map files a reduce task reads from the shared directory at once. Defaults to 16, above `scantask_max_parallel` because shared-mount reads are dominated by per-file round trips rather than bytes.
         enable_multi_glob_path_tasks: Whether to create multiple glob path tasks in Ray Runner to achieve parallel glob. Defaults to False.
     """
@@ -357,6 +363,9 @@ def set_execution_config(
             read_sql_partition_size_bytes=read_sql_partition_size_bytes,
             default_morsel_size=default_morsel_size,
             shuffle_algorithm=shuffle_algorithm,
+            experimental_shuffle_aqe=experimental_shuffle_aqe,
+            experimental_shuffle_aqe_target_bytes=experimental_shuffle_aqe_target_bytes,
+            experimental_shuffle_aqe_min_partitions=experimental_shuffle_aqe_min_partitions,
             pre_shuffle_merge_threshold=pre_shuffle_merge_threshold,
             pre_shuffle_merge_partition_threshold=pre_shuffle_merge_partition_threshold,
             scantask_max_parallel=scantask_max_parallel,

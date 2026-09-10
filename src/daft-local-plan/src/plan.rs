@@ -2534,6 +2534,10 @@ pub struct FlightShuffleReadInput {
     /// shared placement. A per-shuffle constant, shared by `Arc` across every
     /// reduce task so the coordinator holds one copy rather than one per input.
     pub shared_root: Option<Arc<str>>,
+    // Bincode is positional: compatibility is enforced by PyInput's versioned pickle factory.
+    /// Set only by an eligible, explicitly enabled AQE exchange.
+    #[serde(default)]
+    pub coalesce_ranges: bool,
 }
 
 #[cfg(test)]

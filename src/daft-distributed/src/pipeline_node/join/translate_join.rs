@@ -15,6 +15,7 @@ use crate::pipeline_node::join::KeyFilteringJoinNode;
 use crate::pipeline_node::{
     DistributedPipelineNode,
     join::{BroadcastJoinNode, CrossJoinNode, HashJoinNode, SortMergeJoinNode},
+    shuffles::aqe::ShuffleOrigin,
     translate::LogicalPlanToPipelineNodeTranslator,
 };
 
@@ -117,6 +118,7 @@ impl LogicalPlanToPipelineNodeTranslator {
             || (num_partitions > 1 && !is_left_hash_partitioned)
         {
             self.gen_repartition_node(
+                ShuffleOrigin::HashJoin,
                 RepartitionSpec::Hash(HashRepartitionConfig::new(
                     Some(num_partitions),
                     left_on.iter().map(|e| e.clone().into()).collect(),
@@ -133,6 +135,7 @@ impl LogicalPlanToPipelineNodeTranslator {
             || (num_partitions > 1 && !is_right_hash_partitioned)
         {
             self.gen_repartition_node(
+                ShuffleOrigin::HashJoin,
                 RepartitionSpec::Hash(HashRepartitionConfig::new(
                     Some(num_partitions),
                     right_on.iter().map(|e| e.clone().into()).collect(),

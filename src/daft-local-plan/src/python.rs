@@ -82,7 +82,10 @@ pub struct PyInput {
     pub inner: Input,
 }
 
-impl_bincode_py_state_serialization!(PyInput);
+common_py_serde::impl_versioned_bincode_py_state_serialization!(
+    PyInput,
+    _from_serialized_shuffle_aqe_v1
+);
 
 impl<'py> FromPyObject<'_, 'py> for Input {
     type Error = PyErr;

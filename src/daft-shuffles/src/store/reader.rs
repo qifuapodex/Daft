@@ -13,9 +13,11 @@
 //! reported as an error rather than decoded into plausible-looking rows.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::SeekFrom,
     sync::{Arc, LazyLock, Mutex},
+    time::Instant,
 };
 
 use arrow_flight::{FlightData, SchemaAsIpc, decode::FlightRecordBatchStream};
@@ -26,10 +28,15 @@ use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, stream::BoxStream};
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, BufReader},
 };
 
-use super::{index, shared_map_file, verify::CheckedRange};
+use super::{
+    index,
+    read_stats::{ReadStats, elapsed_us},
+    shared_map_file,
+    verify::CheckedRange,
+};
 use crate::client::flight_client::FlightRecordBatchStreamToDaftRecordBatchStream;
 
 /// One map input a reducer must gather: which task wrote it, and which attempt
@@ -191,29 +198,54 @@ pub(super) async fn read_index_region(
     Ok((probe, num_partitions))
 }
 
-/// Stream the raw IPC messages of one output partition out of one map file,
-/// verifying the range against the index before the stream ends.
+/// Keep the common single-bucket request inline: an ordinary shuffle can have
+/// millions of (map, bucket) reads, so even a one-element Vec per read is costly.
+enum PartitionIndices {
+    Single(u32),
+    Multiple(Vec<u32>),
+}
+
+impl PartitionIndices {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Single(index) => std::slice::from_ref(index),
+            Self::Multiple(indices) => indices,
+        }
+    }
+}
+
+/// Stream the raw IPC messages of the requested partitions out of one map file,
+/// verifying each range against the index before the stream ends.
 fn read_one_map_file(
     shuffle_id: u64,
     input: MapInput,
     path: String,
-    partition_idx: usize,
+    partition_indices: PartitionIndices,
+    stats: Arc<ReadStats>,
 ) -> BoxStream<'static, DaftResult<FlightData>> {
     Box::pin(async_stream::try_stream! {
         // Held for the whole file — open, index, and data — because the file
         // handle is what the cap is about. Acquired before the open so a caller
         // waits here rather than in the kernel's descriptor table.
+        let started = stats.enabled.then(Instant::now);
         let _slot = SHARED_READ_SLOTS.acquire().await.map_err(|e| {
             DaftError::InternalError(format!("shared read semaphore closed: {}", e))
         })?;
 
-        // Report identity, not an inferred cause: ENOENT does not tell us why
-        // the output disappeared. Only the coordinator may replace an attempt.
-        let mut file = File::open(&path).await.map_err(|e| ShuffleFetchFailure {
+        stats.add(&stats.slot_wait_us, elapsed_us(started));
+        // A missing coalesced map invalidates every requested bucket; one bucket
+        // identifies the failed read while the coordinator reconstructs the map.
+        let partition_indices = partition_indices.as_slice();
+        let first_idx = partition_indices.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
+        let started = stats.enabled.then(Instant::now);
+        stats.add(&stats.opens, 1);
+        let opened = File::open(&path).await;
+        stats.add(&stats.open_us, elapsed_us(started));
+        let mut file = opened.map_err(|e| ShuffleFetchFailure {
             shuffle_id,
             input_id: input.input_id,
             attempt: input.attempt,
-            partition_idx: partition_idx as u32,
+            partition_idx: *first_idx,
             path: path.clone(),
             message: String::new(),
         }.open_error(e))?;
@@ -221,9 +253,11 @@ fn read_one_map_file(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(shuffle_id, &path);
+        let started = stats.enabled.then(Instant::now);
         let region = match cached {
-            Some(region) => region,
+            Some(region) => { stats.add(&stats.index_hits, 1); region },
             None => {
+                stats.add(&stats.index_misses, 1);
                 let expected = remembered_partition_count(shuffle_id);
                 let (region, num_partitions) =
                     read_index_region(&mut file, &path, expected).await?;
@@ -238,25 +272,60 @@ fn read_one_map_file(
                 region
             }
         };
-        let entry = index::partition_entry(&region, partition_idx, &path)?;
-
-        // An empty output partition contributes no IPC messages at all.
-        if entry.is_empty() {
+        stats.add(&stats.index_us, elapsed_us(started));
+        let first_entry = index::partition_entry(&region, *first_idx as usize, &path)?;
+        let entries: Cow<'_, [index::PartitionEntry]> = if partition_indices.len() == 1 {
+            Cow::Borrowed(std::slice::from_ref(&first_entry))
+        } else {
+            Cow::Owned(std::iter::once(Ok(first_entry)).chain(partition_indices[1..].iter().map(|&idx| index::partition_entry(&region, idx as usize, &path)))
+                .collect::<DaftResult<Vec<_>>>()?)
+        };
+        if entries.iter().all(|entry| entry.is_empty()) {
+            stats.add(&stats.empty_ranges, entries.len() as u64);
+            stats.add(&stats.completed_files, 1);
             return;
         }
-
-        file.seek(SeekFrom::Start(entry.start)).await.map_err(DaftError::IoError)?;
-        let mut range = CheckedRange::new(
-            file,
-            entry.len(),
-            Some(entry.crc32),
-            format!("shuffle map file {} partition {}", path, partition_idx),
-        );
-
-        while let Some(message) = range.next().await? {
-            yield message;
+        let first = entries.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
+        file.seek(SeekFrom::Start(first.start)).await.map_err(DaftError::IoError)?;
+        // Only AQE multi-bucket reads prefetch across bucket boundaries. The
+        // bounded outer buffer is reused; each inner CheckedRange still hashes
+        // and verifies exactly its original partition's bytes.
+        let capacity = if entries.len() > 1 {
+            entries.last().unwrap().end.saturating_sub(first.start).min(1024 * 1024).max(1) as usize
+        } else { 0 }; // Zero-capacity BufReader bypasses buffering without allocating.
+        let mut file = BufReader::with_capacity(capacity, file);
+        let mut position = first.start;
+        for (&partition_idx, entry) in partition_indices.iter().zip(entries.iter()) {
+            if entry.is_empty() {
+                stats.add(&stats.empty_ranges, 1);
+                continue;
+            }
+            stats.add(&stats.ranges, 1);
+            stats.add(&stats.indexed_bytes, entry.len());
+            stats.add(&stats.ranges_under_64k, u64::from(entry.len() < 64 * 1024));
+            stats.add(&stats.ranges_under_1m, u64::from(entry.len() < 1024 * 1024));
+            if position != entry.start {
+                file.seek(SeekFrom::Start(entry.start)).await.map_err(DaftError::IoError)?;
+            }
+            let mut range = CheckedRange::new(
+                &mut file,
+                entry.len(),
+                Some(entry.crc32),
+                format!("shuffle map file {} partition {}", path, partition_idx),
+            );
+            loop {
+                let started = stats.enabled.then(Instant::now);
+                let message = range.next().await;
+                stats.add(&stats.read_poll_us, elapsed_us(started));
+                let Some(message) = message? else { break; };
+                stats.add(&stats.messages, 1);
+                yield message;
+            }
+            range.finish()?;
+            stats.add(&stats.verified_bytes, entry.len());
+            position = entry.end;
         }
-        range.finish()?;
+        stats.add(&stats.completed_files, 1);
     })
 }
 
@@ -279,24 +348,86 @@ pub fn read_partition_stream(
     schema: SchemaRef,
     concurrency: usize,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+    read_ranges_stream(
+        shared_root,
+        shuffle_id,
+        inputs
+            .iter()
+            .map(|&input| (input, PartitionIndices::Single(partition_idx))),
+        schema,
+        concurrency,
+    )
+}
+
+/// Read several original buckets per map file with one open/index lookup and a
+/// shared, bounded prefetch buffer. Callers must preserve key-group semantics.
+/// The concurrency budget applies across all buckets, not separately to each.
+pub fn read_map_ranges_stream(
+    shared_root: &str,
+    shuffle_id: u64,
+    mut inputs: Vec<(MapInput, Vec<u32>)>,
+    schema: SchemaRef,
+    concurrency: usize,
+) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+    for (_, indices) in &mut inputs {
+        indices.sort_unstable();
+        if indices.is_empty() || indices.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(DaftError::InternalError(
+                "Empty or duplicate shuffle bucket request".into(),
+            ));
+        }
+    }
+    read_ranges_stream(
+        shared_root,
+        shuffle_id,
+        inputs.into_iter().map(|(input, indices)| {
+            let indices = if indices.len() == 1 {
+                PartitionIndices::Single(indices[0])
+            } else {
+                PartitionIndices::Multiple(indices)
+            };
+            (input, indices)
+        }),
+        schema,
+        concurrency,
+    )
+}
+
+fn read_ranges_stream(
+    shared_root: &str,
+    shuffle_id: u64,
+    inputs: impl IntoIterator<Item = (MapInput, PartitionIndices)>,
+    schema: SchemaRef,
+    concurrency: usize,
+) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let paths = inputs
-        .iter()
-        .map(|input| {
+        .into_iter()
+        .map(|(input, indices)| {
             (
-                *input,
+                input,
                 shared_map_file(shared_root, shuffle_id, input.input_id, input.attempt),
+                indices,
             )
         })
         .collect::<Vec<_>>();
+    let mut stats = ReadStats::default();
+    stats.shuffle_id = shuffle_id;
+    stats.map_files = paths.len();
+    stats.coalesced = paths
+        .iter()
+        .any(|(_, _, indices)| indices.as_slice().len() > 1);
+    stats.enabled =
+        tracing::enabled!(target: "daft_shuffles::store::read_stats", tracing::Level::INFO);
+    stats.started = stats.enabled.then(Instant::now);
+    let stats = Arc::new(stats);
 
     let arrow_schema = schema.to_arrow()?;
     let flight_schema: FlightData =
         SchemaAsIpc::new(&arrow_schema, &IpcWriteOptions::default()).into();
 
-    let partition_idx = partition_idx as usize;
     let data = futures::stream::iter(paths)
-        .flat_map_unordered(Some(concurrency.max(1)), move |(input, path)| {
-            read_one_map_file(shuffle_id, input, path, partition_idx)
+        .flat_map_unordered(Some(concurrency.max(1)), move |(input, path, indices)| {
+            read_one_map_file(shuffle_id, input, path, indices, stats.clone())
         })
         .map(|item| item.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e))));
 
@@ -403,6 +534,218 @@ pub(super) mod tests {
 
     fn expected(n: usize) -> Vec<u8> {
         (0..n).map(|i| i as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn disabled_diagnostics_leave_counters_untouched() -> DaftResult<()> {
+        let dir = tempdir("stats_disabled");
+        let root = dir.to_str().unwrap();
+        let shuffle_id = rand::random();
+        let input = MapInput {
+            input_id: 7,
+            attempt: 99,
+        };
+        write_shared(root, shuffle_id, input, dummy_schema(), None, 50).await?;
+        let stats = Arc::new(ReadStats::default());
+        let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
+        let messages: Vec<_> = read_one_map_file(
+            shuffle_id,
+            input,
+            path,
+            PartitionIndices::Single(0),
+            stats.clone(),
+        )
+        .try_collect()
+        .await?;
+        assert!(!messages.is_empty());
+        assert_eq!(stats.messages.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(stats.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            stats
+                .read_poll_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        super::super::forget_shuffle(shuffle_id);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coalesced_reads_reuse_opens_and_preserve_empty_and_compressed_ranges() -> DaftResult<()>
+    {
+        for compression in [
+            None,
+            Some(arrow_ipc::CompressionType::LZ4_FRAME),
+            Some(arrow_ipc::CompressionType::ZSTD),
+        ] {
+            let dir = tempdir("coalesced");
+            let root = dir.to_str().unwrap();
+            let shuffle_id = rand::random();
+            let input = MapInput {
+                input_id: 7,
+                attempt: 99,
+            };
+            let schema = dummy_schema();
+            write_shared(root, shuffle_id, input, schema.clone(), compression, 50).await?;
+            let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
+            let mut stats = ReadStats::default();
+            stats.enabled = true;
+            let stats = Arc::new(stats);
+            let messages: Vec<_> = read_one_map_file(
+                shuffle_id,
+                input,
+                path.clone(),
+                PartitionIndices::Multiple(vec![0, 1, 2]),
+                stats.clone(),
+            )
+            .try_collect()
+            .await?;
+            use std::sync::atomic::Ordering::Relaxed;
+            assert_eq!(stats.opens.load(Relaxed), 1);
+            assert_eq!(stats.index_misses.load(Relaxed), 1);
+            assert_eq!(stats.ranges.load(Relaxed), 2);
+            assert_eq!(stats.empty_ranges.load(Relaxed), 1);
+            assert_eq!(stats.completed_files.load(Relaxed), 1);
+            assert_eq!(
+                stats.indexed_bytes.load(Relaxed),
+                stats.verified_bytes.load(Relaxed)
+            );
+            assert!(!messages.is_empty());
+            let batches: Vec<_> = read_map_ranges_stream(
+                root,
+                shuffle_id,
+                vec![(input, vec![0, 1, 2])],
+                schema.clone(),
+                2,
+            )?
+            .try_collect()
+            .await?;
+            let actual: Vec<u8> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let values = batch.get_column(0).u8().unwrap();
+                    (0..values.len())
+                        .map(|i| values.get(i).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(actual, [expected(50), expected(300)].concat());
+            let empty: Vec<_> = read_map_ranges_stream(
+                root,
+                shuffle_id,
+                vec![(input, vec![1])],
+                schema.clone(),
+                2,
+            )?
+            .try_collect()
+            .await?;
+            assert!(empty.is_empty());
+            assert!(
+                read_map_ranges_stream(root, shuffle_id, vec![(input, vec![0, 0])], schema, 2)
+                    .is_err()
+            );
+            super::super::forget_shuffle(shuffle_id);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_bucket_large_ipc_body_roundtrip() -> DaftResult<()> {
+        let dir = tempdir("single_large_body");
+        let root = dir.to_str().unwrap();
+        let shuffle_id = rand::random();
+        let input = MapInput {
+            input_id: 7,
+            attempt: 99,
+        };
+        let schema = dummy_schema();
+        let rows = 64 * 1024 * 1024;
+        write_shared(root, shuffle_id, input, schema.clone(), None, rows).await?;
+        let batches: Vec<_> = read_partition_stream(root, shuffle_id, &[input], 0, schema, 1)?
+            .try_collect()
+            .await?;
+        assert_eq!(batches.iter().map(RecordBatch::len).sum::<usize>(), rows);
+        super::super::forget_shuffle(shuffle_id);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coalesced_prefetch_is_bounded_and_checks_later_bucket_crc() -> DaftResult<()> {
+        let dir = tempdir("coalesced_large");
+        let root = dir.to_str().unwrap();
+        let shuffle_id = rand::random();
+        let input = MapInput {
+            input_id: 7,
+            attempt: 99,
+        };
+        let schema = dummy_schema();
+        let first_rows = 1024 * 1024 + 123;
+        write_shared(root, shuffle_id, input, schema.clone(), None, first_rows).await?;
+        let batches: Vec<_> = read_map_ranges_stream(
+            root,
+            shuffle_id,
+            vec![(input, vec![0, 1, 2])],
+            schema.clone(),
+            2,
+        )?
+        .try_collect()
+        .await?;
+        assert_eq!(
+            batches.iter().map(RecordBatch::len).sum::<usize>(),
+            first_rows + 300
+        );
+        let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
+        let bytes = std::fs::read(&path)?;
+        let entry = index::partition_entry(&bytes, 2, &path)?;
+        // Change a payload byte, leaving IPC framing intact. The original CRC
+        // must still reject the later bucket after the first has been emitted.
+        let pos = bytes[entry.start as usize..entry.end as usize]
+            .iter()
+            .rposition(|&b| b != 0)
+            .unwrap()
+            + entry.start as usize;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(pos as u64))?;
+        file.write_all(&[bytes[pos] ^ 1])?;
+        let result =
+            read_map_ranges_stream(root, shuffle_id, vec![(input, vec![0, 1, 2])], schema, 2)?
+                .try_collect::<Vec<_>>()
+                .await;
+        assert!(result.unwrap_err().to_string().contains("checksum"));
+        super::super::forget_shuffle(shuffle_id);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coalesced_reads_still_reject_truncation_in_later_bucket() -> DaftResult<()> {
+        let dir = tempdir("coalesced_truncated");
+        let root = dir.to_str().unwrap();
+        let shuffle_id = rand::random();
+        let input = MapInput {
+            input_id: 7,
+            attempt: 99,
+        };
+        let schema = dummy_schema();
+        write_shared(root, shuffle_id, input, schema.clone(), None, 50).await?;
+        let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
+        let bytes = std::fs::read(&path)?;
+        let entry = index::partition_entry(&bytes, 2, &path)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(entry.end - 1)?;
+        let result =
+            read_map_ranges_stream(root, shuffle_id, vec![(input, vec![0, 1, 2])], schema, 2)?
+                .try_collect::<Vec<_>>()
+                .await;
+        assert!(result.is_err());
+        super::super::forget_shuffle(shuffle_id);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -692,20 +1035,35 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn missing_map_file_reports_its_path() -> DaftResult<()> {
+    async fn missing_map_file_preserves_identity_for_single_and_coalesced_reads() -> DaftResult<()>
+    {
         let dir = tempdir("missing");
         let root = dir.to_str().unwrap();
-        let schema = dummy_schema();
         let input = MapInput {
             input_id: 404,
             attempt: 0xdead,
         };
-        let err = read_rows(root, 3, &[input], 0, schema).await.unwrap_err();
-        assert!(
-            err.to_string().contains("map_404_000000000000dead.arrow"),
-            "error should name the missing file, got: {}",
-            err
-        );
+        for coalesced in [false, true] {
+            let stream = if coalesced {
+                read_map_ranges_stream(root, 3, vec![(input, vec![2, 1])], dummy_schema(), 1)?
+            } else {
+                read_partition_stream(root, 3, &[input], 1, dummy_schema(), 1)?
+            };
+            let err = stream.try_collect::<Vec<_>>().await.unwrap_err();
+            let failure = err
+                .shuffle_fetch_failure()
+                .expect("missing output retains its identity");
+            assert_eq!(
+                (
+                    failure.shuffle_id,
+                    failure.input_id,
+                    failure.attempt,
+                    failure.partition_idx
+                ),
+                (3, 404, 0xdead, 1)
+            );
+            assert!(failure.path.ends_with("map_404_000000000000dead.arrow"));
+        }
         std::fs::remove_dir_all(&dir).unwrap();
         Ok(())
     }

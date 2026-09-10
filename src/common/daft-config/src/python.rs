@@ -136,6 +136,9 @@ impl PyDaftExecutionConfig {
         flight_shuffle_recovery_max_retained_bytes=None,
 
         enable_multi_glob_path_tasks=None,
+        experimental_shuffle_aqe=None,
+        experimental_shuffle_aqe_target_bytes=None,
+        experimental_shuffle_aqe_min_partitions=None,
     ))]
     fn with_config_values(
         &self,
@@ -187,6 +190,9 @@ impl PyDaftExecutionConfig {
         flight_shuffle_recovery_max_retained_bytes: Option<usize>,
 
         enable_multi_glob_path_tasks: Option<bool>,
+        experimental_shuffle_aqe: Option<bool>,
+        experimental_shuffle_aqe_target_bytes: Option<usize>,
+        experimental_shuffle_aqe_min_partitions: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
         if let Some(value) = flight_shuffle_recovery_max_attempts {
@@ -321,6 +327,26 @@ impl PyDaftExecutionConfig {
                 ));
             }
             config.shuffle_algorithm = shuffle_algorithm.to_string();
+        }
+
+        if let Some(minimum) = experimental_shuffle_aqe_min_partitions {
+            if minimum == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "experimental_shuffle_aqe_min_partitions must be greater than 0",
+                ));
+            }
+            config.experimental_shuffle_aqe_min_partitions = Some(minimum);
+        }
+        if let Some(enabled) = experimental_shuffle_aqe {
+            config.experimental_shuffle_aqe = enabled;
+        }
+        if let Some(target) = experimental_shuffle_aqe_target_bytes {
+            if target == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "experimental_shuffle_aqe_target_bytes must be greater than 0",
+                ));
+            }
+            config.experimental_shuffle_aqe_target_bytes = target;
         }
 
         if let Some(pre_shuffle_merge_threshold) = pre_shuffle_merge_threshold {
@@ -465,6 +491,21 @@ impl PyDaftExecutionConfig {
         Ok(Self {
             config: Arc::new(config),
         })
+    }
+
+    #[getter]
+    fn experimental_shuffle_aqe(&self) -> bool {
+        self.config.experimental_shuffle_aqe
+    }
+
+    #[getter]
+    fn experimental_shuffle_aqe_min_partitions(&self) -> Option<usize> {
+        self.config.experimental_shuffle_aqe_min_partitions
+    }
+
+    #[getter]
+    fn experimental_shuffle_aqe_target_bytes(&self) -> usize {
+        self.config.experimental_shuffle_aqe_target_bytes
     }
 
     #[getter]
@@ -691,7 +732,10 @@ impl PyDaftExecutionConfig {
     }
 }
 
-impl_bincode_py_state_serialization!(PyDaftExecutionConfig);
+common_py_serde::impl_versioned_bincode_py_state_serialization!(
+    PyDaftExecutionConfig,
+    _from_serialized_shuffle_aqe_v1
+);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[pyclass(module = "daft.daft", from_py_object)]
