@@ -142,12 +142,15 @@ impl ShuffleReadSource {
         for (shuffle_id, address, refs) in requests {
             let shared_root = shared_roots.get(&shuffle_id).cloned();
 
-            // This worker wrote it: serve in-process and skip both the network and
+            // Explicit shared reads also exercise the mount for local output.
+            // Otherwise, this worker wrote it: serve in-process and skip both the network and
             // the on-disk index, since the byte ranges are already in memory. The
             // registry is keyed by attempt, so this returns exactly the attempt the
             // coordinator selected even if another attempt of the same task also
             // registered here.
-            if address == local_address {
+            if address == local_address
+                && !(read_route == ReadRoute::Shared && shared_root.is_some())
+            {
                 local_refs += refs.len();
                 streams.push(local_server.get_partition_local(shuffle_id, &refs).await?);
                 continue;

@@ -1,4 +1,6 @@
-use std::ops::Range;
+use std::{collections::BinaryHeap, ops::Range};
+
+use common_error::{DaftError, DaftResult};
 
 /// Record why an exchange exists before internal partition counts are resolved.
 /// `Some(n)` alone cannot distinguish a user's request from a planner default.
@@ -37,8 +39,16 @@ impl ShuffleOrigin {
 /// Greedy contiguous groups, bounded by advisory uncompressed input bytes.
 /// Oversized buckets stay intact; splitting a key group would change results.
 /// Keep at least one group for an all-empty exchange.
-pub(crate) fn coalesce_partitions(sizes: &[usize], target: usize) -> Vec<Range<usize>> {
-    assert!(target > 0);
+pub(crate) fn coalesce_partitions(
+    sizes: &[usize],
+    target: usize,
+    min_partitions: usize,
+) -> DaftResult<Vec<Range<usize>>> {
+    if target == 0 || min_partitions == 0 {
+        return Err(DaftError::ValueError(
+            "Shuffle AQE target bytes and minimum partitions must be greater than 0".into(),
+        ));
+    }
     // Also bound per-task map-ref reconstruction and serialization for empty
     // or tiny buckets; a byte limit alone would allow unbounded fan-in.
     const MAX_BUCKETS_PER_TASK: usize = 64;
@@ -58,7 +68,24 @@ pub(crate) fn coalesce_partitions(sizes: &[usize], target: usize) -> Vec<Range<u
     if start < sizes.len() {
         groups.push(start..sizes.len());
     }
-    groups
+    // Split only at original bucket boundaries to retain both byte/width caps.
+    // Splitting the widest group first avoids leaving a long tail of singletons.
+    let minimum = min_partitions.min(sizes.len());
+    if groups.len() < minimum {
+        let mut heap: BinaryHeap<_> = groups
+            .into_iter()
+            .map(|r| (r.len(), r.start, r.end))
+            .collect();
+        while heap.len() < minimum {
+            let (len, start, end) = heap.pop().unwrap();
+            let mid = start + len / 2;
+            heap.push((mid - start, start, mid));
+            heap.push((end - mid, mid, end));
+        }
+        groups = heap.into_iter().map(|(_, start, end)| start..end).collect();
+        groups.sort_unstable_by_key(|r| r.start);
+    }
+    Ok(groups)
 }
 
 #[cfg(test)]
@@ -68,16 +95,34 @@ mod tests {
     #[test]
     fn coalescing_preserves_coverage_and_large_buckets() {
         assert_eq!(
-            coalesce_partitions(&[20, 30, 0, 80, 200, 10], 100),
+            coalesce_partitions(&[20, 30, 0, 80, 200, 10], 100, 1).unwrap(),
             vec![0..3, 3..4, 4..5, 5..6]
         );
-        assert_eq!(coalesce_partitions(&[0, 0, 0], 100), vec![0..3]);
-        assert_eq!(coalesce_partitions(&[usize::MAX, 1], 100), vec![0..1, 1..2]);
-        assert!(coalesce_partitions(&[], 100).is_empty());
+        assert_eq!(coalesce_partitions(&[0, 0, 0], 100, 1).unwrap(), vec![0..3]);
         assert_eq!(
-            coalesce_partitions(&[0; 130], 100),
+            coalesce_partitions(&[usize::MAX, 1], 100, 1).unwrap(),
+            vec![0..1, 1..2]
+        );
+        assert!(coalesce_partitions(&[], 100, 1).unwrap().is_empty());
+        assert_eq!(
+            coalesce_partitions(&[0; 130], 100, 1).unwrap(),
             vec![0..64, 64..128, 128..130]
         );
+    }
+
+    #[test]
+    fn invalid_config_returns_error_and_floor_preserves_coverage() {
+        assert!(coalesce_partitions(&[1], 0, 1).is_err());
+        assert!(coalesce_partitions(&[1], 100, 0).is_err());
+        for floor in [1, 2, 6, 10, 20, usize::MAX] {
+            let groups = coalesce_partitions(&[1; 10], 100, floor).unwrap();
+            assert_eq!(groups.len(), floor.min(10));
+            assert_eq!(
+                groups.into_iter().flatten().collect::<Vec<_>>(),
+                (0..10).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(coalesce_partitions(&[0; 130], 100, 20).unwrap().len(), 20);
     }
 
     #[test]

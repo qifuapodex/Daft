@@ -126,7 +126,10 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
     fn f_down(&mut self, node: &Self::Node) -> DaftResult<TreeNodeRecursion> {
         // Conservatively protect every join input, including upstream aggregates.
         // Join strategy is selected only after translating its children.
-        if matches!(node.as_ref(), LogicalPlan::Join(_)) {
+        if matches!(
+            node.as_ref(),
+            LogicalPlan::Join(_) | LogicalPlan::AsofJoin(_)
+        ) {
             self.join_depth += 1;
         }
         Ok(TreeNodeRecursion::Continue)
@@ -701,7 +704,10 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                 )
             }
         };
-        if matches!(node.as_ref(), LogicalPlan::Join(_)) {
+        if matches!(
+            node.as_ref(),
+            LogicalPlan::Join(_) | LogicalPlan::AsofJoin(_)
+        ) {
             self.join_depth -= 1;
         }
         self.curr_node.push(output);

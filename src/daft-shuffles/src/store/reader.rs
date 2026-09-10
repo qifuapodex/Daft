@@ -276,7 +276,7 @@ fn read_one_map_file(
         let entries: Cow<'_, [index::PartitionEntry]> = if partition_indices.len() == 1 {
             Cow::Borrowed(std::slice::from_ref(&first_entry))
         } else {
-            Cow::Owned(partition_indices.iter().map(|&idx| index::partition_entry(&region, idx as usize, &path))
+            Cow::Owned(std::iter::once(Ok(first_entry)).chain(partition_indices[1..].iter().map(|&idx| index::partition_entry(&region, idx as usize, &path)))
                 .collect::<DaftResult<Vec<_>>>()?)
         };
         if entries.iter().all(|entry| entry.is_empty()) {
@@ -606,6 +606,27 @@ pub(super) mod tests {
             super::super::forget_shuffle(shuffle_id);
             std::fs::remove_dir_all(dir)?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_bucket_large_ipc_body_roundtrip() -> DaftResult<()> {
+        let dir = tempdir("single_large_body");
+        let root = dir.to_str().unwrap();
+        let shuffle_id = rand::random();
+        let input = MapInput {
+            input_id: 7,
+            attempt: 99,
+        };
+        let schema = dummy_schema();
+        let rows = 64 * 1024 * 1024;
+        write_shared(root, shuffle_id, input, schema.clone(), None, rows).await?;
+        let batches: Vec<_> = read_partition_stream(root, shuffle_id, &[input], 0, schema, 1)?
+            .try_collect()
+            .await?;
+        assert_eq!(batches.iter().map(RecordBatch::len).sum::<usize>(), rows);
+        super::super::forget_shuffle(shuffle_id);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

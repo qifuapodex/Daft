@@ -121,6 +121,7 @@ pub(crate) async fn fold_outputs_from_stream(
     shared_root: Option<&str>,
     aqe_skip_reason: Option<&str>,
     target_bytes: usize,
+    min_partitions: usize,
 ) -> DaftResult<Vec<Vec<FlightShuffleReadInput>>> {
     let started = std::time::Instant::now();
     let mut sizes = vec![0usize; num_partitions];
@@ -146,9 +147,11 @@ pub(crate) async fn fold_outputs_from_stream(
         }
         // Accumulate O(partitions) statistics while discarding each map's refs.
         if partitions.len() != num_partitions {
-            return Err(DaftError::InternalError(
-                "Flight map output partition count mismatch".into(),
-            ));
+            return Err(DaftError::InternalError(format!(
+                "Shuffle {shuffle_id} map {} partition count mismatch: expected {num_partitions}, got {}",
+                map_output.input_id,
+                partitions.len()
+            )));
         }
         for (idx, partition) in partitions.iter().enumerate() {
             let part = as_flight_ref(partition)?;
@@ -157,9 +160,17 @@ pub(crate) async fn fold_outputs_from_stream(
                 || part.shuffle_id != shuffle_id
                 || part.server_address != flight_ref.server_address
             {
-                return Err(DaftError::InternalError(
-                    "Inconsistent Flight map output identity or partition order".into(),
-                ));
+                return Err(DaftError::InternalError(format!(
+                    "Shuffle {shuffle_id} map {} attempt {} slot {idx}: expected partition {idx}, shuffle {shuffle_id}, server {}; got partition {}, shuffle {}, map {} attempt {}, server {}",
+                    map_output.input_id,
+                    map_output.attempt,
+                    flight_ref.server_address,
+                    partition_idx_from_ref(part),
+                    part.shuffle_id,
+                    map_output_from_ref(part).input_id,
+                    map_output_from_ref(part).attempt,
+                    part.server_address
+                )));
             }
             sizes[idx] = sizes[idx].saturating_add(part.size_bytes);
             rows = rows.saturating_add(part.num_rows);
@@ -175,7 +186,7 @@ pub(crate) async fn fold_outputs_from_stream(
     }
 
     let groups = if aqe_skip_reason.is_none() {
-        coalesce_partitions(&sizes, target_bytes)
+        coalesce_partitions(&sizes, target_bytes, min_partitions)?
     } else {
         (0..num_partitions).map(|idx| idx..idx + 1).collect()
     };
@@ -203,10 +214,13 @@ pub(crate) async fn fold_outputs_from_stream(
         map_stage_wait_ms = started.elapsed().as_millis() as u64,
         aqe_status = aqe_skip_reason.unwrap_or(if groups.len() < num_partitions {
             "coalesced"
+        } else if min_partitions >= num_partitions {
+            "parallelism_floor"
         } else {
             "no_small_partitions"
         }),
         target_bytes,
+        min_partitions = min_partitions.min(num_partitions),
         "Shuffle map statistics and AQE decision"
     );
     let inputs_by_server = Arc::new(inputs_by_server);
@@ -318,7 +332,7 @@ mod tests {
             let stream =
                 futures::stream::iter(vec![Ok(output(0, &[64; 4])), Ok(output(1, &[64; 4]))]);
             let groups =
-                fold_outputs_from_stream(stream, 4, 7, Some("/shared"), reason, 256).await?;
+                fold_outputs_from_stream(stream, 4, 7, Some("/shared"), reason, 256, 1).await?;
             assert_eq!(groups.len(), if reason.is_none() { 2 } else { 4 });
             let refs: Vec<_> = groups.iter().flatten().collect();
             assert_eq!(
@@ -355,6 +369,7 @@ mod tests {
             None,
             None,
             256,
+            1,
         )
         .await?;
         assert_eq!(groups.len(), 1);
@@ -366,6 +381,7 @@ mod tests {
             None,
             None,
             256,
+            1,
         )
         .await;
         assert!(result.is_err());
@@ -376,6 +392,7 @@ mod tests {
             None,
             None,
             256,
+            1,
         )
         .await;
         assert!(result.is_err());

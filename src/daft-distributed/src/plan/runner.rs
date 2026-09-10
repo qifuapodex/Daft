@@ -61,6 +61,7 @@ pub(crate) struct PlanExecutionContext {
     /// Output partition counts of this plan's shuffles, for the width check in
     /// [`PlanRunner::warn_if_narrower_than_cluster`].
     shuffle_widths: Vec<usize>,
+    pub(crate) aqe_min_partitions: usize,
     statistics_manager: StatisticsManagerRef,
 }
 
@@ -80,6 +81,7 @@ impl PlanExecutionContext {
             shared_shuffle_dirs: Vec::new(),
             shuffle_ids: Vec::new(),
             shuffle_widths: Vec::new(),
+            aqe_min_partitions: usize::MAX,
             statistics_manager,
         }
     }
@@ -276,6 +278,22 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         let mut plan_context =
             PlanExecutionContext::new(query_idx, scheduler_handle.clone(), statistics_manager);
 
+        {
+            let cpus = self
+                .worker_manager
+                .worker_snapshots()
+                .ok()
+                .map(|snapshots| {
+                    snapshots
+                        .iter()
+                        .map(WorkerSnapshot::total_num_cpus)
+                        .sum::<f64>()
+                        .ceil() as usize
+                })
+                .unwrap_or(0);
+            // Unknown/empty capacity must not silently collapse a wide shuffle.
+            plan_context.aqe_min_partitions = if cpus > 0 { cpus } else { usize::MAX };
+        }
         let running_node = pipeline_node.produce_tasks(&mut plan_context);
         let shuffle_dirs = std::mem::take(&mut plan_context.shuffle_dirs);
         let shared_shuffle_dirs = std::mem::take(&mut plan_context.shared_shuffle_dirs);

@@ -146,6 +146,9 @@ pub struct DaftExecutionConfig {
     pub experimental_shuffle_aqe: bool,
     #[serde(default = "default_shuffle_aqe_target_bytes")]
     pub experimental_shuffle_aqe_target_bytes: usize,
+    /// None uses the cluster CPU snapshot; Some overrides the task floor.
+    #[serde(default)]
+    pub experimental_shuffle_aqe_min_partitions: Option<usize>,
     pub pre_shuffle_merge_threshold: usize,
     pub pre_shuffle_merge_partition_threshold: usize,
     pub scantask_max_parallel: usize,
@@ -210,6 +213,7 @@ impl Default for DaftExecutionConfig {
             shuffle_algorithm: "auto".to_string(),
             experimental_shuffle_aqe: false,
             experimental_shuffle_aqe_target_bytes: default_shuffle_aqe_target_bytes(),
+            experimental_shuffle_aqe_min_partitions: None,
             pre_shuffle_merge_threshold: 1024 * 1024 * 1024, // 1GB
             pre_shuffle_merge_partition_threshold: 200,
             scantask_max_parallel: 8,

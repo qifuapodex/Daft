@@ -112,8 +112,6 @@ impl PyDaftExecutionConfig {
         read_sql_partition_size_bytes=None,
         default_morsel_size=None,
         shuffle_algorithm=None,
-        experimental_shuffle_aqe=None,
-        experimental_shuffle_aqe_target_bytes=None,
         pre_shuffle_merge_threshold=None,
         pre_shuffle_merge_partition_threshold=None,
         scantask_max_parallel=None,
@@ -131,6 +129,9 @@ impl PyDaftExecutionConfig {
         flight_shuffle_read_source=None,
         flight_shuffle_shared_read_concurrency=None,
         enable_multi_glob_path_tasks=None,
+        experimental_shuffle_aqe=None,
+        experimental_shuffle_aqe_target_bytes=None,
+        experimental_shuffle_aqe_min_partitions=None,
     ))]
     fn with_config_values(
         &self,
@@ -157,8 +158,6 @@ impl PyDaftExecutionConfig {
         read_sql_partition_size_bytes: Option<usize>,
         default_morsel_size: Option<usize>,
         shuffle_algorithm: Option<&str>,
-        experimental_shuffle_aqe: Option<bool>,
-        experimental_shuffle_aqe_target_bytes: Option<usize>,
         pre_shuffle_merge_threshold: Option<usize>,
         pre_shuffle_merge_partition_threshold: Option<usize>,
         scantask_max_parallel: Option<usize>,
@@ -176,6 +175,9 @@ impl PyDaftExecutionConfig {
         flight_shuffle_read_source: Option<&str>,
         flight_shuffle_shared_read_concurrency: Option<usize>,
         enable_multi_glob_path_tasks: Option<bool>,
+        experimental_shuffle_aqe: Option<bool>,
+        experimental_shuffle_aqe_target_bytes: Option<usize>,
+        experimental_shuffle_aqe_min_partitions: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
 
@@ -266,6 +268,14 @@ impl PyDaftExecutionConfig {
             config.shuffle_algorithm = shuffle_algorithm.to_string();
         }
 
+        if let Some(minimum) = experimental_shuffle_aqe_min_partitions {
+            if minimum == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "experimental_shuffle_aqe_min_partitions must be greater than 0",
+                ));
+            }
+            config.experimental_shuffle_aqe_min_partitions = Some(minimum);
+        }
         if let Some(enabled) = experimental_shuffle_aqe {
             config.experimental_shuffle_aqe = enabled;
         }
@@ -425,6 +435,11 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn experimental_shuffle_aqe(&self) -> bool {
         self.config.experimental_shuffle_aqe
+    }
+
+    #[getter]
+    fn experimental_shuffle_aqe_min_partitions(&self) -> Option<usize> {
+        self.config.experimental_shuffle_aqe_min_partitions
     }
 
     #[getter]

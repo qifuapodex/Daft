@@ -99,6 +99,7 @@ impl RepartitionNode {
         task_id_counter: TaskIDCounter,
         result_tx: Sender<SwordfishTaskBuilder>,
         scheduler_handle: SchedulerHandle<SwordfishTask>,
+        min_partitions: usize,
     ) -> DaftResult<()> {
         let outputs = local_shuffle_write_node.materialize(
             scheduler_handle.clone(),
@@ -111,6 +112,7 @@ impl RepartitionNode {
                 outputs,
                 self.num_partitions,
                 self.aqe_skip_reason,
+                min_partitions,
                 self.as_ref(),
                 result_tx,
             )
@@ -165,6 +167,11 @@ impl PipelineNodeImpl for RepartitionNode {
         let task_id_counter = plan_context.task_id_counter();
         let scheduler_handle = plan_context.scheduler_handle();
 
+        let min_partitions = self
+            .config
+            .execution_config
+            .experimental_shuffle_aqe_min_partitions
+            .unwrap_or(plan_context.aqe_min_partitions);
         let execution = async move {
             self_arc
                 .execution_loop(
@@ -172,6 +179,7 @@ impl PipelineNodeImpl for RepartitionNode {
                     task_id_counter,
                     result_tx,
                     scheduler_handle,
+                    min_partitions,
                 )
                 .await
         };

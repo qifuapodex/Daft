@@ -233,8 +233,6 @@ def set_execution_config(
     read_sql_partition_size_bytes: int | None = None,
     default_morsel_size: int | None = None,
     shuffle_algorithm: str | None = None,
-    experimental_shuffle_aqe: bool | None = None,
-    experimental_shuffle_aqe_target_bytes: int | None = None,
     pre_shuffle_merge_threshold: int | None = None,
     pre_shuffle_merge_partition_threshold: int | None = None,
     scantask_max_parallel: int | None = None,
@@ -252,6 +250,9 @@ def set_execution_config(
     flight_shuffle_read_source: str | None = None,
     flight_shuffle_shared_read_concurrency: int | None = None,
     enable_multi_glob_path_tasks: bool | None = None,
+    experimental_shuffle_aqe: bool | None = None,
+    experimental_shuffle_aqe_target_bytes: int | None = None,
+    experimental_shuffle_aqe_min_partitions: int | None = None,
 ) -> DaftContext:
     """Globally sets various configuration parameters which control various aspects of Daft execution.
 
@@ -290,6 +291,7 @@ def set_execution_config(
         default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
         shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
         experimental_shuffle_aqe: Opt-in coalescing of internal Flight aggregation and distinct exchanges. Defaults to False. User repartitions and join inputs are excluded.
+        experimental_shuffle_aqe_min_partitions: Minimum reduce tasks, capped by original buckets. Defaults to the CPU count at query start; unavailable capacity preserves the original count. Set a positive value to override.
         experimental_shuffle_aqe_target_bytes: Advisory uncompressed input bytes per coalesced task; defaults to 256 MiB. This is not a peak-memory limit.
         pre_shuffle_merge_threshold: Memory threshold in bytes for pre-shuffle merge. Defaults to 1GB
         pre_shuffle_merge_partition_threshold: Number of partitions threshold to enable pre-shuffle merge when shuffle_algorithm is "auto". Defaults to 200.
@@ -306,7 +308,7 @@ def set_execution_config(
         flight_shuffle_shared_dir: A cluster-shared POSIX directory (Lustre, NFS, FSx, ...) to write flight shuffle data to. Required when `flight_shuffle_placement` is "shared_only", and must be set in the same call. Defaults to None.
         flight_shuffle_placement: Where flight shuffle map output is written. "local_only" (the default) uses the node-local `flight_shuffle_dirs` and serves partitions over gRPC only. "shared_only" writes to `flight_shuffle_shared_dir`, letting any node read a partition directly and letting a query survive losing the worker that wrote it. Only applies to repartition-style shuffles; gather and into_partitions always write node-locally.
         flight_shuffle_shared_durability: How shared-directory writes are fsynced. "background" (the default) publishes the file immediately and fsyncs off the critical path; "none" never fsyncs, so a shared copy can be lost if its writer node dies; "sync" fsyncs before publishing, which is the strongest but can cut write throughput several-fold on filesystems with expensive fsync.
-        flight_shuffle_read_source: How this worker fetches shuffle partitions written by other workers. "auto" (the default) reads the shared directory directly when the data is there and otherwise uses gRPC; "rpc" always tries gRPC first; "shared" always reads the shared directory for shuffles written there and requires `flight_shuffle_placement="shared_only"` (gather and into_partitions are always node-local and are read over gRPC regardless). "auto" and "rpc" both fall back to the shared directory if the gRPC fetch fails before returning data.
+        flight_shuffle_read_source: How this worker fetches shuffle partitions. "auto" (the default) reads the shared directory directly when the data is there and otherwise uses gRPC; "rpc" always tries gRPC first; "shared" always reads the shared directory (including this worker's own output) for shuffles written there and requires `flight_shuffle_placement="shared_only"` (gather and into_partitions are always node-local and are read over gRPC regardless). "auto" and "rpc" both fall back to the shared directory if the gRPC fetch fails before returning data.
         flight_shuffle_shared_read_concurrency: How many map files a reduce task reads from the shared directory at once. Defaults to 16, above `scantask_max_parallel` because shared-mount reads are dominated by per-file round trips rather than bytes.
         enable_multi_glob_path_tasks: Whether to create multiple glob path tasks in Ray Runner to achieve parallel glob. Defaults to False.
     """
@@ -349,6 +351,7 @@ def set_execution_config(
             shuffle_algorithm=shuffle_algorithm,
             experimental_shuffle_aqe=experimental_shuffle_aqe,
             experimental_shuffle_aqe_target_bytes=experimental_shuffle_aqe_target_bytes,
+            experimental_shuffle_aqe_min_partitions=experimental_shuffle_aqe_min_partitions,
             pre_shuffle_merge_threshold=pre_shuffle_merge_threshold,
             pre_shuffle_merge_partition_threshold=pre_shuffle_merge_partition_threshold,
             scantask_max_parallel=scantask_max_parallel,

@@ -212,6 +212,7 @@ pub async fn write_partitions_one_shot(
             }
 
             tracing::info!(
+                target: "daft_shuffle_diagnostics",
                 shuffle_id,
                 input_id,
                 attempt,

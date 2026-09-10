@@ -23,6 +23,7 @@ def plan_text(df):
 
 def test_shuffle_aqe_config_defaults_and_validation():
     config = get_context().daft_execution_config
+    assert config.experimental_shuffle_aqe_min_partitions is None
     assert config.experimental_shuffle_aqe is False
     assert config.experimental_shuffle_aqe_target_bytes == 256 * 1024 * 1024
     with (
@@ -30,22 +31,43 @@ def test_shuffle_aqe_config_defaults_and_validation():
         daft.execution_config_ctx(experimental_shuffle_aqe_target_bytes=0),
     ):
         pass
-    with daft.execution_config_ctx(experimental_shuffle_aqe=True, experimental_shuffle_aqe_target_bytes=1024):
+    with (
+        pytest.raises(ValueError, match="greater than 0"),
+        daft.execution_config_ctx(experimental_shuffle_aqe_min_partitions=0),
+    ):
+        pass
+    with daft.execution_config_ctx(
+        experimental_shuffle_aqe=True,
+        experimental_shuffle_aqe_min_partitions=1,
+        experimental_shuffle_aqe_target_bytes=1024,
+    ):
         assert get_context().daft_execution_config.experimental_shuffle_aqe is True
         assert get_context().daft_execution_config.experimental_shuffle_aqe_target_bytes == 1024
     assert get_context().daft_execution_config.experimental_shuffle_aqe is False
 
 
+@pytest.mark.parametrize("placement", ["local_only", "shared_only"])
 @pytest.mark.parametrize("operation", ["aggregate", "distinct"])
-def test_shuffle_aqe_opt_in_coalesces_and_preserves_rows(tmp_path, operation):
+def test_shuffle_aqe_opt_in_coalesces_and_preserves_rows(tmp_path, operation, placement):
     df = source()
     answers = []
     counts = []
+    storage = (
+        {}
+        if placement == "local_only"
+        else {
+            "flight_shuffle_placement": "shared_only",
+            "flight_shuffle_shared_dir": str(tmp_path / "shared"),
+            "flight_shuffle_read_source": "shared",
+        }
+    )
     for enabled in [False, True]:
         with daft.execution_config_ctx(
             shuffle_algorithm="flight_shuffle",
             flight_shuffle_dirs=[str(tmp_path)],
             experimental_shuffle_aqe=enabled,
+            experimental_shuffle_aqe_min_partitions=1,
+            **storage,
         ):
             result = df.groupby("k").agg(daft.col("v").sum()) if operation == "aggregate" else df.select("k").distinct()
             text = plan_text(result)
@@ -80,6 +102,7 @@ def test_shuffle_aqe_skips_hash_join_and_its_inputs(tmp_path):
             shuffle_algorithm="flight_shuffle",
             flight_shuffle_dirs=[str(tmp_path)],
             experimental_shuffle_aqe=enabled,
+            experimental_shuffle_aqe_min_partitions=1,
             broadcast_join_size_bytes_threshold=0,
         ):
             left = df.groupby("k").agg(daft.col("v").sum())
@@ -100,6 +123,7 @@ def test_shuffle_aqe_empty_aggregate_and_repartition_after_coalescing(tmp_path):
         shuffle_algorithm="flight_shuffle",
         flight_shuffle_dirs=[str(tmp_path)],
         experimental_shuffle_aqe=True,
+        experimental_shuffle_aqe_min_partitions=1,
     ):
         empty = df.where(daft.col("k") < 0).groupby("k").agg(daft.col("v").sum())
         assert empty.to_pydict() == {"k": [], "v": []}
@@ -110,3 +134,84 @@ def test_shuffle_aqe_empty_aggregate_and_repartition_after_coalescing(tmp_path):
         result = grouped.repartition(7, "k").collect()
         assert result._result_cache.num_partitions() == 7
         assert dict(zip(result.to_pydict()["k"], result.to_pydict()["v"])) == expected
+
+
+@pytest.mark.parametrize("aligned", [False, True])
+def test_shuffle_aqe_skips_asof_join_inputs(tmp_path, aligned):
+    df = source()
+    for enabled in [False, True]:
+        with daft.execution_config_ctx(
+            shuffle_algorithm="flight_shuffle",
+            flight_shuffle_dirs=[str(tmp_path)],
+            experimental_shuffle_aqe=enabled,
+            experimental_shuffle_aqe_min_partitions=1,
+            enable_scan_task_split_and_merge=False,
+        ):
+            left = df.groupby("k").agg(daft.col("v").sum())
+            right = df.select("k").distinct().with_column("w", daft.col("k"))
+            # One partition on both sides makes the private alignment contract
+            # unambiguous, while retaining the upstream adaptive exchanges in plan.
+            if aligned:
+                left = left.into_partitions(1).sort("k")
+                right = right.into_partitions(1).sort("k")
+            result = left.join_asof(right, on="k", _assume_sorted_and_aligned=aligned)
+            if enabled:
+                text = plan_text(result)
+                assert "join_input" in text
+                assert "Experimental AQE: coalesce" not in text
+            rows = result.to_pydict()
+            assert sorted(zip(rows["k"], rows["v"], rows["w"])) == [(k, 4 * k + 384, k) for k in range(64)]
+
+
+@pytest.mark.parametrize("downstream", ["into_partitions", "sort", "window", "distinct_window"])
+def test_shuffle_aqe_shared_downstream_operators(tmp_path, downstream):
+    df = source()
+    with daft.execution_config_ctx(
+        shuffle_algorithm="flight_shuffle",
+        flight_shuffle_dirs=[str(tmp_path / "local")],
+        flight_shuffle_placement="shared_only",
+        flight_shuffle_shared_dir=str(tmp_path / "shared"),
+        flight_shuffle_read_source="shared",
+        experimental_shuffle_aqe=True,
+        experimental_shuffle_aqe_min_partitions=1,
+    ):
+        grouped = df.groupby("k").agg(daft.col("v").sum())
+        if downstream == "into_partitions":
+            result = grouped.into_partitions(7).collect()
+            assert result._result_cache.num_partitions() == 7
+        elif downstream == "sort":
+            result = grouped.sort("k").collect()
+            assert result.to_pydict()["k"] == list(range(64))
+        else:
+            if downstream == "distinct_window":
+                grouped = grouped.distinct()
+            window = (
+                daft.Window()
+                .partition_by("k")
+                .order_by("v")
+                .rows_between(daft.Window.unbounded_preceding, daft.Window.current_row)
+            )
+            result = grouped.with_column("w", daft.col("v").first_value().over(window)).collect()
+            rows = result.to_pydict()
+            assert rows["w"] == rows["v"]
+        rows = result.to_pydict()
+        assert sorted(zip(rows["k"], rows["v"])) == [(k, 4 * k + 384) for k in range(64)]
+
+
+@pytest.mark.parametrize("minimum", [None, 3, 100000])
+def test_shuffle_aqe_task_floor(tmp_path, minimum):
+    import ray
+
+    df = source().into_partitions(8)
+    counts = []
+    for enabled in [False, True]:
+        with daft.execution_config_ctx(
+            shuffle_algorithm="flight_shuffle",
+            flight_shuffle_dirs=[str(tmp_path)],
+            experimental_shuffle_aqe=enabled,
+            experimental_shuffle_aqe_min_partitions=minimum,
+        ):
+            result = df.groupby("k").agg(daft.col("v").sum()).collect()
+            counts.append(result._result_cache.num_partitions())
+    floor = minimum if minimum is not None else int(ray.cluster_resources()["CPU"])
+    assert min(floor, counts[0]) <= counts[1] <= counts[0]

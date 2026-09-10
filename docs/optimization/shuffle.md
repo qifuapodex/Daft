@@ -189,11 +189,13 @@ If you're unsure whether your shuffle has crossed the thresholds, run it once wi
 ## Shuffle diagnostics and experimental AQE
 
 Flight repartition exchanges emit structured `INFO` summaries independently of AQE.
+Per-map write events use the dedicated `daft_shuffle_diagnostics` target so enabling
+`daft_shuffles=info` alone does not emit a log for every map attempt.
 To retain the fields for analysis, set these variables on the driver **and Ray workers**
 before starting the processes (or supply the worker variables through Ray's runtime environment):
 
 ```bash
-export DAFT_TRACE=daft_shuffles=info,daft_distributed=info,daft_local_execution=info
+export DAFT_TRACE=daft_shuffle_diagnostics=info,daft_shuffles=info,daft_distributed=info,daft_local_execution=info
 export DAFT_TRACE_FORMAT=json
 export RAY_DEDUP_LOGS=0
 ```
@@ -223,13 +225,21 @@ shared-mount breakdown; use routing and source consumption to avoid attributing 
 costs to shared reads. These summaries do not measure process RSS or filesystem cache
 hits. Use storage/cgroup measurements alongside them.
 
-Experimental adaptive coalescing is **off by default**. Enable it explicitly:
+Experimental adaptive coalescing is **off by default**. It reduces task count;
+file-open reuse is currently available only for direct shared-mount reads. With
+the default `local_only` placement, RPC and in-process paths still open each
+original (map, bucket) range separately: grouping tasks does not reduce that total.
+Map writes and the number of map files are unchanged on every route.
+
+Enable task coalescing explicitly:
 
 ```python
 daft.set_execution_config(
     shuffle_algorithm="flight_shuffle",
     experimental_shuffle_aqe=True,
     experimental_shuffle_aqe_target_bytes=256 * 1024 * 1024,
+    # Optional override; otherwise use cluster CPUs at query start.
+    # experimental_shuffle_aqe_min_partitions=128,
 )
 ```
 
@@ -240,8 +250,17 @@ hash-table or aggregate memory. Each task takes at most 64 original buckets to b
 ref reconstruction even when buckets are empty. Coordinator statistics remain
 O(map tasks + original buckets); full map-by-bucket matrices are not retained.
 
+The task-count floor defaults to the number of CPUs reported by the worker manager
+at query start, capped by the original bucket count. If that snapshot is empty or
+unavailable, preserve the original count. Set a positive
+`experimental_shuffle_aqe_min_partitions` to override it, for example when reserving
+only part of a shared cluster. The floor splits coalesced groups at original bucket
+boundaries; it never increases the original bucket count. This is a capacity
+snapshot, not a dynamic autoscaling policy or a guarantee that CPUs remain available.
+
 AQE skips hash-join exchanges and conservatively skips exchanges anywhere in a join's
-input subtree, since the join strategy is chosen after translating its children. It
+input subtree, including broadcast joins and both normal/aligned as-of joins, since
+the join strategy is chosen after translating its children. It
 also skips user `repartition` calls, including explicit partition counts and `None`
 (which currently promises to keep the count). `into_partitions`, sorts, windows,
 random row shuffles and non-Flight backends retain their existing execution behavior.
@@ -250,14 +269,40 @@ An internal aggregation partition count derived from configuration is not a user
 
 `explain(show_all=True)` shows eligibility or the skip reason. Runtime decision logs
 report `disabled`, `join_input`, `user_partition_contract`, `unsupported_backend`,
-`unsupported_operator`, `coalesced`, or `no_small_partitions`. Planning-time partition
+`unsupported_operator`, `coalesced`, `parallelism_floor`, or `no_small_partitions`. Planning-time partition
 counts for eligible exchanges remain upper bounds; inspect the runtime decision
 event for the actual number of reduce tasks.
+
+Eligible exchanges advertise `Unknown` clustering before execution, and aggregation,
+projection and distinct preserve that uncertainty. Consequently a downstream distinct
+or partitioned window may need an extra shuffle, even when the runtime decision is
+`no_small_partitions` or `parallelism_floor`. The planner does not yet replan downstream
+nodes after observing runtime coalescing. Keeping the join-input guard is necessary
+until a future planner explicitly coordinates alignment on both sides.
 
 For eligible coalesced tasks reading the shared mount directly, the reader opens each
 map file once and reuses an at-most-1-MiB prefetch buffer across its original bucket
 ranges. The task's shared-read concurrency budget applies across the entire group.
+For K merged buckets, this is C simultaneous map-file streams rather than the former
+up-to-K×C streams across K tasks. Each file's K ranges are consumed sequentially.
+This deliberately bounds open handles and buffer memory, but can reduce I/O overlap
+and throughput on high-latency storage. The CPU task floor helps retain task parallelism;
+it does not preserve the previous I/O concurrency. Tune
+`flight_shuffle_shared_read_concurrency` against task count, buffer memory and measured
+storage latency; no cluster performance A/B currently establishes the right setting.
 Original per-bucket length/CRC checks and selected map attempts are preserved. The
 RPC/in-process paths and RPC-to-shared fallback retain their existing read layout.
+To exercise direct shared reads, configure `flight_shuffle_placement="shared_only"`,
+`flight_shuffle_shared_dir`, and `flight_shuffle_read_source="shared"` together. Explicit
+`shared` also reads this worker's own shared output through the mount; `auto` retains
+its in-process shortcut. Local temporary directories in tests exercise this route,
+but are not evidence for Lustre/NFS performance.
+
+The ordinary single-bucket path retains its existing `CheckedRange` buffer; only the
+additional outer buffer and bucket-list allocations are avoided. Large IPC bodies
+can bypass the inner 8-KiB buffer, so that size alone cannot predict syscall counts.
+Workloads containing many small IPC messages need separate storage measurements before
+changing the prefetch policy for all default reads.
+
 AQE does not merge already-written map files, automatically choose a different
 shuffle algorithm, resize the cluster, or compact final Parquet files.

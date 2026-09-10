@@ -215,6 +215,7 @@ impl ShuffleBackend {
         materialized_stream: impl futures::Stream<Item = DaftResult<MaterializedOutput>> + Send + Unpin,
         num_partitions: usize,
         aqe_skip_reason: Option<&'static str>,
+        min_partitions: usize,
         node: &dyn PipelineNodeImpl,
         result_tx: Sender<SwordfishTaskBuilder>,
     ) -> DaftResult<()> {
@@ -250,6 +251,7 @@ impl ShuffleBackend {
                     node.config()
                         .execution_config
                         .experimental_shuffle_aqe_target_bytes,
+                    min_partitions,
                 )
                 .await?;
                 flight::emit_read_tasks(
