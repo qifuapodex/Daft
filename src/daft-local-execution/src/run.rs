@@ -420,6 +420,20 @@ async fn run_execution_loop(
         }
     };
 
+    let result = finish_input_streams(message_router, enqueue_input_rx, result).await;
+
+    stats_manager.finish(finish_status).await;
+    flush_opentelemetry_providers();
+    result
+}
+
+/// Close a pipeline's inputs and deliver its failure to every unfinished input,
+/// including inputs accepted into the queue but not yet routed to the pipeline.
+async fn finish_input_streams(
+    message_router: MessageRouter,
+    mut enqueue_input_rx: crate::channel::Receiver<EnqueueInputMessage>,
+    result: DaftResult<()>,
+) -> DaftResult<()> {
     let result = result.map_err(|error| {
         let error = Arc::new(error);
         for sender in message_router.output_senders.values() {
@@ -438,8 +452,6 @@ async fn run_execution_loop(
     }
     drop(message_router);
 
-    stats_manager.finish(finish_status).await;
-    flush_opentelemetry_providers();
     result.map_err(DaftError::Shared)
 }
 
@@ -624,7 +636,8 @@ impl NativeExecutor {
     ) -> DaftResult<BoxFuture<'static, DaftResult<ExecutionStats>>> {
         let Some(plan_state) = self.plans.get_mut(&fingerprint) else {
             // Plan already removed (pipeline died and another input_id cleaned it up).
-            // Return empty stats; the actual error was already surfaced by the first caller.
+            // Return empty stats; PyResultReceiver retains each unfinished input's
+            // error independently of this shared plan's lifetime.
             let query_id = QueryID::from("");
             return Ok(async move { Ok(ExecutionStats::new(query_id, vec![])) }.boxed());
         };
@@ -837,6 +850,76 @@ fn dispatch_task_start_event(subscribers: &[Arc<dyn Subscriber>], event: &Event)
     for subscriber in subscribers {
         if let Err(e) = subscriber.on_event(event.clone()) {
             log::debug!("Failed to dispatch task start event: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn pipeline_failure_reaches_unfinished_and_queued_inputs() {
+        let (enqueue_tx, enqueue_rx) = create_channel(1);
+        let mut router = MessageRouter::new();
+        let mut results = Vec::new();
+        for input_id in 0..4 {
+            let (tx, rx) = create_unbounded_channel();
+            results.push(ExecutionEngineResult {
+                receiver: rx,
+                error: None,
+            });
+            if input_id == 3 {
+                assert!(
+                    enqueue_tx
+                        .send(EnqueueInputMessage {
+                            input_id,
+                            inputs: HashMap::new(),
+                            result_sender: tx,
+                        })
+                        .await
+                        .is_ok()
+                );
+            } else {
+                router.insert_output_sender(input_id, tx);
+            }
+        }
+        // Input 0 finished; input 1 emitted partial output; input 2 emitted
+        // nothing; input 3 is accepted but still waiting in the input queue.
+        router.route_message(PipelineMessage::Flush(0));
+        router.route_message(PipelineMessage::Morsel {
+            input_id: 1,
+            partition: MicroPartition::empty(None),
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            finish_input_streams(
+                router,
+                enqueue_rx,
+                Err(DaftError::SocketError("connection reset".into())),
+            ),
+        )
+        .await
+        .expect("must finish even while the input sender is alive")
+        .unwrap_err();
+        let DaftError::Shared(error) = error else {
+            panic!("expected the shared pipeline error");
+        };
+        assert!(enqueue_tx.is_closed());
+        assert!(results[0].next().await.is_none());
+        assert!(results[0].error.is_none());
+        assert!(matches!(
+            results[1].next().await,
+            Some(ExecutionEngineResultItem::Partition(_))
+        ));
+        for result in &mut results[1..] {
+            assert!(result.next().await.is_none());
+            let received = result.error.as_ref().expect("must retain the input error");
+            assert!(Arc::ptr_eq(received, &error));
+            assert!(received.is_transient());
         }
     }
 }

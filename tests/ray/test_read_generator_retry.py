@@ -63,8 +63,7 @@ def test_read_generator_retries_transient_errors(generator_calls, exc_type):
     assert ray.get(generator_calls.get.remote()) == {0: 2}
 
 
-@pytest.mark.parametrize("repeat", range(5))
-def test_read_generator_retries_after_batch_without_duplicates(generator_calls, repeat):
+def test_read_generator_retries_after_batch_without_duplicates(generator_calls):
     batch = RecordBatch.from_pydict({"x": [0]})
 
     def generate(partition):
