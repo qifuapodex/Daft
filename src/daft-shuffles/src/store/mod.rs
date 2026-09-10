@@ -18,6 +18,7 @@
 #[cfg(test)]
 mod bench;
 pub mod index;
+mod read_stats;
 pub mod reader;
 pub(crate) mod verify;
 pub mod writer;

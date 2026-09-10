@@ -3,7 +3,10 @@ use std::sync::Arc;
 use common_error::DaftResult;
 use common_metrics::ops::{NodeCategory, NodeType};
 use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan};
-use daft_logical_plan::{partitioning::RepartitionSpec, stats::StatsState};
+use daft_logical_plan::{
+    partitioning::{ClusteringSpec, RepartitionSpec, UnknownClusteringConfig},
+    stats::StatsState,
+};
 use daft_schema::schema::SchemaRef;
 
 use crate::{
@@ -25,6 +28,7 @@ pub(crate) struct RepartitionNode {
     config: PipelineNodeConfig,
     context: PipelineNodeContext,
     repartition_spec: RepartitionSpec,
+    aqe_skip_reason: Option<&'static str>,
     shuffle_backend: ShuffleBackend,
     num_partitions: usize,
     child: DistributedPipelineNode,
@@ -38,6 +42,7 @@ impl RepartitionNode {
         node_id: NodeID,
         plan_config: &PlanConfig,
         repartition_spec: RepartitionSpec,
+        aqe_skip_reason: Option<&'static str>,
         schema: SchemaRef,
         num_partitions: usize,
         backend: DistributedShuffleBackend,
@@ -58,6 +63,14 @@ impl RepartitionNode {
             child.config().clustering_spec.num_partitions(),
             &child.config().schema,
         )?;
+        // Coalesced hash buckets are not hash(key) % the new task count.
+        // Keep the planned count as an upper bound, but never let downstream
+        // joins elide a required exchange using this stale hash property.
+        let clustering_spec = if aqe_skip_reason.is_none() {
+            ClusteringSpec::Unknown(UnknownClusteringConfig::new(num_partitions))
+        } else {
+            clustering_spec
+        };
         let config = PipelineNodeConfig::new(
             schema.clone(),
             plan_config.config.clone(),
@@ -68,6 +81,7 @@ impl RepartitionNode {
             config,
             context: context.clone(),
             repartition_spec,
+            aqe_skip_reason,
             shuffle_backend: ShuffleBackend::new(
                 &context,
                 schema,
@@ -85,6 +99,7 @@ impl RepartitionNode {
         task_id_counter: TaskIDCounter,
         result_tx: Sender<SwordfishTaskBuilder>,
         scheduler_handle: SchedulerHandle<SwordfishTask>,
+        min_partitions: usize,
     ) -> DaftResult<()> {
         let outputs = local_shuffle_write_node.materialize(
             scheduler_handle.clone(),
@@ -93,7 +108,14 @@ impl RepartitionNode {
         );
 
         self.shuffle_backend
-            .emit_read_tasks_from_stream(outputs, self.num_partitions, self.as_ref(), result_tx)
+            .emit_read_tasks_from_stream(
+                outputs,
+                self.num_partitions,
+                self.aqe_skip_reason,
+                min_partitions,
+                self.as_ref(),
+                result_tx,
+            )
             .await
     }
 }
@@ -145,6 +167,11 @@ impl PipelineNodeImpl for RepartitionNode {
         let task_id_counter = plan_context.task_id_counter();
         let scheduler_handle = plan_context.scheduler_handle();
 
+        let min_partitions = self
+            .config
+            .execution_config
+            .experimental_shuffle_aqe_min_partitions
+            .unwrap_or(plan_context.aqe_min_partitions);
         let execution = async move {
             self_arc
                 .execution_loop(
@@ -152,6 +179,7 @@ impl PipelineNodeImpl for RepartitionNode {
                     task_id_counter,
                     result_tx,
                     scheduler_handle,
+                    min_partitions,
                 )
                 .await
         };
@@ -170,6 +198,17 @@ impl PipelineNodeImpl for RepartitionNode {
             self.repartition_spec.var_name()
         )];
         res.extend(self.repartition_spec.multiline_display());
+        if self.config.execution_config.experimental_shuffle_aqe {
+            res.push(match self.aqe_skip_reason {
+                Some(reason) => format!("Experimental AQE: skipped ({reason})"),
+                None => format!(
+                    "Experimental AQE: coalesce, target {} bytes (uncompressed)",
+                    self.config
+                        .execution_config
+                        .experimental_shuffle_aqe_target_bytes
+                ),
+            });
+        }
         res
     }
 }
