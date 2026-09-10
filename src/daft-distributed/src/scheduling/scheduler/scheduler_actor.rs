@@ -54,8 +54,9 @@ where
         task_rx: SchedulerReceiver<W::Task>,
         worker_manager: Arc<dyn WorkerManager<Worker = W>>,
         statistics_manager: StatisticsManagerRef,
+        recovery: Arc<crate::scheduling::shuffle_recovery::ShuffleRecovery>,
     ) -> Self {
-        let dispatcher = Dispatcher::new(statistics_manager.clone());
+        let dispatcher = Dispatcher::new(statistics_manager.clone(), recovery);
         Self {
             scheduler,
             task_rx,
@@ -153,15 +154,10 @@ where
                     scheduled_tasks = %format!("{:#?}", scheduled_tasks)
                 );
 
-                for task in &scheduled_tasks {
-                    self.statistics_manager.handle_event(TaskEvent::Scheduled {
-                        context: task.task().task_context(),
-                        worker_id: task.worker_id(),
-                    })?;
-                }
-
                 self.dispatcher
                     .dispatch_tasks(scheduled_tasks, &self.worker_manager)?;
+                self.scheduler
+                    .enqueue_tasks(self.dispatcher.take_deferred_tasks());
             }
 
             // 3b: Ask the worker manager to retire idle workers when downscaling is configured.
@@ -263,14 +259,18 @@ where
     S: Scheduler<W::Task> + Send + 'static,
 {
     let (scheduler_sender, scheduler_receiver) = create_unbounded_channel();
+    let recovery_statistics = statistics_manager.clone();
+    let mut handle = SchedulerHandle::new(scheduler_sender);
     let loop_state = SchedulerLoop::new(
         scheduler,
         scheduler_receiver,
         worker_manager,
         statistics_manager,
+        handle.shuffle_recovery.clone(),
     );
     joinset.spawn(loop_state.run());
-    SchedulerHandle::new(scheduler_sender)
+    handle.recovery_statistics = recovery_statistics;
+    handle
 }
 
 fn spawn_default_scheduler_actor<W: Worker>(
@@ -301,22 +301,38 @@ fn spawn_linear_scheduler_actor<W: Worker>(
     )
 }
 
-#[derive(Debug)]
 pub(crate) struct SchedulerHandle<T: Task> {
     scheduler_sender: SchedulerSender<T>,
+    pub(crate) task_id_counter: crate::plan::TaskIDCounter,
+    pub(crate) shuffle_recovery: Arc<crate::scheduling::shuffle_recovery::ShuffleRecovery>,
+    pub(crate) recovery_statistics: StatisticsManagerRef,
+}
+
+impl<T: Task> std::fmt::Debug for SchedulerHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchedulerHandle").finish_non_exhaustive()
+    }
 }
 
 impl<T: Task> Clone for SchedulerHandle<T> {
     fn clone(&self) -> Self {
         Self {
             scheduler_sender: self.scheduler_sender.clone(),
+            task_id_counter: self.task_id_counter.clone(),
+            shuffle_recovery: self.shuffle_recovery.clone(),
+            recovery_statistics: self.recovery_statistics.clone(),
         }
     }
 }
 
 impl<T: Task> SchedulerHandle<T> {
     fn new(scheduler_sender: SchedulerSender<T>) -> Self {
-        Self { scheduler_sender }
+        Self {
+            scheduler_sender,
+            task_id_counter: crate::plan::TaskIDCounter::new(),
+            shuffle_recovery: Arc::new(crate::scheduling::shuffle_recovery::ShuffleRecovery::new()),
+            recovery_statistics: StatisticsManagerRef::default(),
+        }
     }
 
     pub fn prepare_task_for_submission(
@@ -379,18 +395,42 @@ impl<T: Task> SubmittableTask<T> {
         }
     }
 
+    pub(crate) fn into_parts(self) -> (T, CancellationToken, Vec<TaskNotifyToken>) {
+        (self.task, self.cancel_token, self.notify_tokens)
+    }
+
     pub fn submit(self, scheduler_handle: &SchedulerHandle<T>) -> DaftResult<SubmittedTask> {
+        T::submit(self, scheduler_handle)
+    }
+
+    pub(crate) fn submit_raw(
+        self,
+        scheduler_handle: &SchedulerHandle<T>,
+    ) -> DaftResult<SubmittedTask> {
         scheduler_handle.submit_task(self)
     }
 }
 
-#[derive(Debug)]
+enum SubmittedResult {
+    Receiver(OneshotReceiver<DaftResult<Option<MaterializedOutput>>>),
+    Recovery(futures::future::BoxFuture<'static, DaftResult<Option<MaterializedOutput>>>),
+}
+
 pub(crate) struct SubmittedTask {
     _task_id: TaskID,
-    result_rx: OneshotReceiver<DaftResult<Option<MaterializedOutput>>>,
+    result: SubmittedResult,
     cancel_token: Option<CancellationToken>,
     notify_tokens: Vec<TaskNotifyToken>,
     finished: bool,
+}
+
+impl std::fmt::Debug for SubmittedTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmittedTask")
+            .field("task_id", &self._task_id)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SubmittedTask {
@@ -402,7 +442,22 @@ impl SubmittedTask {
     ) -> Self {
         Self {
             _task_id: task_id,
-            result_rx,
+            result: SubmittedResult::Receiver(result_rx),
+            cancel_token,
+            notify_tokens,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn from_future(
+        task_id: TaskID,
+        result: futures::future::BoxFuture<'static, DaftResult<Option<MaterializedOutput>>>,
+        cancel_token: Option<CancellationToken>,
+        notify_tokens: Vec<TaskNotifyToken>,
+    ) -> Self {
+        Self {
+            _task_id: task_id,
+            result: SubmittedResult::Recovery(result),
             cancel_token,
             notify_tokens,
             finished: false,
@@ -419,23 +474,18 @@ impl Future for SubmittedTask {
     type Output = DaftResult<Option<MaterializedOutput>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.result_rx.poll_unpin(cx) {
-            Poll::Ready(Ok(result)) => {
+        let result = match &mut self.result {
+            SubmittedResult::Receiver(rx) => rx.poll_unpin(cx).map(|r| r.unwrap_or(Ok(None))),
+            SubmittedResult::Recovery(future) => future.poll_unpin(cx),
+        };
+        match result {
+            Poll::Ready(result) => {
                 self.finished = true;
                 let task_id = self._task_id;
                 for notify_token in self.notify_tokens.drain(..) {
                     notify_token.notify(task_id);
                 }
                 Poll::Ready(result)
-            }
-            // If the sender is dropped (i.e. the task is cancelled), return no results
-            Poll::Ready(Err(_)) => {
-                self.finished = true;
-                let task_id = self._task_id;
-                for notify_token in self.notify_tokens.drain(..) {
-                    notify_token.notify(task_id);
-                }
-                Poll::Ready(Ok(None))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -493,14 +543,15 @@ mod tests {
         let mut joinset = JoinSet::new();
 
         let (scheduler_sender, scheduler_receiver) = create_unbounded_channel();
+        let scheduler_handle = SchedulerHandle::new(scheduler_sender);
         let loop_state = SchedulerLoop::new(
             DefaultScheduler::<MockTask>::default(),
             scheduler_receiver,
             worker_manager.clone(),
             StatisticsManagerRef::default(),
+            scheduler_handle.shuffle_recovery.clone(),
         );
         joinset.spawn(loop_state.run());
-        let scheduler_handle = SchedulerHandle::new(scheduler_sender);
 
         SchedulerActorTestContext {
             scheduler_handle_ref: Arc::new(scheduler_handle),

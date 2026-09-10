@@ -15,6 +15,26 @@ class DaftTypeError(DaftCoreException):
     pass
 
 
+class DaftShuffleFetchError(DaftCoreException):
+    """An unavailable shuffle output, including its exact execution identity."""
+
+    def __init__(
+        self, shuffle_id: int, input_id: int, attempt: int, partition_idx: int, path: str, message: str
+    ) -> None:
+        self.shuffle_id = shuffle_id
+        self.input_id = input_id
+        self.attempt = attempt
+        self.partition_idx = partition_idx
+        self.path = path
+        self.message = message
+        super().__init__(
+            f"Shuffle {shuffle_id} map {input_id} attempt {attempt:#x} partition {partition_idx}: {message} ({path})"
+        )
+
+    def __reduce__(self) -> tuple[type[DaftShuffleFetchError], tuple[int, int, int, int, str, str]]:
+        return type(self), (self.shuffle_id, self.input_id, self.attempt, self.partition_idx, self.path, self.message)
+
+
 class DaftTransientError(DaftCoreException):
     """Daft Transient Error.
 

@@ -43,7 +43,7 @@ impl ShuffleFlightClient {
                 DaftError::External(format!("Failed to create endpoint: {:?}", e).into())
             })?;
             let channel = endpoint.connect().await.map_err(|e| {
-                DaftError::External(format!("Failed to connect to endpoint: {:?}", e).into())
+                DaftError::SocketError(format!("Failed to connect to endpoint: {:?}", e).into())
             })?;
             let client = FlightClient::new(channel);
             let inner = client.into_inner().max_decoding_message_size(usize::MAX);
@@ -77,19 +77,11 @@ impl ShuffleFlightClient {
             ));
         }
         let ticket = Ticket::new(encode_ticket(shuffle_id, refs));
-        let (address, client) = self.connect().await?;
-        let stream = client.do_get(ticket).await.map_err(|e| {
-            DaftError::External(
-                format!(
-                    "Error fetching {} partition refs from shuffle {} at {}. {}",
-                    refs.len(),
-                    shuffle_id,
-                    address,
-                    e
-                )
-                .into(),
-            )
-        })?;
+        let (_, client) = self.connect().await?;
+        let stream = client
+            .do_get(ticket)
+            .await
+            .map_err(crate::error::from_flight)?;
         Ok(FlightRecordBatchStreamToDaftRecordBatchStream::new(
             stream, schema,
         ))
@@ -141,9 +133,7 @@ impl Stream for FlightRecordBatchStreamToDaftRecordBatchStream {
                     RecordBatch::new_with_size(this.schema.clone(), columns, batch.num_rows())?;
                 Poll::Ready(Some(Ok(rb)))
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Some(Err(DaftError::External(e.to_string().into()))))
-            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(crate::error::from_flight(e)))),
             Poll::Ready(None) => {
                 this.done = true;
                 Poll::Ready(None)

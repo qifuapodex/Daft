@@ -433,6 +433,10 @@ impl RuntimeStatsManager {
                     }
 
                     _ = &mut finish_rx => {
+                        // Fence new requests before draining. A snapshot request
+                        // accepted after the last drain could otherwise wait for
+                        // a responder until the completed manager is joined.
+                        node_rx.close();
                         // Drain any messages queued before the finish signal but not yet
                         // processed. Without this, a `RegisterRuntimeStats` send that
                         // races with `finish_tx.send` can be lost when `select!` picks the
@@ -772,6 +776,60 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_snapshot_requests_after_final_drain() {
+        struct LateSnapshot {
+            handle: Mutex<Option<RuntimeStatsManagerHandle>>,
+            accepted: std::sync::atomic::AtomicBool,
+        }
+        impl std::fmt::Debug for LateSnapshot {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("LateSnapshot")
+            }
+        }
+        impl Subscriber for LateSnapshot {
+            fn on_event(&self, event: Event) -> DaftResult<()> {
+                if matches!(event, Event::ExecEnd(_)) {
+                    let (tx, _rx) = oneshot::channel();
+                    let accepted = self
+                        .handle
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .tx
+                        .send(StatsManagerMessage::TakeInputSnapshot(0, tx))
+                        .is_ok();
+                    self.accepted
+                        .store(accepted, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+        let subscriber = Arc::new(LateSnapshot {
+            handle: Mutex::new(None),
+            accepted: std::sync::atomic::AtomicBool::new(true),
+        });
+        let stats = Arc::new(DefaultRuntimeStats::new(
+            &Meter::test_scope("shutdown_fence"),
+            &node_info_from_id(0),
+        ));
+        let manager = make_stats_manager(
+            vec![subscriber.clone()],
+            stats,
+            Duration::from_millis(50),
+            "shutdown_fence",
+            false,
+        );
+        *subscriber.handle.lock().unwrap() = Some(manager.handle());
+        manager.finish(QueryEndState::Failed).await;
+        assert!(
+            !subscriber
+                .accepted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[tokio::test(start_paused = true)]

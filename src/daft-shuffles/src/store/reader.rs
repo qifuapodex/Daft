@@ -22,7 +22,7 @@ use std::{
 
 use arrow_flight::{FlightData, SchemaAsIpc, decode::FlightRecordBatchStream};
 use arrow_ipc::writer::IpcWriteOptions;
-use common_error::{DaftError, DaftResult};
+use common_error::{DaftError, DaftResult, ShuffleFetchFailure};
 use daft_core::prelude::SchemaRef;
 use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, stream::BoxStream};
@@ -218,6 +218,7 @@ impl PartitionIndices {
 /// verifying each range against the index before the stream ends.
 fn read_one_map_file(
     shuffle_id: u64,
+    input: MapInput,
     path: String,
     partition_indices: PartitionIndices,
     stats: Arc<ReadStats>,
@@ -232,20 +233,22 @@ fn read_one_map_file(
         })?;
 
         stats.add(&stats.slot_wait_us, elapsed_us(started));
-        // TODO: recompute from lineage instead of failing. A missing file here
-        // means the selected map attempt died before its commit rename landed, so
-        // there is no copy anywhere and the only correct recovery is to re-run
-        // that map task. Flotilla has no lineage-recompute path today, so the
-        // query fails.
+        // A missing coalesced map invalidates every requested bucket; one bucket
+        // identifies the failed read while the coordinator reconstructs the map.
+        let partition_indices = partition_indices.as_slice();
+        let first_idx = partition_indices.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
         let started = stats.enabled.then(Instant::now);
         stats.add(&stats.opens, 1);
         let opened = File::open(&path).await;
         stats.add(&stats.open_us, elapsed_us(started));
-        let mut file = opened.map_err(|e| {
-            DaftError::External(
-                format!("Failed to open shared shuffle map file {}: {}", path, e).into(),
-            )
-        })?;
+        let mut file = opened.map_err(|e| ShuffleFetchFailure {
+            shuffle_id,
+            input_id: input.input_id,
+            attempt: input.attempt,
+            partition_idx: *first_idx,
+            path: path.clone(),
+            message: String::new(),
+        }.open_error(e))?;
         let cached = INDEX_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -270,8 +273,6 @@ fn read_one_map_file(
             }
         };
         stats.add(&stats.index_us, elapsed_us(started));
-        let partition_indices = partition_indices.as_slice();
-        let first_idx = partition_indices.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
         let first_entry = index::partition_entry(&region, *first_idx as usize, &path)?;
         let entries: Cow<'_, [index::PartitionEntry]> = if partition_indices.len() == 1 {
             Cow::Borrowed(std::slice::from_ref(&first_entry))
@@ -403,6 +404,7 @@ fn read_ranges_stream(
         .into_iter()
         .map(|(input, indices)| {
             (
+                input,
                 shared_map_file(shared_root, shuffle_id, input.input_id, input.attempt),
                 indices,
             )
@@ -413,7 +415,7 @@ fn read_ranges_stream(
     stats.map_files = paths.len();
     stats.coalesced = paths
         .iter()
-        .any(|(_, indices)| indices.as_slice().len() > 1);
+        .any(|(_, _, indices)| indices.as_slice().len() > 1);
     stats.enabled =
         tracing::enabled!(target: "daft_shuffles::store::read_stats", tracing::Level::INFO);
     stats.started = stats.enabled.then(Instant::now);
@@ -424,8 +426,8 @@ fn read_ranges_stream(
         SchemaAsIpc::new(&arrow_schema, &IpcWriteOptions::default()).into();
 
     let data = futures::stream::iter(paths)
-        .flat_map_unordered(Some(concurrency.max(1)), move |(path, indices)| {
-            read_one_map_file(shuffle_id, path, indices, stats.clone())
+        .flat_map_unordered(Some(concurrency.max(1)), move |(input, path, indices)| {
+            read_one_map_file(shuffle_id, input, path, indices, stats.clone())
         })
         .map(|item| item.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e))));
 
@@ -546,10 +548,15 @@ pub(super) mod tests {
         write_shared(root, shuffle_id, input, dummy_schema(), None, 50).await?;
         let stats = Arc::new(ReadStats::default());
         let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
-        let messages: Vec<_> =
-            read_one_map_file(shuffle_id, path, PartitionIndices::Single(0), stats.clone())
-                .try_collect()
-                .await?;
+        let messages: Vec<_> = read_one_map_file(
+            shuffle_id,
+            input,
+            path,
+            PartitionIndices::Single(0),
+            stats.clone(),
+        )
+        .try_collect()
+        .await?;
         assert!(!messages.is_empty());
         assert_eq!(stats.messages.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(stats.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -587,6 +594,7 @@ pub(super) mod tests {
             let stats = Arc::new(stats);
             let messages: Vec<_> = read_one_map_file(
                 shuffle_id,
+                input,
                 path.clone(),
                 PartitionIndices::Multiple(vec![0, 1, 2]),
                 stats.clone(),
@@ -1027,20 +1035,35 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn missing_map_file_reports_its_path() -> DaftResult<()> {
+    async fn missing_map_file_preserves_identity_for_single_and_coalesced_reads() -> DaftResult<()>
+    {
         let dir = tempdir("missing");
         let root = dir.to_str().unwrap();
-        let schema = dummy_schema();
         let input = MapInput {
             input_id: 404,
             attempt: 0xdead,
         };
-        let err = read_rows(root, 3, &[input], 0, schema).await.unwrap_err();
-        assert!(
-            err.to_string().contains("map_404_000000000000dead.arrow"),
-            "error should name the missing file, got: {}",
-            err
-        );
+        for coalesced in [false, true] {
+            let stream = if coalesced {
+                read_map_ranges_stream(root, 3, vec![(input, vec![2, 1])], dummy_schema(), 1)?
+            } else {
+                read_partition_stream(root, 3, &[input], 1, dummy_schema(), 1)?
+            };
+            let err = stream.try_collect::<Vec<_>>().await.unwrap_err();
+            let failure = err
+                .shuffle_fetch_failure()
+                .expect("missing output retains its identity");
+            assert_eq!(
+                (
+                    failure.shuffle_id,
+                    failure.input_id,
+                    failure.attempt,
+                    failure.partition_idx
+                ),
+                (3, 404, 0xdead, 1)
+            );
+            assert!(failure.path.ends_with("map_404_000000000000dead.arrow"));
+        }
         std::fs::remove_dir_all(&dir).unwrap();
         Ok(())
     }

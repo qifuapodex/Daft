@@ -402,7 +402,7 @@ fn shared_stream_with_rpc_fallback(
                 },
             ));
             while let Some(batch) = rpc.next().await {
-                yield batch?;
+                yield batch.map_err(|fallback| preserve_fetch_failure(&e, fallback))?;
             }
         }
     })
@@ -513,10 +513,22 @@ fn rpc_stream_with_shared_fallback(
                 false,
             )?;
             while let Some(batch) = fallback.next().await {
-                yield batch?;
+                yield batch.map_err(|fallback| preserve_fetch_failure(&e, fallback))?;
             }
         }
     })
+}
+
+// A failed alternate route must not erase the map identity needed by the
+// coordinator. Prefer the alternate route's identity when it has one.
+fn preserve_fetch_failure(original: &DaftError, fallback: DaftError) -> DaftError {
+    if fallback.shuffle_fetch_failure().is_none()
+        && let Some(failure) = original.shuffle_fetch_failure()
+    {
+        DaftError::ShuffleFetchFailure(Box::new(failure))
+    } else {
+        fallback
+    }
 }
 
 async fn forward_partition_stream(
@@ -646,6 +658,28 @@ mod tests {
 
     fn dummy_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("ints", DataType::UInt8)]))
+    }
+
+    #[test]
+    fn missing_output_identity_survives_transient_fallback() {
+        let original =
+            DaftError::ShuffleFetchFailure(Box::new(common_error::ShuffleFetchFailure {
+                shuffle_id: 1,
+                input_id: 2,
+                attempt: 3,
+                partition_idx: 0,
+                path: "missing.arrow".into(),
+                message: "missing".into(),
+            }));
+        let transient = DaftError::SocketError("connection reset".into());
+        let error = preserve_fetch_failure(&original, transient);
+        assert!(!error.is_transient());
+        assert_eq!(error.shuffle_fetch_failure().unwrap().input_id, 2);
+        let error = preserve_fetch_failure(
+            &original,
+            DaftError::InternalError("fallback failed".into()),
+        );
+        assert_eq!(error.shuffle_fetch_failure().unwrap().input_id, 2);
     }
 
     #[test]
@@ -851,8 +885,8 @@ mod tests {
         .await;
         let auto = auto.expect_err("both routes are down in this test");
         assert!(
-            !auto.to_string().contains("daft-shared-root"),
-            "auto should have moved on to gRPC, but reported the mount: {auto}"
+            auto.shuffle_fetch_failure().is_some(),
+            "the unavailable RPC route must not erase proven file loss: {auto}"
         );
     }
 

@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TaskIDCounter {
     counter: Arc<AtomicU32>,
 }
@@ -74,9 +74,9 @@ impl PlanExecutionContext {
         let joinset = JoinSet::new();
         Self {
             query_idx,
-            scheduler_handle,
+            scheduler_handle: scheduler_handle.clone(),
             joinset,
-            task_id_counter: TaskIDCounter::new(),
+            task_id_counter: scheduler_handle.task_id_counter.clone(),
             shuffle_dirs: Vec::new(),
             shared_shuffle_dirs: Vec::new(),
             shuffle_ids: Vec::new(),

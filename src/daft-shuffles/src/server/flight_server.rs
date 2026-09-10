@@ -13,7 +13,7 @@ use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
 };
 use arrow_ipc::writer::IpcWriteOptions;
-use common_error::{DaftError, DaftResult};
+use common_error::{DaftError, DaftResult, ShuffleFetchFailure};
 use common_runtime::RuntimeTask;
 use daft_core::prelude::SchemaRef;
 use daft_recordbatch::RecordBatch;
@@ -112,11 +112,15 @@ struct RangeSpec {
 /// How to read one file's contribution to a Flight response.
 enum FileReadSpec {
     /// Read the entire IPC stream file (per-partition cache).
-    Whole { path: String },
+    Whole {
+        path: String,
+        failure: ShuffleFetchFailure,
+    },
     /// Read one or more ranges from a single file (combined-file shuffle).
     Ranges {
         path: String,
         ranges: Vec<RangeSpec>,
+        failure: ShuffleFetchFailure,
     },
 }
 
@@ -244,18 +248,27 @@ impl ShuffleFlightServer {
 
         // Group ranged reads by file path so each physical file is read from a single FD.
         let mut specs: Vec<FileReadSpec> = Vec::new();
-        let mut ranges_by_path: HashMap<String, Vec<RangeSpec>> = HashMap::new();
+        let mut ranges_by_path: HashMap<String, (Vec<RangeSpec>, ShuffleFetchFailure)> =
+            HashMap::new();
         let mut order: Vec<String> = Vec::new();
 
-        for cache in caches {
+        for (cache, (attempt, partition_ref_id)) in caches.into_iter().zip(refs) {
+            let identity = |path: &String| ShuffleFetchFailure {
+                shuffle_id,
+                input_id: (partition_ref_id >> 32) as u32,
+                attempt: *attempt,
+                partition_idx: *partition_ref_id as u32,
+                path: path.clone(),
+                message: String::new(),
+            };
             match &cache.byte_ranges {
                 Some(ranges) => {
                     for (idx, (path, (start, end))) in
                         cache.file_paths.iter().zip(ranges.iter()).enumerate()
                     {
-                        let entry = ranges_by_path.entry(path.clone()).or_insert_with(|| {
+                        let (entry, _) = ranges_by_path.entry(path.clone()).or_insert_with(|| {
                             order.push(path.clone());
-                            Vec::new()
+                            (Vec::new(), identity(path))
                         });
                         entry.push(RangeSpec {
                             start: *start,
@@ -266,17 +279,26 @@ impl ShuffleFlightServer {
                 }
                 None => {
                     for path in &cache.file_paths {
-                        specs.push(FileReadSpec::Whole { path: path.clone() });
+                        specs.push(FileReadSpec::Whole {
+                            path: path.clone(),
+                            failure: identity(path),
+                        });
                     }
                 }
             }
         }
 
         for path in order {
-            let mut ranges = ranges_by_path.remove(&path).unwrap_or_default();
+            let Some((mut ranges, failure)) = ranges_by_path.remove(&path) else {
+                return Err(refs.to_vec());
+            };
             // Sort by start so sequential reads stay forward-going (kind to readahead).
             ranges.sort_unstable_by_key(|r| r.start);
-            specs.push(FileReadSpec::Ranges { path, ranges });
+            specs.push(FileReadSpec::Ranges {
+                path,
+                ranges,
+                failure,
+            });
         }
 
         Ok((specs, schema))
@@ -401,7 +423,7 @@ impl FlightService for ShuffleFlightServer {
 
         let data_stream = futures::stream::iter(specs)
             .flat_map(open_spec_as_flight_stream)
-            .map_err(|e| Status::internal(format!("flight stream: {}", e)));
+            .map_err(crate::error::to_status);
         let flight_data = futures::stream::once(async { Ok(flight_schema) }).chain(data_stream);
         Ok(Response::new(Box::pin(flight_data)))
     }
@@ -438,12 +460,12 @@ impl FlightService for ShuffleFlightServer {
 fn open_spec_as_flight_stream(spec: FileReadSpec) -> BoxStream<'static, DaftResult<FlightData>> {
     Box::pin(async_stream::try_stream! {
         match spec {
-            FileReadSpec::Whole { path } => {
+            FileReadSpec::Whole { path, failure } => {
                 // The per-partition layout records neither a length nor a checksum,
                 // so the only thing that distinguishes "this stream had few batches"
                 // from "this file was cut short" is the writer's end-of-stream
                 // marker. Requiring it turns a silently short answer into an error.
-                let file = tokio::fs::File::open(&path).await.map_err(DaftError::IoError)?;
+                let file = tokio::fs::File::open(&path).await.map_err(|e| failure.open_error(e))?;
                 let mut reader = BufReader::new(file);
                 skip_stream_metadata(&mut reader).await?;
                 loop {
@@ -457,8 +479,8 @@ fn open_spec_as_flight_stream(spec: FileReadSpec) -> BoxStream<'static, DaftResu
                     }
                 }
             }
-            FileReadSpec::Ranges { path, ranges } => {
-                let mut file = tokio::fs::File::open(&path).await.map_err(DaftError::IoError)?;
+            FileReadSpec::Ranges { path, ranges, failure } => {
+                let mut file = tokio::fs::File::open(&path).await.map_err(|e| failure.open_error(e))?;
                 for range in ranges {
                     file.seek(SeekFrom::Start(range.start)).await.map_err(DaftError::IoError)?;
                     let mut checked = CheckedRange::new(

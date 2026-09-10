@@ -249,6 +249,13 @@ def set_execution_config(
     flight_shuffle_shared_durability: str | None = None,
     flight_shuffle_read_source: str | None = None,
     flight_shuffle_shared_read_concurrency: int | None = None,
+    flight_shuffle_recovery_max_attempts: int | None = None,
+    flight_shuffle_recovery_max_inflight: int | None = None,
+    flight_shuffle_recovery_max_consumer_failures: int | None = None,
+    flight_shuffle_recovery_max_depth: int | None = None,
+    flight_shuffle_recovery_wait_warn_ms: int | None = None,
+    flight_shuffle_recovery_max_retained_maps: int | None = None,
+    flight_shuffle_recovery_max_retained_bytes: int | None = None,
     enable_multi_glob_path_tasks: bool | None = None,
     experimental_shuffle_aqe: bool | None = None,
     experimental_shuffle_aqe_target_bytes: int | None = None,
@@ -308,6 +315,13 @@ def set_execution_config(
         flight_shuffle_shared_dir: A cluster-shared POSIX directory (Lustre, NFS, FSx, ...) to write flight shuffle data to. Required when `flight_shuffle_placement` is "shared_only", and must be set in the same call. Defaults to None.
         flight_shuffle_placement: Where flight shuffle map output is written. "local_only" (the default) uses the node-local `flight_shuffle_dirs` and serves partitions over gRPC only. "shared_only" writes to `flight_shuffle_shared_dir`, letting any node read a partition directly and letting a query survive losing the worker that wrote it. Only applies to repartition-style shuffles; gather and into_partitions always write node-locally.
         flight_shuffle_shared_durability: How shared-directory writes are fsynced. "background" (the default) publishes the file immediately and fsyncs off the critical path; "none" never fsyncs, so a shared copy can be lost if its writer node dies; "sync" fsyncs before publishing, which is the strongest but can cut write throughput several-fold on filesystems with expensive fsync.
+        flight_shuffle_recovery_max_attempts: Map reconstruction attempts per producer. Defaults to 0 (disabled). Enabling retains replayable producer inputs until query completion; scan-to-shuffle producers are not supported.
+        flight_shuffle_recovery_max_inflight: Maximum concurrently executing reconstruction tasks per query. Defaults to 4.
+        flight_shuffle_recovery_max_consumer_failures: Maximum fetch recovery rounds per consumer. Defaults to 64.
+        flight_shuffle_recovery_max_depth: Maximum reconstruction dependency depth. Defaults to 16.
+        flight_shuffle_recovery_wait_warn_ms: Interval for warnings while waiting for another repair owner. Never aborts recovery or limits execution. Defaults to 0 (disabled).
+        flight_shuffle_recovery_max_retained_maps: Maximum retained producer recipes per query. Defaults to 10000. Additional producers remain executable but are not recoverable.
+        flight_shuffle_recovery_max_retained_bytes: Conservative retained input byte budget per query. Defaults to 256 MiB. Shared references may be charged more than once; producers beyond the budget are not recoverable.
         flight_shuffle_read_source: How this worker fetches shuffle partitions. "auto" (the default) reads the shared directory directly when the data is there and otherwise uses gRPC; "rpc" always tries gRPC first; "shared" reads the shared directory for remote output and for this worker's own AQE-eligible output and requires `flight_shuffle_placement="shared_only"` (gather and into_partitions are always node-local and are read over gRPC regardless). "auto" and "rpc" both fall back to the shared directory if the gRPC fetch fails before returning data.
         flight_shuffle_shared_read_concurrency: How many map files a reduce task reads from the shared directory at once. Defaults to 16, above `scantask_max_parallel` because shared-mount reads are dominated by per-file round trips rather than bytes.
         enable_multi_glob_path_tasks: Whether to create multiple glob path tasks in Ray Runner to achieve parallel glob. Defaults to False.
@@ -368,6 +382,13 @@ def set_execution_config(
             flight_shuffle_shared_durability=flight_shuffle_shared_durability,
             flight_shuffle_read_source=flight_shuffle_read_source,
             flight_shuffle_shared_read_concurrency=flight_shuffle_shared_read_concurrency,
+            flight_shuffle_recovery_max_attempts=flight_shuffle_recovery_max_attempts,
+            flight_shuffle_recovery_max_inflight=flight_shuffle_recovery_max_inflight,
+            flight_shuffle_recovery_max_consumer_failures=flight_shuffle_recovery_max_consumer_failures,
+            flight_shuffle_recovery_max_depth=flight_shuffle_recovery_max_depth,
+            flight_shuffle_recovery_wait_warn_ms=flight_shuffle_recovery_wait_warn_ms,
+            flight_shuffle_recovery_max_retained_maps=flight_shuffle_recovery_max_retained_maps,
+            flight_shuffle_recovery_max_retained_bytes=flight_shuffle_recovery_max_retained_bytes,
             enable_multi_glob_path_tasks=enable_multi_glob_path_tasks,
         )
 

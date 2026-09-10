@@ -168,7 +168,11 @@ impl Drop for MessageRouter {
 }
 
 /// Per-plan execution state
+type PipelineFailure = Arc<OnceLock<Arc<DaftError>>>;
+
 struct PlanState {
+    generation: u64,
+    failure: PipelineFailure,
     task_handle: RuntimeTask<DaftResult<()>>,
     enqueue_input_sender: Sender<EnqueueInputMessage>,
     stats_handle: RuntimeStatsManagerHandle,
@@ -254,6 +258,7 @@ impl PyNativeExecutor {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = enqueue_future.await?;
             Ok(PyResultReceiver {
+                generation: result.generation,
                 result: Arc::new(tokio::sync::Mutex::new(Some(result))),
                 fingerprint,
                 input_id,
@@ -263,7 +268,8 @@ impl PyNativeExecutor {
     }
 
     pub fn active_plan_count(&self, py: Python<'_>) -> usize {
-        self.executor.lock_py_attached(py).unwrap().plans.len()
+        let executor = self.executor.lock_py_attached(py).unwrap();
+        executor.plans.len() + executor.retired_plans.len()
     }
 
     pub fn cancel_plan(&self, py: Python<'_>, fingerprint: u64) -> PyResult<()> {
@@ -351,6 +357,7 @@ async fn run_execution_loop(
     input_senders: Arc<HashMap<SourceId, crate::input_sender::InputSender>>,
     pipeline: Box<dyn crate::pipeline::PipelineNode>,
     maintain_order: bool,
+    failure: PipelineFailure,
 ) -> DaftResult<()> {
     let stats_manager_handle = stats_manager.handle();
     let memory_manager = get_or_init_memory_manager();
@@ -420,7 +427,7 @@ async fn run_execution_loop(
         }
     };
 
-    let result = finish_input_streams(message_router, enqueue_input_rx, result).await;
+    let result = finish_input_streams(message_router, enqueue_input_rx, result, &failure).await;
 
     stats_manager.finish(finish_status).await;
     flush_opentelemetry_providers();
@@ -433,9 +440,13 @@ async fn finish_input_streams(
     message_router: MessageRouter,
     mut enqueue_input_rx: crate::channel::Receiver<EnqueueInputMessage>,
     result: DaftResult<()>,
+    failure: &PipelineFailure,
 ) -> DaftResult<()> {
     let result = result.map_err(|error| {
         let error = Arc::new(error);
+        // Rejected enqueues must observe the same failure as accepted inputs.
+        // Publish it before closing the enqueue channel.
+        let _ = failure.set(error.clone());
         for sender in message_router.output_senders.values() {
             let _ = sender.send(ExecutionEngineResultItem::Error(error.clone()));
         }
@@ -461,6 +472,7 @@ pub struct NativeExecutor {
     shuffle_server: Option<Arc<ShuffleFlightServer>>,
     shuffle_server_connection: Option<FlightServerConnectionHandle>,
     plans: HashMap<u64, PlanState>,
+    retired_plans: HashMap<(u64, u64), PlanState>,
 }
 
 impl NativeExecutor {
@@ -476,6 +488,7 @@ impl NativeExecutor {
                 shuffle_server: Some(shuffle_server),
                 shuffle_server_connection,
                 plans: HashMap::new(),
+                retired_plans: HashMap::new(),
             }
         } else {
             Self {
@@ -484,6 +497,7 @@ impl NativeExecutor {
                 shuffle_server: None,
                 shuffle_server_connection: None,
                 plans: HashMap::new(),
+                retired_plans: HashMap::new(),
             }
         }
     }
@@ -532,10 +546,17 @@ impl NativeExecutor {
                     header: event_header(query_id.clone()),
                     task: Arc::new(TaskInfo {
                         id: task_id,
-                        last_node_id: 0,  // TODO: propagate last_node_id
+                        last_node_id: additional_context
+                            .as_ref()
+                            .and_then(|ctx| ctx.get("shuffle_reconstruction_node"))
+                            .and_then(|id| id.parse().ok())
+                            .unwrap_or(0),
                         node_ids: vec![], // TODO: propagate node_ids
                         plan_fingerprint: fingerprint as u32,
-                        name: None,
+                        name: additional_context
+                            .as_ref()
+                            .and_then(|ctx| ctx.get("shuffle_reconstruction_of"))
+                            .map(|id| Arc::from(format!("Shuffle reconstruction of task {id}"))),
                     }),
                     worker_id: None, // TODO: propagate worker id
                 }),
@@ -545,6 +566,15 @@ impl NativeExecutor {
             None
         };
 
+        if self
+            .plans
+            .get(&fingerprint)
+            .is_some_and(|state| state.enqueue_input_sender.is_closed())
+        {
+            let state = self.plans.remove(&fingerprint).unwrap();
+            self.retired_plans
+                .insert((fingerprint, state.generation), state);
+        }
         if !self.plans.contains_key(&fingerprint) {
             let cancel = self.cancel.clone();
             let additional_context = additional_context.unwrap_or_default();
@@ -572,6 +602,7 @@ impl NativeExecutor {
             let (enqueue_input_tx, enqueue_input_rx) = create_channel::<EnqueueInputMessage>(1);
 
             let input_senders = Arc::new(input_senders);
+            let failure = PipelineFailure::default();
             let task = run_execution_loop(
                 cancel,
                 stats_manager,
@@ -579,12 +610,15 @@ impl NativeExecutor {
                 input_senders,
                 pipeline,
                 maintain_order,
+                failure.clone(),
             );
 
             let task_handle = RuntimeTask::new(handle, task);
             self.plans.insert(
                 fingerprint,
                 PlanState {
+                    generation: next_auto_fingerprint(),
+                    failure,
                     task_handle,
                     enqueue_input_sender: enqueue_input_tx,
                     stats_handle,
@@ -596,45 +630,47 @@ impl NativeExecutor {
 
         let plan_state = self.plans.get_mut(&fingerprint).unwrap();
         let enqueue_input_sender = plan_state.enqueue_input_sender.clone();
+        let failure = plan_state.failure.clone();
+        let generation = plan_state.generation;
         plan_state.active_input_ids.insert(input_id);
 
         Ok((
             fingerprint,
             async move {
-                let (result_tx, result_rx) = create_unbounded_channel();
-                let enqueue_msg = EnqueueInputMessage {
-                    input_id,
-                    inputs,
-                    result_sender: result_tx,
-                };
-                if enqueue_input_sender.send(enqueue_msg).await.is_err() {
-                    return Err(common_error::DaftError::InternalError(
-                        "Plan execution task has died; cannot enqueue new input".to_string(),
-                    ));
-                }
-
-                // Send the event after the task has been enqueued for execution
-                if let Some((event, subscribers)) = task_start_dispatch {
+                let mut result =
+                    ExecutionEngineResult::enqueue(enqueue_input_sender, inputs, input_id, failure)
+                        .await;
+                result.generation = generation;
+                // Rejected inputs never started execution.
+                if result.error.is_none()
+                    && let Some((event, subscribers)) = task_start_dispatch
+                {
                     dispatch_task_start_event(&subscribers, &event);
                 }
-
-                Ok(ExecutionEngineResult {
-                    receiver: result_rx,
-                    error: None,
-                })
+                Ok(result)
             }
             .boxed(),
         ))
     }
 
-    /// Finish tracking an input_id. If no active input_ids remain (or the
-    /// enqueue channel is closed), removes the plan and awaits the exec task.
+    /// Finish exactly the generation this input joined. A late finisher can
+    /// release a retired execution without touching a replacement pipeline.
     pub fn try_finish(
         &mut self,
         fingerprint: u64,
         input_id: InputId,
+        generation: u64,
     ) -> DaftResult<BoxFuture<'static, DaftResult<ExecutionStats>>> {
-        let Some(plan_state) = self.plans.get_mut(&fingerprint) else {
+        let current = self
+            .plans
+            .get(&fingerprint)
+            .is_some_and(|state| state.generation == generation);
+        let state = if current {
+            self.plans.get_mut(&fingerprint)
+        } else {
+            self.retired_plans.get_mut(&(fingerprint, generation))
+        };
+        let Some(plan_state) = state else {
             // Plan already removed (pipeline died and another input_id cleaned it up).
             // Return empty stats; PyResultReceiver retains each unfinished input's
             // error independently of this shared plan's lifetime.
@@ -643,11 +679,17 @@ impl NativeExecutor {
         };
 
         plan_state.active_input_ids.remove(&input_id);
-        let pipeline_dead = plan_state.enqueue_input_sender.is_closed();
-        let should_remove = plan_state.active_input_ids.is_empty() || pipeline_dead;
+        let should_remove =
+            plan_state.active_input_ids.is_empty() || plan_state.enqueue_input_sender.is_closed();
 
         if should_remove {
-            let plan_state = self.plans.remove(&fingerprint).unwrap();
+            let plan_state = if current {
+                self.plans.remove(&fingerprint).unwrap()
+            } else {
+                self.retired_plans
+                    .remove(&(fingerprint, generation))
+                    .unwrap()
+            };
             Ok(async move {
                 // Try to get stats for this input_id. If the pipeline already died,
                 // the stats manager may be finished so this can fail — that's OK.
@@ -686,6 +728,8 @@ impl NativeExecutor {
     pub fn cancel_plan(&mut self, fingerprint: u64) {
         // RuntimeTask drop cancels the spawned task
         self.plans.remove(&fingerprint);
+        self.retired_plans
+            .retain(|(plan, _), _| *plan != fingerprint);
     }
 
     fn repr_ascii(
@@ -737,11 +781,64 @@ impl Drop for NativeExecutor {
 }
 
 pub struct ExecutionEngineResult {
+    generation: u64,
     receiver: crate::channel::UnboundedReceiver<ExecutionEngineResultItem>,
     error: Option<Arc<DaftError>>,
 }
 
 impl ExecutionEngineResult {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    async fn enqueue(
+        sender: Sender<EnqueueInputMessage>,
+        inputs: HashMap<SourceId, Input>,
+        input_id: InputId,
+        failure: PipelineFailure,
+    ) -> Self {
+        let (result_sender, receiver) = create_unbounded_channel();
+        let message = EnqueueInputMessage {
+            input_id,
+            inputs,
+            result_sender,
+        };
+        let error = if sender.send(message).await.is_err() {
+            // Even rejected inputs return a handle so try_finish releases their
+            // active tracking. Use the same Arc broadcast to accepted inputs.
+            Some(failure.get().cloned().unwrap_or_else(|| {
+                Arc::new(DaftError::InternalError(
+                    "Plan execution task has died; cannot enqueue new input".into(),
+                ))
+            }))
+        } else {
+            None
+        };
+        Self {
+            receiver,
+            error,
+            generation: 0,
+        }
+    }
+
+    /// Drain both ordinary and shuffle output for in-process distributed tests.
+    pub async fn collect_outputs_for_testing(
+        mut self,
+    ) -> DaftResult<(Vec<MicroPartition>, Vec<FlightPartitionRef>)> {
+        let mut partitions = Vec::new();
+        let mut refs = Vec::new();
+        while let Some(item) = self.next().await {
+            match item {
+                ExecutionEngineResultItem::Partition(p) => partitions.push(p),
+                ExecutionEngineResultItem::FlightPartitionRef(r) => refs.push(r),
+                ExecutionEngineResultItem::Error(_) => unreachable!("next stores errors"),
+            }
+        }
+        if let Some(error) = self.error {
+            return Err(DaftError::Shared(error));
+        }
+        Ok((partitions, refs))
+    }
+
     async fn next(&mut self) -> Option<ExecutionEngineResultItem> {
         match self.receiver.recv().await {
             Some(ExecutionEngineResultItem::Error(error)) => {
@@ -776,6 +873,7 @@ impl ExecutionEngineResult {
 pub struct PyResultReceiver {
     result: Arc<tokio::sync::Mutex<Option<ExecutionEngineResult>>>,
     fingerprint: u64,
+    generation: u64,
     input_id: InputId,
     executor: Arc<Mutex<NativeExecutor>>,
 }
@@ -821,6 +919,7 @@ impl PyResultReceiver {
         let result = self.result.clone();
         let executor = self.executor.clone();
         let fingerprint = self.fingerprint;
+        let generation = self.generation;
         let input_id = self.input_id;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Take the result to drop the receiver
@@ -832,7 +931,11 @@ impl PyResultReceiver {
             drop(result);
 
             // Delegate to NativeExecutor::try_finish
-            let finish_future = executor.lock().unwrap().try_finish(fingerprint, input_id)?;
+            let finish_future =
+                executor
+                    .lock()
+                    .unwrap()
+                    .try_finish(fingerprint, input_id, generation)?;
             let stats = finish_future.await;
             // Always finish tracking this input before returning its pipeline error.
             // Another input may already have removed the shared plan and consumed
@@ -861,6 +964,69 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn late_finisher_cannot_remove_replacement_generation() -> DaftResult<()> {
+        use daft_core::prelude::{DataType, Field, Schema};
+        use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan};
+        use daft_logical_plan::stats::StatsState;
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64)]));
+        let plan = LocalPhysicalPlan::in_memory_scan(
+            0,
+            schema.clone(),
+            0,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        let mut executor = tokio::task::spawn_blocking(|| NativeExecutor::new(false, ""))
+            .await
+            .unwrap();
+        let context = Some(HashMap::from([("plan_fingerprint".into(), "123".into())]));
+        let inputs = HashMap::from([(
+            0,
+            Input::InMemory(vec![Arc::new(MicroPartition::empty(Some(schema)))]),
+        )]);
+        let config = Arc::new(DaftExecutionConfig::default());
+        let (fingerprint, first) = executor.run(
+            &plan,
+            config.clone(),
+            vec![],
+            context.clone(),
+            inputs.clone(),
+            0,
+            true,
+        )?;
+        let mut first = first.await?;
+        while first.next().await.is_some() {}
+        // Model the exact dead-pipeline/unfinished-input window: the enqueue
+        // channel has closed, but the first receiver has not called try_finish.
+        let (closed_sender, receiver) = create_channel(1);
+        drop(receiver);
+        executor
+            .plans
+            .get_mut(&fingerprint)
+            .unwrap()
+            .enqueue_input_sender = closed_sender;
+        let (_, second) = executor.run(&plan, config, vec![], context, inputs, 1, true)?;
+        let mut second = second.await?;
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(executor.retired_plans.len(), 1);
+        executor
+            .try_finish(fingerprint, 0, first.generation)?
+            .await?;
+        assert_eq!(executor.plans[&fingerprint].generation, second.generation);
+        assert!(executor.retired_plans.is_empty());
+        while second.next().await.is_some() {}
+        assert!(second.error.is_none());
+        executor
+            .try_finish(fingerprint, 1, second.generation)?
+            .await?;
+        assert!(executor.plans.is_empty());
+        tokio::task::spawn_blocking(move || drop(executor))
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pipeline_failure_reaches_unfinished_and_queued_inputs() {
         let (enqueue_tx, enqueue_rx) = create_channel(1);
         let mut router = MessageRouter::new();
@@ -870,6 +1036,7 @@ mod tests {
             results.push(ExecutionEngineResult {
                 receiver: rx,
                 error: None,
+                generation: 0,
             });
             if input_id == 3 {
                 assert!(
@@ -894,12 +1061,14 @@ mod tests {
             partition: MicroPartition::empty(None),
         });
 
+        let failure = PipelineFailure::default();
         let error = tokio::time::timeout(
             Duration::from_secs(1),
             finish_input_streams(
                 router,
                 enqueue_rx,
                 Err(DaftError::SocketError("connection reset".into())),
+                &failure,
             ),
         )
         .await
@@ -908,7 +1077,14 @@ mod tests {
         let DaftError::Shared(error) = error else {
             panic!("expected the shared pipeline error");
         };
+        assert!(Arc::ptr_eq(failure.get().unwrap(), &error));
         assert!(enqueue_tx.is_closed());
+        // A new input arriving after queue closure must receive the original
+        // error too, rather than an unclassified enqueue failure.
+        let mut rejected =
+            ExecutionEngineResult::enqueue(enqueue_tx, HashMap::new(), 4, failure).await;
+        assert!(rejected.next().await.is_none());
+        assert!(Arc::ptr_eq(rejected.error.as_ref().unwrap(), &error));
         assert!(results[0].next().await.is_none());
         assert!(results[0].error.is_none());
         assert!(matches!(

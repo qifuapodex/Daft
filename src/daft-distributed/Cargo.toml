@@ -52,6 +52,7 @@ python = [
 ]
 
 [dev-dependencies]
+tempfile = "3.23.0"
 arrow = {workspace = true}
 daft-core = {path = "../daft-core", default-features = false}
 daft-local-execution = {path = "../daft-local-execution", default-features = false}
