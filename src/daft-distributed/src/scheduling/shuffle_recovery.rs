@@ -246,8 +246,13 @@ pub(crate) fn submit(
 ) -> DaftResult<SubmittedTask> {
     let (task, cancel, notifications) = submittable.into_parts();
     let recovery = scheduler.shuffle_recovery.clone();
-    if recovery.max_attempts == 0 || !task_replayable(&task, false) {
+    if recovery.max_attempts == 0 || !uses_shared_shuffle(&task) {
         return SubmittableTask::new(task, cancel, notifications).submit(scheduler);
+    }
+    if !task_replayable(&task, false) {
+        // Rebinding before the first execution is safe even when retrying the
+        // consumer is not: registered producer outputs are replay-equivalent.
+        return SubmittableTask::new(recovery.bind(&task), cancel, notifications).submit(scheduler);
     }
     let task_id = task.task_id();
     let scheduler = scheduler.clone();
@@ -360,20 +365,28 @@ fn output_location(
 }
 
 fn producer_spec(task: &SwordfishTask) -> Option<(u64, usize)> {
-    if !task_replayable(task, true) {
-        return None;
-    }
     match task.plan().as_ref() {
         LocalPhysicalPlan::RepartitionWrite(write) => match &write.backend {
             ShuffleBackend::Flight {
                 shuffle_id,
                 shared: Some(_),
                 ..
-            } => Some((*shuffle_id, write.num_partitions)),
+            } if task_replayable(task, true) => Some((*shuffle_id, write.num_partitions)),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// Ordinary tasks and node-local shuffles do not need replay analysis, cloned
+/// recipes, or a logical-completion guard on their normal submission path.
+fn uses_shared_shuffle(task: &SwordfishTask) -> bool {
+    matches!(task.plan().as_ref(), LocalPhysicalPlan::RepartitionWrite(write)
+        if matches!(&write.backend, ShuffleBackend::Flight { shared: Some(_), .. }))
+        || task.inputs().values().any(|input| {
+            matches!(input, Input::FlightShuffle(reads)
+                if reads.iter().any(|read| read.shared_root.is_some()))
+        })
 }
 
 fn scalar_type(dtype: &DataType) -> bool {
@@ -735,6 +748,63 @@ mod tests {
         assert_eq!(producer.repair.lock().await.attempts, 2);
         drop(producer);
         harness.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_does_not_retain_or_reconstruct_outputs() -> DaftResult<()> {
+        let mut harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        Arc::get_mut(&mut harness.scheduler.shuffle_recovery)
+            .unwrap()
+            .max_attempts = 0;
+        let original = harness.execute(harness.producer(0, "none", false)).await?;
+        let failure = harness.remove(&output_location(&original, harness.shuffle_id, 3)?);
+        let result = harness.execute(harness.consumer(&[original], 0)).await;
+        assert!(
+            harness
+                .scheduler
+                .shuffle_recovery
+                .outputs
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        harness.shutdown().await;
+        let actual = result.unwrap_err().shuffle_fetch_failure().unwrap();
+        assert_eq!(
+            (actual.shuffle_id, actual.input_id, actual.attempt),
+            (failure.shuffle_id, failure.input_id, failure.attempt)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_replayable_consumer_uses_repaired_refs_on_first_execution() -> DaftResult<()> {
+        let harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        let original = harness.execute(harness.producer(0, "none", false)).await?;
+        let old = output_location(&original, harness.shuffle_id, 3)?;
+        harness.remove(&old);
+        let read = harness.consumer(std::slice::from_ref(&original), 0);
+        let expected = values(&harness.execute(read.clone()).await?);
+        // Limit is deliberately outside the retry allowlist, but its first
+        // execution should use the replacement already published by another task.
+        let limit = LocalPhysicalPlan::limit(
+            read.plan(),
+            1_000,
+            None,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        let task = SwordfishTask::for_recovery_test(
+            limit,
+            read.inputs().clone(),
+            harness.config.clone(),
+            harness.scheduler.task_id_counter.next(),
+        );
+        assert!(!task_replayable(&task, false));
+        let result = harness.execute(task).await;
+        harness.shutdown().await;
+        assert_eq!(values(&result?), expected);
         Ok(())
     }
 

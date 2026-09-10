@@ -158,6 +158,11 @@ snapshot. On a typed failure, check consumer replay eligibility, reconstruct the
 producer, rebind, and resubmit. Original pipeline notification tokens must complete
 exactly once, after final success/failure/cancellation, not after the failed execution.
 
+Binding the first execution does not require consumer retry eligibility. A consumer
+outside the retry allowlist still uses a replacement that another task has already
+published. Ordinary tasks and node-local shuffles bypass replay analysis and the
+logical-completion guard entirely.
+
 Physical execution attempts and logical pipeline completion are distinct. Recovery
 must not prematurely end an operator, double-decrement running-task counters, or
 re-emit a completed producer's original completion token. Reconstructed producers
@@ -177,6 +182,11 @@ The release branch provides this through `finish_input_streams` and
 `DaftError::Shared(Arc<DaftError>)` (#4). This change reuses that mechanism and unwraps
 `Shared` when classifying or serializing shuffle failures; no shuffle-specific failure
 cell is added. Each input retains its error independently of cached-plan lifetime.
+The pipeline also publishes this same error Arc in a `OnceLock` before closing its
+enqueue channel. Inputs rejected during closure receive a failed result handle with
+that original error, so they preserve recovery classification and still execute
+`try_finish`. Failed cached plans remain registered until all tracked inputs finish;
+late finishers cannot remove a new pipeline instance using the same fingerprint.
 New recovery executions use fresh fingerprints so failed local operator state is not
 reused. Normal executions continue to share pipelines.
 
@@ -229,16 +239,21 @@ actual reconstruction and reference replacement. Run the relevant existing shuff
 scheduler, lifecycle, and cleanup regressions. Test sync/background/none publication
 without confusing normal visibility with persistence under storage failure.
 
-Validation before rebasing onto release #4 (2026-09-10); final PR checks are recorded separately:
+Validation after rebasing onto release #4 and self-review fixes (2026-09-10):
 
-* Distributed Rust suite: 97 passed, 1 existing ignored test. New tests cover exact
+* Distributed Rust suite: 99 passed, 1 existing ignored test. New tests cover exact
   row multisets across concurrent consumers and two maps, all durability modes, stale
   reports, repeated deletion/budget exhaustion, cancellation while waiting for capacity,
   exactly-once completion notification, recursive dependency reconstruction, and rejection
-  of random repartition.
+  of random repartition, disabled recovery, and first-execution binding for consumers
+  outside the retry allowlist.
 * Shuffle Rust suite: 43 passed, 3 existing ignored tests, including typed Flight
   status/header round trips and rejection of ordinary NotFound/permission errors.
-* Flotilla/Ray: 18 targeted shared-shuffle tests passed, including 9 actual
+* Common-error Rust suite: 2 passed. The local execution regression for finished,
+  partial, queued and rejected inputs passed.
+* Flotilla/Ray: 87 tests passed across the complete shuffle suite, generator retry,
+  transient errors and exception serialization. This includes 18 shared-shuffle
+  tests and 9 actual
   deletion/reconstruction tests (`auto/rpc/shared` ×
   `none/background/sync`). The hook runs inside the scheduler actor after real worker
   publication, deletes the referenced file, and checks exact rows and exactly one fresh

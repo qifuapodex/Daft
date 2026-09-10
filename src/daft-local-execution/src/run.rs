@@ -168,7 +168,10 @@ impl Drop for MessageRouter {
 }
 
 /// Per-plan execution state
+type PipelineFailure = Arc<OnceLock<Arc<DaftError>>>;
+
 struct PlanState {
+    failure: PipelineFailure,
     task_handle: RuntimeTask<DaftResult<()>>,
     enqueue_input_sender: Sender<EnqueueInputMessage>,
     stats_handle: RuntimeStatsManagerHandle,
@@ -351,6 +354,7 @@ async fn run_execution_loop(
     input_senders: Arc<HashMap<SourceId, crate::input_sender::InputSender>>,
     pipeline: Box<dyn crate::pipeline::PipelineNode>,
     maintain_order: bool,
+    failure: PipelineFailure,
 ) -> DaftResult<()> {
     let stats_manager_handle = stats_manager.handle();
     let memory_manager = get_or_init_memory_manager();
@@ -420,7 +424,7 @@ async fn run_execution_loop(
         }
     };
 
-    let result = finish_input_streams(message_router, enqueue_input_rx, result).await;
+    let result = finish_input_streams(message_router, enqueue_input_rx, result, &failure).await;
 
     stats_manager.finish(finish_status).await;
     flush_opentelemetry_providers();
@@ -433,9 +437,13 @@ async fn finish_input_streams(
     message_router: MessageRouter,
     mut enqueue_input_rx: crate::channel::Receiver<EnqueueInputMessage>,
     result: DaftResult<()>,
+    failure: &PipelineFailure,
 ) -> DaftResult<()> {
     let result = result.map_err(|error| {
         let error = Arc::new(error);
+        // Rejected enqueues must observe the same failure as accepted inputs.
+        // Publish it before closing the enqueue channel.
+        let _ = failure.set(error.clone());
         for sender in message_router.output_senders.values() {
             let _ = sender.send(ExecutionEngineResultItem::Error(error.clone()));
         }
@@ -572,6 +580,7 @@ impl NativeExecutor {
             let (enqueue_input_tx, enqueue_input_rx) = create_channel::<EnqueueInputMessage>(1);
 
             let input_senders = Arc::new(input_senders);
+            let failure = PipelineFailure::default();
             let task = run_execution_loop(
                 cancel,
                 stats_manager,
@@ -579,12 +588,14 @@ impl NativeExecutor {
                 input_senders,
                 pipeline,
                 maintain_order,
+                failure.clone(),
             );
 
             let task_handle = RuntimeTask::new(handle, task);
             self.plans.insert(
                 fingerprint,
                 PlanState {
+                    failure,
                     task_handle,
                     enqueue_input_sender: enqueue_input_tx,
                     stats_handle,
@@ -596,39 +607,29 @@ impl NativeExecutor {
 
         let plan_state = self.plans.get_mut(&fingerprint).unwrap();
         let enqueue_input_sender = plan_state.enqueue_input_sender.clone();
+        let failure = plan_state.failure.clone();
         plan_state.active_input_ids.insert(input_id);
 
         Ok((
             fingerprint,
             async move {
-                let (result_tx, result_rx) = create_unbounded_channel();
-                let enqueue_msg = EnqueueInputMessage {
-                    input_id,
-                    inputs,
-                    result_sender: result_tx,
-                };
-                if enqueue_input_sender.send(enqueue_msg).await.is_err() {
-                    return Err(common_error::DaftError::InternalError(
-                        "Plan execution task has died; cannot enqueue new input".to_string(),
-                    ));
-                }
-
-                // Send the event after the task has been enqueued for execution
-                if let Some((event, subscribers)) = task_start_dispatch {
+                let result =
+                    ExecutionEngineResult::enqueue(enqueue_input_sender, inputs, input_id, failure)
+                        .await;
+                // Rejected inputs never started execution.
+                if result.error.is_none()
+                    && let Some((event, subscribers)) = task_start_dispatch
+                {
                     dispatch_task_start_event(&subscribers, &event);
                 }
-
-                Ok(ExecutionEngineResult {
-                    receiver: result_rx,
-                    error: None,
-                })
+                Ok(result)
             }
             .boxed(),
         ))
     }
 
-    /// Finish tracking an input_id. If no active input_ids remain (or the
-    /// enqueue channel is closed), removes the plan and awaits the exec task.
+    /// Finish tracking an input_id. Keep a failed pipeline registered until all
+    /// its inputs finish; a late finisher must never remove a replacement pipeline.
     pub fn try_finish(
         &mut self,
         fingerprint: u64,
@@ -643,8 +644,7 @@ impl NativeExecutor {
         };
 
         plan_state.active_input_ids.remove(&input_id);
-        let pipeline_dead = plan_state.enqueue_input_sender.is_closed();
-        let should_remove = plan_state.active_input_ids.is_empty() || pipeline_dead;
+        let should_remove = plan_state.active_input_ids.is_empty();
 
         if should_remove {
             let plan_state = self.plans.remove(&fingerprint).unwrap();
@@ -742,6 +742,32 @@ pub struct ExecutionEngineResult {
 }
 
 impl ExecutionEngineResult {
+    async fn enqueue(
+        sender: Sender<EnqueueInputMessage>,
+        inputs: HashMap<SourceId, Input>,
+        input_id: InputId,
+        failure: PipelineFailure,
+    ) -> Self {
+        let (result_sender, receiver) = create_unbounded_channel();
+        let message = EnqueueInputMessage {
+            input_id,
+            inputs,
+            result_sender,
+        };
+        let error = if sender.send(message).await.is_err() {
+            // Even rejected inputs return a handle so try_finish releases their
+            // active tracking. Use the same Arc broadcast to accepted inputs.
+            Some(failure.get().cloned().unwrap_or_else(|| {
+                Arc::new(DaftError::InternalError(
+                    "Plan execution task has died; cannot enqueue new input".into(),
+                ))
+            }))
+        } else {
+            None
+        };
+        Self { receiver, error }
+    }
+
     /// Drain both ordinary and shuffle output for in-process distributed tests.
     pub async fn collect_outputs_for_testing(
         mut self,
@@ -913,12 +939,14 @@ mod tests {
             partition: MicroPartition::empty(None),
         });
 
+        let failure = PipelineFailure::default();
         let error = tokio::time::timeout(
             Duration::from_secs(1),
             finish_input_streams(
                 router,
                 enqueue_rx,
                 Err(DaftError::SocketError("connection reset".into())),
+                &failure,
             ),
         )
         .await
@@ -927,7 +955,14 @@ mod tests {
         let DaftError::Shared(error) = error else {
             panic!("expected the shared pipeline error");
         };
+        assert!(Arc::ptr_eq(failure.get().unwrap(), &error));
         assert!(enqueue_tx.is_closed());
+        // A new input arriving after queue closure must receive the original
+        // error too, rather than an unclassified enqueue failure.
+        let mut rejected =
+            ExecutionEngineResult::enqueue(enqueue_tx, HashMap::new(), 4, failure).await;
+        assert!(rejected.next().await.is_none());
+        assert!(Arc::ptr_eq(rejected.error.as_ref().unwrap(), &error));
         assert!(results[0].next().await.is_none());
         assert!(results[0].error.is_none());
         assert!(matches!(
