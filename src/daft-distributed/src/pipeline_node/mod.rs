@@ -25,7 +25,7 @@ use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan, LocalPhysicalPlanRef}
 use daft_logical_plan::stats::StatsState;
 use daft_schema::schema::SchemaRef;
 use futures::{Stream, StreamExt, stream::BoxStream};
-use materialize::materialize_all_pipeline_outputs;
+use materialize::materialize_swordfish_outputs;
 
 use crate::{
     plan::{PlanExecutionContext, QueryIdx, TaskIDCounter},
@@ -517,7 +517,7 @@ impl TaskBuilderStream {
         let stream = self
             .task_builder_stream
             .map(move |builder| builder.build(query_idx, &task_id_counter));
-        materialize_all_pipeline_outputs(stream, scheduler_handle, None)
+        materialize_swordfish_outputs(stream, scheduler_handle, None)
     }
 
     pub fn pipeline_instruction<F>(self, node: Arc<dyn PipelineNodeImpl>, plan_builder: F) -> Self

@@ -13,7 +13,7 @@ use super::{PlanResult, QueryIdx};
 use crate::{
     pipeline_node::{
         DistributedPipelineNode, MaterializedOutput, TaskBuilderStream,
-        materialize::materialize_all_pipeline_outputs,
+        materialize::materialize_swordfish_outputs,
     },
     plan::DistributedPhysicalPlan,
     scheduling::{
@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TaskIDCounter {
     counter: Arc<AtomicU32>,
 }
@@ -73,9 +73,9 @@ impl PlanExecutionContext {
         let joinset = JoinSet::new();
         Self {
             query_idx,
-            scheduler_handle,
+            scheduler_handle: scheduler_handle.clone(),
             joinset,
-            task_id_counter: TaskIDCounter::new(),
+            task_id_counter: scheduler_handle.task_id_counter.clone(),
             shuffle_dirs: Vec::new(),
             shared_shuffle_dirs: Vec::new(),
             shuffle_ids: Vec::new(),
@@ -172,7 +172,7 @@ impl RunningPlan {
         let stream = self
             .task_stream
             .map(move |builder| builder.build(self.plan_context.query_idx, &task_id_counter));
-        materialize_all_pipeline_outputs(stream, scheduler_handle, Some(joinset))
+        materialize_swordfish_outputs(stream, scheduler_handle, Some(joinset))
     }
 }
 

@@ -5,6 +5,8 @@ pub type GenericError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum DaftError {
+    #[error("{0}")]
+    ShuffleFetchFailure(Box<crate::ShuffleFetchFailure>),
     /// A pipeline failure delivered to each input that did not finish.
     #[error(transparent)]
     Shared(std::sync::Arc<DaftError>),

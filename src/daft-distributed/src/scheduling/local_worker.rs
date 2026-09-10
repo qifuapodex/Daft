@@ -52,6 +52,7 @@ pub struct LocalSwordfishWorker {
     /// Fresh `InputId` generator. Each task submitted gets a unique input_id so
     /// multiple same-fingerprint tasks can run concurrently on one pipeline.
     input_id_counter: Arc<AtomicU32>,
+    shuffle_enabled: bool,
 }
 
 impl std::fmt::Debug for LocalSwordfishWorker {
@@ -71,7 +72,15 @@ impl LocalSwordfishWorker {
             // Tests that need shuffle support can revisit this.
             executor: Arc::new(Mutex::new(NativeExecutor::new(false, ""))),
             input_id_counter: Arc::new(AtomicU32::new(0)),
+            shuffle_enabled: false,
         }
+    }
+
+    pub fn with_shuffle(worker_id: WorkerId) -> Self {
+        let mut worker = Self::new(worker_id);
+        worker.executor = Arc::new(Mutex::new(NativeExecutor::new(true, "127.0.0.1")));
+        worker.shuffle_enabled = true;
+        worker
     }
 
     pub fn add_active_task(&self, task: &SwordfishTask) {
@@ -148,11 +157,16 @@ pub struct LocalSwordfishTaskResultHandle {
 
 impl LocalSwordfishTaskResultHandle {
     fn new(task: SwordfishTask, worker: &LocalSwordfishWorker) -> Self {
+        let input_id = if worker.shuffle_enabled {
+            task.task_id()
+        } else {
+            worker.next_input_id()
+        };
         Self {
             task,
             worker_id: worker.worker_id.clone(),
             executor: worker.executor.clone(),
-            input_id: worker.next_input_id(),
+            input_id,
         }
     }
 }
@@ -248,17 +262,20 @@ async fn execute_swordfish_task_on_executor(
     let result = run_fut.await?;
     // Mirror the production Python flow: drain this input_id's output so the
     // pipeline has finished reading bytes before stats are harvested.
-    let partitions = result.collect_partitions_for_testing().await;
+    let output = result.collect_outputs_for_testing().await;
 
     let stats = {
         let mut exec = executor.lock().unwrap();
         exec.try_finish(fingerprint, input_id)?
     }
-    .await?;
+    .await;
+    let (partitions, flight_refs) = output?;
+    let stats = stats?;
 
     let partition_refs: Vec<PartitionRef> = partitions
         .into_iter()
         .map(|mp| Arc::new(mp) as PartitionRef)
+        .chain(flight_refs.into_iter().map(|r| Arc::new(r) as PartitionRef))
         .collect();
     let materialized = MaterializedOutput::new(partition_refs, worker_id, String::new(), task_id);
 

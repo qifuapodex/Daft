@@ -14,19 +14,48 @@ use crate::{
     },
 };
 
+#[cfg(test)]
 pub(crate) fn materialize_all_pipeline_outputs<T: Task>(
     input: impl Stream<Item = SubmittableTask<T>> + Send + Unpin + 'static,
     scheduler_handle: SchedulerHandle<T>,
     joinset: Option<JoinSet<DaftResult<()>>>,
+) -> impl Stream<Item = DaftResult<MaterializedOutput>> + Send + Unpin + 'static {
+    materialize_with_submit(input, scheduler_handle, joinset, |task, scheduler| {
+        task.submit(scheduler)
+    })
+}
+
+pub(crate) fn materialize_swordfish_outputs(
+    input: impl Stream<Item = SubmittableTask<crate::scheduling::task::SwordfishTask>>
+    + Send
+    + Unpin
+    + 'static,
+    scheduler_handle: SchedulerHandle<crate::scheduling::task::SwordfishTask>,
+    joinset: Option<JoinSet<DaftResult<()>>>,
+) -> impl Stream<Item = DaftResult<MaterializedOutput>> + Send + Unpin + 'static {
+    materialize_with_submit(
+        input,
+        scheduler_handle,
+        joinset,
+        crate::scheduling::shuffle_recovery::submit,
+    )
+}
+
+fn materialize_with_submit<T: Task>(
+    input: impl Stream<Item = SubmittableTask<T>> + Send + Unpin + 'static,
+    scheduler_handle: SchedulerHandle<T>,
+    joinset: Option<JoinSet<DaftResult<()>>>,
+    submit: fn(SubmittableTask<T>, &SchedulerHandle<T>) -> DaftResult<SubmittedTask>,
 ) -> impl Stream<Item = DaftResult<MaterializedOutput>> + Send + Unpin + 'static {
     /// Force all tasks in the `input`` stream to start running if un-submitted
     async fn task_finalizer<T: Task>(
         mut input: impl Stream<Item = SubmittableTask<T>> + Unpin,
         tx: Sender<SubmittedTask>,
         scheduler_handle: SchedulerHandle<T>,
+        submit: fn(SubmittableTask<T>, &SchedulerHandle<T>) -> DaftResult<SubmittedTask>,
     ) -> DaftResult<()> {
         while let Some(pipeline_output) = input.next().await {
-            let finalized_task = pipeline_output.submit(&scheduler_handle)?;
+            let finalized_task = submit(pipeline_output, &scheduler_handle)?;
             if tx.send(finalized_task).await.is_err() {
                 break;
             }
@@ -80,6 +109,7 @@ pub(crate) fn materialize_all_pipeline_outputs<T: Task>(
         input,
         finalized_tasks_sender,
         scheduler_handle,
+        submit,
     ));
     joinset.spawn(task_materializer(
         finalized_tasks_receiver,

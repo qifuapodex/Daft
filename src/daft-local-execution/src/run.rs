@@ -742,6 +742,25 @@ pub struct ExecutionEngineResult {
 }
 
 impl ExecutionEngineResult {
+    /// Drain both ordinary and shuffle output for in-process distributed tests.
+    pub async fn collect_outputs_for_testing(
+        mut self,
+    ) -> DaftResult<(Vec<MicroPartition>, Vec<FlightPartitionRef>)> {
+        let mut partitions = Vec::new();
+        let mut refs = Vec::new();
+        while let Some(item) = self.next().await {
+            match item {
+                ExecutionEngineResultItem::Partition(p) => partitions.push(p),
+                ExecutionEngineResultItem::FlightPartitionRef(r) => refs.push(r),
+                ExecutionEngineResultItem::Error(_) => unreachable!("next stores errors"),
+            }
+        }
+        if let Some(error) = self.error {
+            return Err(DaftError::Shared(error));
+        }
+        Ok((partitions, refs))
+    }
+
     async fn next(&mut self) -> Option<ExecutionEngineResultItem> {
         match self.receiver.recv().await {
             Some(ExecutionEngineResultItem::Error(error)) => {

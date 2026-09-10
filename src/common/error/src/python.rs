@@ -3,6 +3,7 @@ use pyo3::{exceptions::PyFileNotFoundError, import_exception};
 use crate::{DaftError, format::format_error_for_user};
 
 import_exception!(daft.exceptions, DaftCoreException);
+import_exception!(daft.exceptions, DaftShuffleFetchError);
 import_exception!(daft.exceptions, DaftTypeError);
 import_exception!(daft.exceptions, DaftTransientError);
 import_exception!(daft.exceptions, ConnectTimeoutError);
@@ -21,6 +22,14 @@ impl std::convert::From<DaftError> for pyo3::PyErr {
 fn to_pyerr(err: &DaftError) -> pyo3::PyErr {
     match err {
         DaftError::Shared(error) => to_pyerr(error),
+        DaftError::ShuffleFetchFailure(failure) => DaftShuffleFetchError::new_err((
+            failure.shuffle_id,
+            failure.input_id,
+            failure.attempt,
+            failure.partition_idx,
+            failure.path.clone(),
+            failure.message.clone(),
+        )),
         DaftError::PyO3Error(pyerr) => pyo3::Python::attach(|py| pyerr.clone_ref(py)),
         DaftError::TypeError(msg) => DaftTypeError::new_err(msg.clone()),
         other => {

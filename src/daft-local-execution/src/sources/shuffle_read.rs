@@ -376,7 +376,7 @@ fn shared_stream_with_rpc_fallback(
                 },
             ));
             while let Some(batch) = rpc.next().await {
-                yield batch?;
+                yield batch.map_err(|fallback| preserve_fetch_failure(&e, fallback))?;
             }
         }
     })
@@ -466,10 +466,22 @@ fn rpc_stream_with_shared_fallback(
                 shared_read_concurrency,
             )?;
             while let Some(batch) = fallback.next().await {
-                yield batch?;
+                yield batch.map_err(|fallback| preserve_fetch_failure(&e, fallback))?;
             }
         }
     })
+}
+
+// A failed alternate route must not erase the map identity needed by the
+// coordinator. Prefer the alternate route's identity when it has one.
+fn preserve_fetch_failure(original: &DaftError, fallback: DaftError) -> DaftError {
+    if fallback.shuffle_fetch_failure().is_none()
+        && let Some(failure) = original.shuffle_fetch_failure()
+    {
+        DaftError::ShuffleFetchFailure(Box::new(failure))
+    } else {
+        fallback
+    }
 }
 
 async fn forward_partition_stream(

@@ -131,9 +131,7 @@ impl Stream for FlightRecordBatchStreamToDaftRecordBatchStream {
                     RecordBatch::new_with_size(this.schema.clone(), columns, batch.num_rows())?;
                 Poll::Ready(Some(Ok(rb)))
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Some(Err(DaftError::External(e.to_string().into()))))
-            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(crate::error::from_flight(e)))),
             Poll::Ready(None) => {
                 this.done = true;
                 Poll::Ready(None)

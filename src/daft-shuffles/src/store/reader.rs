@@ -20,7 +20,7 @@ use std::{
 
 use arrow_flight::{FlightData, SchemaAsIpc, decode::FlightRecordBatchStream};
 use arrow_ipc::writer::IpcWriteOptions;
-use common_error::{DaftError, DaftResult};
+use common_error::{DaftError, DaftResult, ShuffleFetchFailure};
 use daft_core::prelude::SchemaRef;
 use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, stream::BoxStream};
@@ -195,6 +195,7 @@ pub(super) async fn read_index_region(
 /// verifying the range against the index before the stream ends.
 fn read_one_map_file(
     shuffle_id: u64,
+    input: MapInput,
     path: String,
     partition_idx: usize,
 ) -> BoxStream<'static, DaftResult<FlightData>> {
@@ -206,16 +207,16 @@ fn read_one_map_file(
             DaftError::InternalError(format!("shared read semaphore closed: {}", e))
         })?;
 
-        // TODO: recompute from lineage instead of failing. A missing file here
-        // means the selected map attempt died before its commit rename landed, so
-        // there is no copy anywhere and the only correct recovery is to re-run
-        // that map task. Flotilla has no lineage-recompute path today, so the
-        // query fails.
-        let mut file = File::open(&path).await.map_err(|e| {
-            DaftError::External(
-                format!("Failed to open shared shuffle map file {}: {}", path, e).into(),
-            )
-        })?;
+        // Report identity, not an inferred cause: ENOENT does not tell us why
+        // the output disappeared. Only the coordinator may replace an attempt.
+        let mut file = File::open(&path).await.map_err(|e| ShuffleFetchFailure {
+            shuffle_id,
+            input_id: input.input_id,
+            attempt: input.attempt,
+            partition_idx: partition_idx as u32,
+            path: path.clone(),
+            message: String::new(),
+        }.open_error(e))?;
         let cached = INDEX_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -280,7 +281,12 @@ pub fn read_partition_stream(
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let paths = inputs
         .iter()
-        .map(|input| shared_map_file(shared_root, shuffle_id, input.input_id, input.attempt))
+        .map(|input| {
+            (
+                *input,
+                shared_map_file(shared_root, shuffle_id, input.input_id, input.attempt),
+            )
+        })
         .collect::<Vec<_>>();
 
     let arrow_schema = schema.to_arrow()?;
@@ -289,8 +295,8 @@ pub fn read_partition_stream(
 
     let partition_idx = partition_idx as usize;
     let data = futures::stream::iter(paths)
-        .flat_map_unordered(Some(concurrency.max(1)), move |path| {
-            read_one_map_file(shuffle_id, path, partition_idx)
+        .flat_map_unordered(Some(concurrency.max(1)), move |(input, path)| {
+            read_one_map_file(shuffle_id, input, path, partition_idx)
         })
         .map(|item| item.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e))));
 

@@ -251,6 +251,76 @@ pub(crate) struct SwordfishTask {
 }
 
 impl SwordfishTask {
+    #[cfg(test)]
+    pub(crate) fn for_recovery_test(
+        plan: LocalPhysicalPlanRef,
+        mut inputs: HashMap<SourceId, Input>,
+        config: Arc<DaftExecutionConfig>,
+        task_id: TaskID,
+    ) -> Self {
+        let mut psets = HashMap::new();
+        inputs.retain(|id, input| {
+            if let Input::InMemory(parts) = input {
+                psets.insert(
+                    *id,
+                    parts.iter().map(|p| p.clone() as PartitionRef).collect(),
+                );
+                false
+            } else {
+                true
+            }
+        });
+        let fingerprint = task_id + 1;
+        Self {
+            resource_request: TaskResourceRequest::new(plan.resource_request()),
+            task_context: TaskContext {
+                task_id,
+                plan_fingerprint: fingerprint,
+                ..Default::default()
+            },
+            plan,
+            config,
+            inputs,
+            psets,
+            strategy: SchedulingStrategy::Spread,
+            context: HashMap::from([
+                ("task_id".into(), task_id.to_string()),
+                ("plan_fingerprint".into(), fingerprint.to_string()),
+            ]),
+        }
+    }
+
+    pub(crate) fn with_recovery_inputs(&self, inputs: HashMap<SourceId, Input>) -> Self {
+        Self {
+            inputs,
+            ..self.clone()
+        }
+    }
+
+    /// A reconstruction is a new physical execution, not another completion of
+    /// the original producer. A new fingerprint also isolates failed pipelines.
+    pub(crate) fn recovery_attempt(&self, task_id: TaskID, producer: bool) -> Self {
+        let mut task = self.clone();
+        task.task_context.task_id = task_id;
+        task.task_context.plan_fingerprint =
+            hash_fingerprint(&[self.task_context.plan_fingerprint, task_id, u32::MAX]);
+        if producer {
+            // The original operator already completed. Reconstruction work has
+            // task-level telemetry but does not reopen its logical lifecycle.
+            task.task_context.node_ids.clear();
+        }
+        task.context.insert("task_id".into(), task_id.to_string());
+        task.context.insert(
+            "plan_fingerprint".into(),
+            task.task_context.plan_fingerprint.to_string(),
+        );
+        task.context.insert(
+            "shuffle_recovery_of".into(),
+            self.task_context.task_id.to_string(),
+        );
+        task
+    }
+
     pub fn plan(&self) -> LocalPhysicalPlanRef {
         self.plan.clone()
     }

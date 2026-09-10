@@ -30,6 +30,25 @@ use crate::{
 
 const STATISTICS_LOG_TARGET: &str = "DaftStatisticsManager";
 
+/// Keeps a consumer's operator alive between physical executions without
+/// inventing Scheduled/Failed events or changing active-task gauges.
+pub(crate) struct RecoveryCompletionGuard {
+    manager: StatisticsManagerRef,
+    node_ids: Vec<NodeID>,
+}
+
+impl Drop for RecoveryCompletionGuard {
+    fn drop(&mut self) {
+        for node_id in &self.node_ids {
+            if let Some(manager) = self.manager.runtime_node_managers.get(node_id)
+                && manager.on_task_finished()
+            {
+                self.manager.dispatch_operator_end(manager.node_info());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) enum TaskEvent {
@@ -143,6 +162,24 @@ pub struct StatisticsManager {
 }
 
 impl StatisticsManager {
+    pub(crate) fn hold_recovery_completion(
+        self: &Arc<Self>,
+        context: &TaskContext,
+    ) -> RecoveryCompletionGuard {
+        let mut node_ids = Vec::new();
+        for node_id in &context.node_ids {
+            if let Some(manager) = self.runtime_node_managers.get(node_id) {
+                if manager.on_task_submitted() {
+                    self.dispatch_operator_start(manager.node_info());
+                }
+                node_ids.push(*node_id);
+            }
+        }
+        RecoveryCompletionGuard {
+            manager: self.clone(),
+            node_ids,
+        }
+    }
     pub fn from_pipeline_node(
         pipeline_node: &DistributedPipelineNode,
         mut subscribers: Vec<Box<dyn StatisticsSubscriber>>,

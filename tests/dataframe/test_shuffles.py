@@ -796,3 +796,77 @@ def test_flight_shuffle_shared_config_validation():
 
     with pytest.raises(ValueError, match="must not be empty"):
         daft.set_execution_config(flight_shuffle_shared_dir="   ")
+
+
+@pytest.mark.skipif(
+    get_tests_daft_runner_name() != "ray",
+    reason="recovery requires Flotilla with Ray workers",
+)
+@pytest.mark.parametrize("durability", ["none", "background", "sync"])
+@pytest.mark.parametrize("read_source", ["auto", "rpc", "shared"])
+def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, durability, read_source):
+    """Delete an acknowledged output inside the real Flotilla scheduler actor."""
+    import ray
+
+    from daft.runners import get_or_create_runner
+
+    # Initialize the scheduler actor before installing the publication hook.
+    daft.from_pydict({"warmup": [1]}).select("warmup").collect()
+    actor = get_or_create_runner().flotilla_plan_runner.runner
+
+    with shared_flight_shuffle_ctx(durability=durability, read_source=read_source) as shared_root:
+
+        def install(actor_self):
+            from pathlib import Path
+
+            from daft.daft import RayTaskResult
+            from daft.runners.flotilla import RaySwordfishTaskHandle
+
+            original = RaySwordfishTaskHandle._get_result
+            state = {"deleted": [], "published": []}
+            actor_self._shuffle_recovery_test = (original, state)
+            root = Path(shared_root)
+
+            async def inject_after_publication(handle):
+                result = await original(handle)
+                if isinstance(result, RayTaskResult.SuccessFlight) and result._0:
+                    ref = result._0[0]
+                    input_id = ref.partition_ref_id >> 32
+                    path = (
+                        root
+                        / "daft_shuffle"
+                        / str(ref.shuffle_id)
+                        / f"shard_{input_id % 256}"
+                        / f"map_{input_id}_{ref.attempt:016x}.arrow"
+                    )
+                    if path.exists():
+                        identity = (ref.shuffle_id, input_id, ref.attempt)
+                        state["published"].append(identity)
+                        if not state["deleted"]:
+                            path.unlink()
+                            state["deleted"].append(identity)
+                return result
+
+            RaySwordfishTaskHandle._get_result = inject_after_publication
+
+        def uninstall(actor_self):
+            from daft.runners.flotilla import RaySwordfishTaskHandle
+
+            original, state = actor_self._shuffle_recovery_test
+            RaySwordfishTaskHandle._get_result = original
+            del actor_self._shuffle_recovery_test
+            return state
+
+        ray.get(actor.__ray_call__.remote(install))
+        try:
+            rows = list(range(180))
+            got = daft.from_pydict({"id": rows}).into_partitions(2).repartition(3, "id").to_pydict()["id"]
+        finally:
+            state = ray.get(actor.__ray_call__.remote(uninstall))
+
+        assert len(state["deleted"]) == 1, "the test must actually remove a published map file"
+        assert sorted(got) == rows
+        lost_shuffle = state["deleted"][0][0]
+        same_shuffle = [entry for entry in state["published"] if entry[0] == lost_shuffle]
+        assert len(same_shuffle) == 2, "one merged original map plus exactly one reconstruction"
+        assert len(set(same_shuffle)) == 2, "reconstruction must publish a fresh physical output"
