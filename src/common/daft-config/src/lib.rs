@@ -163,6 +163,15 @@ pub struct DaftExecutionConfig {
     pub flight_shuffle_read_source: String,
     /// Map files a reduce task reads from the shared mount at once.
     pub flight_shuffle_shared_read_concurrency: usize,
+    // Recovery is opt-in. Bounds apply per query; timeout covers coordination waits only.
+    pub flight_shuffle_recovery_max_attempts: u32,
+    pub flight_shuffle_recovery_max_inflight: usize,
+    pub flight_shuffle_recovery_max_consumer_failures: usize,
+    pub flight_shuffle_recovery_max_depth: usize,
+    pub flight_shuffle_recovery_wait_timeout_ms: u64,
+    pub flight_shuffle_recovery_max_retained_maps: usize,
+    pub flight_shuffle_recovery_max_retained_bytes: usize,
+
     pub enable_multi_glob_path_tasks: bool,
 }
 
@@ -214,6 +223,14 @@ impl Default for DaftExecutionConfig {
             flight_shuffle_placement: "local_only".to_string(),
             flight_shuffle_shared_durability: "background".to_string(),
             flight_shuffle_read_source: "auto".to_string(),
+            flight_shuffle_recovery_max_attempts: 0,
+            flight_shuffle_recovery_max_inflight: 4,
+            flight_shuffle_recovery_max_consumer_failures: 64,
+            flight_shuffle_recovery_max_depth: 16,
+            flight_shuffle_recovery_wait_timeout_ms: 0,
+            flight_shuffle_recovery_max_retained_maps: 10000,
+            flight_shuffle_recovery_max_retained_bytes: 268435456,
+
             // Above `scantask_max_parallel`'s 8 on purpose: shared-mount reads are
             // dominated by per-file round trips rather than bytes, so a reduce task
             // with many map inputs needs the extra fan-out to stay off the latency

@@ -53,6 +53,7 @@ pub struct LocalSwordfishWorker {
     /// multiple same-fingerprint tasks can run concurrently on one pipeline.
     input_id_counter: Arc<AtomicU32>,
     shuffle_enabled: bool,
+    execution_delay_ms: Arc<AtomicU32>,
 }
 
 impl std::fmt::Debug for LocalSwordfishWorker {
@@ -73,6 +74,7 @@ impl LocalSwordfishWorker {
             executor: Arc::new(Mutex::new(NativeExecutor::new(false, ""))),
             input_id_counter: Arc::new(AtomicU32::new(0)),
             shuffle_enabled: false,
+            execution_delay_ms: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -81,6 +83,10 @@ impl LocalSwordfishWorker {
         worker.executor = Arc::new(Mutex::new(NativeExecutor::new(true, "127.0.0.1")));
         worker.shuffle_enabled = true;
         worker
+    }
+
+    pub fn set_execution_delay_ms(&self, millis: u32) {
+        self.execution_delay_ms.store(millis, Ordering::Relaxed);
     }
 
     pub fn add_active_task(&self, task: &SwordfishTask) {
@@ -153,6 +159,7 @@ pub struct LocalSwordfishTaskResultHandle {
     worker_id: WorkerId,
     executor: Arc<Mutex<NativeExecutor>>,
     input_id: InputId,
+    execution_delay_ms: u32,
 }
 
 impl LocalSwordfishTaskResultHandle {
@@ -167,6 +174,7 @@ impl LocalSwordfishTaskResultHandle {
             worker_id: worker.worker_id.clone(),
             executor: worker.executor.clone(),
             input_id,
+            execution_delay_ms: worker.execution_delay_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -186,8 +194,15 @@ impl TaskResultHandle for LocalSwordfishTaskResultHandle {
         let worker_id = self.worker_id.clone();
         let executor = self.executor.clone();
         let input_id = self.input_id;
+        let execution_delay_ms = self.execution_delay_ms;
 
         async move {
+            if execution_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(u64::from(
+                    execution_delay_ms,
+                )))
+                .await;
+            }
             match execute_swordfish_task_on_executor(
                 executor, plan, config, context, inputs, psets, input_id, task_id, worker_id,
             )
@@ -260,13 +275,14 @@ async fn execute_swordfish_task_on_executor(
         )?
     };
     let result = run_fut.await?;
+    let generation = result.generation();
     // Mirror the production Python flow: drain this input_id's output so the
     // pipeline has finished reading bytes before stats are harvested.
     let output = result.collect_outputs_for_testing().await;
 
     let stats = {
         let mut exec = executor.lock().unwrap();
-        exec.try_finish(fingerprint, input_id)?
+        exec.try_finish(fingerprint, input_id, generation)?
     }
     .await;
     let (partitions, flight_refs) = output?;

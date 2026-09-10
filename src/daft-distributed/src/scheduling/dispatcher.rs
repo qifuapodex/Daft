@@ -70,11 +70,15 @@ pub(super) struct Dispatcher<W: Worker> {
     statistics_manager: StatisticsManagerRef,
     max_transient_retries: u32,
     max_infra_retries: u32,
+    recovery: Arc<super::shuffle_recovery::ShuffleRecovery>,
+    deferred: Vec<PendingTask<W::Task>>,
 }
 
 impl<W: Worker> Dispatcher<W> {
     pub fn new(statistics_manager: StatisticsManagerRef) -> Self {
         Self {
+            recovery: Arc::new(super::shuffle_recovery::ShuffleRecovery::new()),
+            deferred: Vec::new(),
             task_result_joinset: JoinSet::new(),
             joinset_id_to_task: HashMap::new(),
             statistics_manager,
@@ -102,6 +106,16 @@ impl<W: Worker> Dispatcher<W> {
         }
     }
 
+    pub fn set_shuffle_recovery(
+        &mut self,
+        recovery: Arc<super::shuffle_recovery::ShuffleRecovery>,
+    ) {
+        self.recovery = recovery;
+    }
+    pub fn take_deferred_tasks(&mut self) -> Vec<PendingTask<W::Task>> {
+        std::mem::take(&mut self.deferred)
+    }
+
     pub fn dispatch_tasks(
         &mut self,
         scheduled_tasks: Vec<ScheduledTask<W::Task>>,
@@ -109,8 +123,25 @@ impl<W: Worker> Dispatcher<W> {
     ) -> DaftResult<()> {
         let mut worker_to_tasks = HashMap::new();
         let mut task_context_to_task = HashMap::new();
+        let mut permits = HashMap::new();
 
-        for scheduled_task in scheduled_tasks {
+        for mut scheduled_task in scheduled_tasks {
+            if !scheduled_task.prepare_dispatch(&self.recovery) {
+                self.deferred.push(scheduled_task.defer());
+                continue;
+            }
+            let permit = match scheduled_task.task().recovery_slot(&self.recovery) {
+                Ok(permit) => permit,
+                Err(()) => {
+                    self.deferred.push(scheduled_task.defer());
+                    continue;
+                }
+            };
+            permits.insert(scheduled_task.task().task_context(), permit);
+            self.statistics_manager.handle_event(TaskEvent::Scheduled {
+                context: scheduled_task.task().task_context(),
+                worker_id: scheduled_task.worker_id(),
+            })?;
             let worker_id = scheduled_task.worker_id();
             let task = scheduled_task.task();
             task_context_to_task.insert(task.task_context(), scheduled_task);
@@ -126,11 +157,13 @@ impl<W: Worker> Dispatcher<W> {
             let scheduled_task = task_context_to_task
                 .remove(&result_handle.task_context())
                 .expect("Task should be present in task_context_to_task");
+            let permit = permits.remove(&result_handle.task_context());
             let result_awaiter =
                 TaskResultAwaiter::new(result_handle, scheduled_task.cancel_token());
-            let id = self
-                .task_result_joinset
-                .spawn(result_awaiter.await_result());
+            let id = self.task_result_joinset.spawn(async move {
+                let _permit = permit;
+                result_awaiter.await_result().await
+            });
             self.joinset_id_to_task.insert(id, scheduled_task);
         }
 

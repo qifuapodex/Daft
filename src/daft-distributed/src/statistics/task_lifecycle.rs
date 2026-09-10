@@ -125,7 +125,13 @@ fn task_info_from_context(context: &TaskContext, name: Option<String>) -> Arc<Ta
         last_node_id: context.last_node_id,
         node_ids: context.node_ids.clone(),
         plan_fingerprint: context.plan_fingerprint,
-        name: name.map(Arc::from),
+        name: name
+            .or_else(|| {
+                context
+                    .reconstruction_of
+                    .map(|id| format!("Shuffle reconstruction of task {id}"))
+            })
+            .map(Arc::from),
     };
     Arc::new(info)
 }

@@ -36,7 +36,6 @@ impl PyDaftPlanningConfig {
         enable_strict_filter_pushdown: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
-
         if let Some(default_io_config) = default_io_config {
             config.default_io_config = default_io_config.config;
         }
@@ -128,6 +127,14 @@ impl PyDaftExecutionConfig {
         flight_shuffle_shared_durability=None,
         flight_shuffle_read_source=None,
         flight_shuffle_shared_read_concurrency=None,
+        flight_shuffle_recovery_max_attempts=None,
+        flight_shuffle_recovery_max_inflight=None,
+        flight_shuffle_recovery_max_consumer_failures=None,
+        flight_shuffle_recovery_max_depth=None,
+        flight_shuffle_recovery_wait_timeout_ms=None,
+        flight_shuffle_recovery_max_retained_maps=None,
+        flight_shuffle_recovery_max_retained_bytes=None,
+
         enable_multi_glob_path_tasks=None,
     ))]
     fn with_config_values(
@@ -171,9 +178,63 @@ impl PyDaftExecutionConfig {
         flight_shuffle_shared_durability: Option<&str>,
         flight_shuffle_read_source: Option<&str>,
         flight_shuffle_shared_read_concurrency: Option<usize>,
+        flight_shuffle_recovery_max_attempts: Option<u32>,
+        flight_shuffle_recovery_max_inflight: Option<usize>,
+        flight_shuffle_recovery_max_consumer_failures: Option<usize>,
+        flight_shuffle_recovery_max_depth: Option<usize>,
+        flight_shuffle_recovery_wait_timeout_ms: Option<u64>,
+        flight_shuffle_recovery_max_retained_maps: Option<usize>,
+        flight_shuffle_recovery_max_retained_bytes: Option<usize>,
+
         enable_multi_glob_path_tasks: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
+        if let Some(value) = flight_shuffle_recovery_max_attempts {
+            config.flight_shuffle_recovery_max_attempts = value;
+        }
+        if let Some(value) = flight_shuffle_recovery_max_inflight {
+            if value == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "flight_shuffle_recovery_max_inflight must be positive",
+                ));
+            }
+            config.flight_shuffle_recovery_max_inflight = value;
+        }
+        if let Some(value) = flight_shuffle_recovery_max_consumer_failures {
+            if value == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "flight_shuffle_recovery_max_consumer_failures must be positive",
+                ));
+            }
+            config.flight_shuffle_recovery_max_consumer_failures = value;
+        }
+        if let Some(value) = flight_shuffle_recovery_max_depth {
+            if value == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "flight_shuffle_recovery_max_depth must be positive",
+                ));
+            }
+            config.flight_shuffle_recovery_max_depth = value;
+        }
+        if let Some(value) = flight_shuffle_recovery_wait_timeout_ms {
+            config.flight_shuffle_recovery_wait_timeout_ms = value;
+        }
+        if let Some(value) = flight_shuffle_recovery_max_retained_maps {
+            if value == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "flight_shuffle_recovery_max_retained_maps must be positive",
+                ));
+            }
+            config.flight_shuffle_recovery_max_retained_maps = value;
+        }
+        if let Some(value) = flight_shuffle_recovery_max_retained_bytes {
+            if value == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "flight_shuffle_recovery_max_retained_bytes must be positive",
+                ));
+            }
+            config.flight_shuffle_recovery_max_retained_bytes = value;
+        }
 
         if let Some(enable_scan_task_split_and_merge) = enable_scan_task_split_and_merge {
             config.enable_scan_task_split_and_merge = enable_scan_task_split_and_merge;
@@ -582,6 +643,41 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn flight_shuffle_shared_durability(&self) -> PyResult<&str> {
         Ok(&self.config.flight_shuffle_shared_durability)
+    }
+
+    #[getter]
+    fn flight_shuffle_recovery_max_attempts(&self) -> PyResult<u32> {
+        Ok(self.config.flight_shuffle_recovery_max_attempts)
+    }
+
+    #[getter]
+    fn flight_shuffle_recovery_max_inflight(&self) -> PyResult<usize> {
+        Ok(self.config.flight_shuffle_recovery_max_inflight)
+    }
+
+    #[getter]
+    fn flight_shuffle_recovery_max_consumer_failures(&self) -> PyResult<usize> {
+        Ok(self.config.flight_shuffle_recovery_max_consumer_failures)
+    }
+
+    #[getter]
+    fn flight_shuffle_recovery_max_depth(&self) -> PyResult<usize> {
+        Ok(self.config.flight_shuffle_recovery_max_depth)
+    }
+
+    #[getter]
+    fn flight_shuffle_recovery_wait_timeout_ms(&self) -> PyResult<u64> {
+        Ok(self.config.flight_shuffle_recovery_wait_timeout_ms)
+    }
+
+    #[getter]
+    fn flight_shuffle_recovery_max_retained_maps(&self) -> PyResult<usize> {
+        Ok(self.config.flight_shuffle_recovery_max_retained_maps)
+    }
+
+    #[getter]
+    fn flight_shuffle_recovery_max_retained_bytes(&self) -> PyResult<usize> {
+        Ok(self.config.flight_shuffle_recovery_max_retained_bytes)
     }
 
     #[getter]

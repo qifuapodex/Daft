@@ -13,7 +13,7 @@ use super::{PlanResult, QueryIdx};
 use crate::{
     pipeline_node::{
         DistributedPipelineNode, MaterializedOutput, TaskBuilderStream,
-        materialize::materialize_swordfish_outputs,
+        materialize::materialize_all_pipeline_outputs,
     },
     plan::DistributedPhysicalPlan,
     scheduling::{
@@ -172,7 +172,7 @@ impl RunningPlan {
         let stream = self
             .task_stream
             .map(move |builder| builder.build(self.plan_context.query_idx, &task_id_counter));
-        materialize_swordfish_outputs(stream, scheduler_handle, Some(joinset))
+        materialize_all_pipeline_outputs(stream, scheduler_handle, Some(joinset))
     }
 }
 

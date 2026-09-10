@@ -1,9 +1,8 @@
-//! Plan-owned reconstruction of replay-equivalent shared shuffle outputs.
-//! Resource scheduling remains in SchedulerLoop; no recovery waits inside it.
+//! Plan-owned, opt-in reconstruction. Queued tasks bind at dispatch, not submission.
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -17,7 +16,7 @@ use daft_logical_plan::partitioning::RepartitionSpec;
 use daft_partition_refs::FlightPartitionRef;
 use daft_schema::{dtype::DataType, schema::Schema};
 use futures::{FutureExt, future::BoxFuture};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -26,21 +25,18 @@ use super::{
 };
 use crate::pipeline_node::MaterializedOutput;
 
-// Physical identity; aliases are bounded by the per-producer reconstruction budget.
 type OutputKey = (u64, u32, u64);
-
+type MapList = Arc<BTreeMap<String, Vec<FlightMapOutput>>>;
 #[derive(Clone, Debug)]
 struct Location {
     output: FlightMapOutput,
     server: String,
 }
-
 #[derive(Debug, Default)]
 struct RepairState {
     attempts: u32,
     terminal: Option<String>,
 }
-
 #[derive(Debug)]
 struct Producer {
     template: SwordfishTask,
@@ -48,86 +44,198 @@ struct Producer {
     repair: AsyncMutex<RepairState>,
     num_partitions: usize,
 }
-
-#[derive(Debug)]
-pub(crate) struct ShuffleRecovery {
-    outputs: Mutex<HashMap<OutputKey, Arc<Producer>>>,
-    version: AtomicU64,
-    slots: Semaphore,
-    max_attempts: u32,
+#[derive(Debug, Default)]
+struct Directory {
+    outputs: HashMap<OutputKey, Arc<Producer>>,
+    // Keep the source Arc alive: its address must not be reused while cached.
+    bindings: HashMap<(u64, usize), (MapList, Option<MapList>)>,
+    repairing: HashSet<OutputKey>,
+    retained_bytes: usize,
+    retained_maps: usize,
 }
-
+#[derive(Debug, Default)]
+pub(crate) struct ShuffleRecovery {
+    directory: Mutex<Directory>,
+    version: AtomicU64,
+    slots: OnceLock<Arc<Semaphore>>,
+}
+struct RepairPublicationGuard<'a> {
+    recovery: &'a ShuffleRecovery,
+    key: OutputKey,
+}
+impl Drop for RepairPublicationGuard<'_> {
+    fn drop(&mut self) {
+        let mut directory = self.recovery.directory.lock().unwrap();
+        directory.repairing.remove(&self.key);
+        directory.bindings.clear();
+    }
+}
 impl ShuffleRecovery {
     pub fn new() -> Self {
-        Self {
-            outputs: Mutex::new(HashMap::new()),
-            version: AtomicU64::new(0),
-            slots: Semaphore::new(4),
-            max_attempts: std::env::var("DAFT_SHUFFLE_RECOVERY_MAX_ATTEMPTS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2),
-        }
+        Self::default()
     }
 
-    fn register(&self, task: &SwordfishTask, result: &MaterializedOutput) -> DaftResult<()> {
+    fn register(&self, task: &SwordfishTask, result: &MaterializedOutput) {
         let Some((shuffle_id, num_partitions)) = producer_spec(task) else {
-            return Ok(());
+            return;
         };
-        let location = output_location(result, shuffle_id, num_partitions)?;
+        let location = match output_location(result, shuffle_id, num_partitions) {
+            Ok(location) => location,
+            Err(error) => {
+                tracing::warn!(task_id = task.task_id(), %error, "Skipping invalid shuffle recovery recipe");
+                return;
+            }
+        };
+        let bytes = task
+            .psets()
+            .values()
+            .flatten()
+            .fold(0usize, |sum, p| sum.saturating_add(p.size_bytes()));
+        let bytes = task.inputs().values().fold(bytes, |sum, input| {
+            sum.saturating_add(match input {
+                Input::InMemory(parts) => parts
+                    .iter()
+                    .fold(0usize, |n, p| n.saturating_add(p.size_bytes())),
+                Input::FlightShuffle(reads) => reads.iter().fold(0usize, |n, read| {
+                    n.saturating_add(
+                        read.inputs_by_server
+                            .values()
+                            .map(|maps| {
+                                maps.len()
+                                    .saturating_mul(std::mem::size_of::<FlightMapOutput>())
+                            })
+                            .sum::<usize>(),
+                    )
+                }),
+                _ => usize::MAX,
+            })
+        });
+        let mut directory = self.directory.lock().unwrap();
         let key = (
             shuffle_id,
             location.output.input_id,
             location.output.attempt,
         );
-        self.outputs.lock().unwrap().entry(key).or_insert_with(|| {
+        if directory.outputs.contains_key(&key) {
+            return;
+        }
+        let cfg = task.config();
+        if directory.retained_maps >= cfg.flight_shuffle_recovery_max_retained_maps
+            || bytes
+                > cfg
+                    .flight_shuffle_recovery_max_retained_bytes
+                    .saturating_sub(directory.retained_bytes)
+        {
+            tracing::warn!(
+                shuffle_id,
+                task_id = task.task_id(),
+                bytes,
+                "Shuffle recovery retention budget reached; producer will not be replayable"
+            );
+            return;
+        }
+        directory.retained_bytes += bytes;
+        directory.retained_maps += 1;
+        directory.outputs.insert(
+            key,
             Arc::new(Producer {
                 template: task.clone(),
                 selected: Mutex::new(location),
                 repair: AsyncMutex::new(RepairState::default()),
                 num_partitions,
-            })
-        });
-        Ok(())
+            }),
+        );
     }
-
     fn lookup(&self, key: OutputKey) -> Option<Arc<Producer>> {
-        self.outputs.lock().unwrap().get(&key).cloned()
+        self.directory.lock().unwrap().outputs.get(&key).cloned()
     }
 
-    /// No directory walk or new map/ref matrix in normal successful execution.
-    /// After repair, each task receives a fresh immutable snapshot. Old aliases
-    /// continue to resolve to the same logical producer.
-    fn bind(&self, task: &SwordfishTask) -> SwordfishTask {
-        if self.version.load(Ordering::Acquire) == 0 {
-            return task.clone();
+    pub(crate) fn has_updates(&self) -> bool {
+        self.version.load(Ordering::Acquire) != 0
+    }
+
+    /// One lock per dispatch, one rewritten list per source Arc per directory
+    /// version. All reduce tasks continue sharing the same allocation.
+    pub(crate) fn bind(&self, task: &SwordfishTask) -> Option<SwordfishTask> {
+        if !self.has_updates() {
+            return Some(task.clone());
         }
         let mut inputs = task.inputs().clone();
+        let mut directory = self.directory.lock().unwrap();
         for input in inputs.values_mut() {
             let Input::FlightShuffle(reads) = input else {
                 continue;
             };
             for read in reads {
+                let key = (
+                    read.shuffle_id,
+                    Arc::as_ptr(&read.inputs_by_server) as usize,
+                );
+                if let Some((_, bound)) = directory.bindings.get(&key) {
+                    read.inputs_by_server = bound.as_ref()?.clone();
+                    continue;
+                }
                 let mut by_server: BTreeMap<String, Vec<FlightMapOutput>> = BTreeMap::new();
+                let mut changed = false;
                 for (server, maps) in read.inputs_by_server.iter() {
                     for map in maps {
-                        let location = self
-                            .lookup((read.shuffle_id, map.input_id, map.attempt))
+                        let location = directory
+                            .outputs
+                            .get(&(read.shuffle_id, map.input_id, map.attempt))
                             .map(|p| p.selected.lock().unwrap().clone())
                             .unwrap_or_else(|| Location {
                                 output: *map,
                                 server: server.clone(),
                             });
+                        // Resolve aliases before checking repair ownership. This
+                        // also fences consumers still carrying the original Arc
+                        // during a second reconstruction of a replacement attempt.
+                        if directory.repairing.contains(&(
+                            read.shuffle_id,
+                            location.output.input_id,
+                            location.output.attempt,
+                        )) {
+                            directory
+                                .bindings
+                                .insert(key, (read.inputs_by_server.clone(), None));
+                            return None;
+                        }
+                        changed |= location.output != *map || location.server != *server;
                         by_server
                             .entry(location.server)
                             .or_default()
                             .push(location.output);
                     }
                 }
-                read.inputs_by_server = Arc::new(by_server);
+                let bound = if changed {
+                    Arc::new(by_server)
+                } else {
+                    read.inputs_by_server.clone()
+                };
+                directory
+                    .bindings
+                    .insert(key, (read.inputs_by_server.clone(), Some(bound.clone())));
+                read.inputs_by_server = bound;
             }
         }
-        task.with_recovery_inputs(inputs)
+        Some(task.with_recovery_inputs(inputs))
+    }
+
+    /// Called only after the resource scheduler selected a worker. Waiting tasks
+    /// hold no permit; each physical completion releases its execution permit.
+    pub(crate) fn try_execution_slot(
+        &self,
+        task: &SwordfishTask,
+    ) -> Result<Option<OwnedSemaphorePermit>, ()> {
+        if !task.is_reconstruction() {
+            return Ok(None);
+        }
+        let slots = self.slots.get_or_init(|| {
+            Arc::new(Semaphore::new(
+                task.config().flight_shuffle_recovery_max_inflight,
+            ))
+        });
+        slots.clone().try_acquire_owned().map(Some).map_err(|_| ())
     }
 
     fn run<'a>(
@@ -139,35 +247,22 @@ impl ShuffleRecovery {
         reconstruction: bool,
     ) -> BoxFuture<'a, DaftResult<Option<MaterializedOutput>>> {
         async move {
-            // Independent from each producer's budget: a consumer can encounter
-            // several missing maps, but cannot keep discovering new failures forever.
-            for failure_count in 0..=64 {
+            for failure_count in 0..=task.config().flight_shuffle_recovery_max_consumer_failures {
                 if cancel.is_cancelled() {
                     return Ok(None);
                 }
-                task = self.bind(&task);
-                let result = {
-                    let _slot = if reconstruction {
-                        Some(
-                            self.slots
-                                .acquire()
-                                .await
-                                .map_err(|e| DaftError::InternalError(e.to_string()))?,
-                        )
-                    } else {
-                        None
-                    };
-                    SubmittableTask::new(task.clone(), cancel.child_token(), vec![])
-                        .submit(scheduler)?
-                        .await
-                }; // Release the slot before recursively reconstructing dependencies.
+                let result = SubmittableTask::new(task.clone(), cancel.child_token(), vec![])
+                    .submit_raw(scheduler)?
+                    .await;
                 match result {
                     Ok(result) => return Ok(result),
                     Err(error) => {
                         let Some(failure) = error.shuffle_fetch_failure() else {
                             return Err(error);
                         };
-                        if failure_count == 64 {
+                        if failure_count
+                            == task.config().flight_shuffle_recovery_max_consumer_failures
+                        {
                             return Err(recovery_error(
                                 &failure,
                                 "consumer recovery budget exhausted",
@@ -184,7 +279,6 @@ impl ShuffleRecovery {
         }
         .boxed()
     }
-
     fn repair<'a>(
         &'a self,
         failure: &'a ShuffleFetchFailure,
@@ -194,47 +288,59 @@ impl ShuffleRecovery {
     ) -> BoxFuture<'a, DaftResult<()>> {
         async move {
             let key = (failure.shuffle_id, failure.input_id, failure.attempt);
-            if ancestors.contains(&key) || ancestors.len() >= 16 {
+            let producer = self.lookup(key).ok_or_else(|| recovery_error(failure,
+                "producer not retained or not replayable (scan-to-shuffle is unsupported); automatic stage rollback is not supported"))?;
+            let cfg = producer.template.config();
+            if ancestors.contains(&key) || ancestors.len() >= cfg.flight_shuffle_recovery_max_depth {
                 return Err(recovery_error(failure, "cyclic or excessive reconstruction dependencies"));
             }
             ancestors.push(key);
-            let producer = self.lookup(key).ok_or_else(|| recovery_error(failure,
-                "producer is not replayable from retained inputs; automatic stage rollback is not supported"))?;
-            let mut repair = producer.repair.lock().await;
-            // A waiting consumer may report an attempt another consumer already replaced.
+            // Only waiting for another owner is timed. Neither scheduler queue
+            // time nor producer/consumer execution is constrained by this timer.
+            let mut repair = if cfg.flight_shuffle_recovery_wait_timeout_ms == 0 {
+                producer.repair.lock().await
+            } else {
+                tokio::time::timeout(Duration::from_millis(cfg.flight_shuffle_recovery_wait_timeout_ms), producer.repair.lock())
+                    .await.map_err(|_| recovery_error(failure, "recovery ownership wait deadline exceeded"))?
+            };
             let selected = producer.selected.lock().unwrap().clone();
-            if (selected.output.input_id, selected.output.attempt) != (failure.input_id, failure.attempt) {
-                return Ok(());
-            }
+            if (selected.output.input_id, selected.output.attempt) != (failure.input_id, failure.attempt) { return Ok(()); }
             if let Some(reason) = &repair.terminal { return Err(recovery_error(failure, reason)); }
-            if repair.attempts >= self.max_attempts {
-                repair.terminal = Some("map reconstruction budget exhausted".into());
+            if repair.attempts >= cfg.flight_shuffle_recovery_max_attempts {
                 return Err(recovery_error(failure, "map reconstruction budget exhausted"));
             }
-            repair.attempts += 1;
+            if cancel.is_cancelled() { return Ok(()); }
+            {
+                let mut directory = self.directory.lock().unwrap();
+                directory.repairing.insert(key);
+                directory.bindings.clear();
+                self.version.fetch_add(1, Ordering::Release);
+            }
+            let _publication = RepairPublicationGuard { recovery: self, key };
             let task = producer.template.recovery_attempt(scheduler.task_id_counter.next(), true);
-            tracing::warn!(shuffle_id = failure.shuffle_id, input_id = failure.input_id,
-                attempt = failure.attempt, reconstruction = repair.attempts,
-                task_id = task.task_id(), "Reconstructing unavailable shared shuffle output");
-            let result = self.run(task, scheduler, cancel, ancestors, true).await;
+            tracing::warn!(shuffle_id = failure.shuffle_id, input_id = failure.input_id, attempt = failure.attempt,
+                reconstruction = repair.attempts + 1, task_id = task.task_id(), "Reconstructing unavailable shared shuffle output");
+            let result = self.run(task, scheduler, cancel.clone(), ancestors, true).await;
+            if cancel.is_cancelled() || matches!(&result, Ok(None)) { return Err(recovery_error(failure, "reconstruction cancelled")); }
+            // Dropping an unfinished repair on cancellation/ownership timeout
+            // does not permanently consume the producer's completion budget.
+            repair.attempts += 1;
             let result = match result {
                 Ok(Some(result)) => result,
                 Ok(None) => return Err(recovery_error(failure, "reconstruction cancelled")),
                 Err(error) => {
-                    repair.terminal = Some(error.to_string());
+                    if !error.is_transient() { repair.terminal = Some(error.to_string()); }
                     return Err(error);
                 }
             };
             let replacement = output_location(&result, failure.shuffle_id, producer.num_partitions)?;
             let replacement_key = (failure.shuffle_id, replacement.output.input_id, replacement.output.attempt);
-            // Publish the alias before the selection; consumers can resolve every
-            // reference they are handed, including from another reconstruction.
-            self.outputs.lock().unwrap().insert(replacement_key, producer.clone());
+            let mut directory = self.directory.lock().unwrap();
+            directory.outputs.insert(replacement_key, producer.clone());
             *producer.selected.lock().unwrap() = replacement;
+            directory.bindings.clear();
             self.version.fetch_add(1, Ordering::Release);
-            tracing::info!(shuffle_id = failure.shuffle_id, old_input_id = failure.input_id,
-                old_attempt = failure.attempt, input_id = replacement_key.1,
-                attempt = replacement_key.2, "Published reconstructed shared shuffle output");
+            tracing::info!(shuffle_id = failure.shuffle_id, input_id = replacement_key.1, attempt = replacement_key.2, "Published reconstructed shared shuffle output");
             Ok(())
         }.boxed()
     }
@@ -246,13 +352,11 @@ pub(crate) fn submit(
 ) -> DaftResult<SubmittedTask> {
     let (task, cancel, notifications) = submittable.into_parts();
     let recovery = scheduler.shuffle_recovery.clone();
-    if recovery.max_attempts == 0 || !uses_shared_shuffle(&task) {
-        return SubmittableTask::new(task, cancel, notifications).submit(scheduler);
-    }
-    if !task_replayable(&task, false) {
-        // Rebinding before the first execution is safe even when retrying the
-        // consumer is not: registered producer outputs are replay-equivalent.
-        return SubmittableTask::new(recovery.bind(&task), cancel, notifications).submit(scheduler);
+    if task.config().flight_shuffle_recovery_max_attempts == 0
+        || !uses_shared_shuffle(&task)
+        || !consumer_replayable(&task.plan())
+    {
+        return SubmittableTask::new(task, cancel, notifications).submit_raw(scheduler);
     }
     let task_id = task.task_id();
     let scheduler = scheduler.clone();
@@ -262,40 +366,26 @@ pub(crate) fn submit(
         .hold_recovery_completion(&task.task_context());
     let future = async move {
         let _completion = completion;
-        // Ordinary execution has no recovery timeout. Start a recovery deadline
-        // only when a fetch failure is first observed.
-        let initial = recovery.bind(&task);
-        let result = SubmittableTask::new(initial, future_cancel.child_token(), vec![])
-            .submit(&scheduler)?
-            .await;
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                let Some(failure) = error.shuffle_fetch_failure() else {
-                    return Err(error);
-                };
-                let recovering = async {
-                    recovery
-                        .repair(&failure, &scheduler, future_cancel.clone(), vec![])
-                        .await?;
-                    let retry = task.recovery_attempt(scheduler.task_id_counter.next(), false);
-                    recovery
-                        .run(retry, &scheduler, future_cancel.clone(), vec![], false)
-                        .await
-                };
-                tokio::select! {
-                    biased;
-                    _ = future_cancel.cancelled() => return Ok(None),
-                    result = tokio::time::timeout(Duration::from_secs(120), recovering) => {
-                        result.map_err(|_| recovery_error(&failure, "recovery deadline exceeded"))??
-                    }
-                }
+        let executing = async {
+            let result = recovery
+                .run(
+                    task.clone(),
+                    &scheduler,
+                    future_cancel.clone(),
+                    vec![],
+                    false,
+                )
+                .await?;
+            if let Some(result) = &result {
+                recovery.register(&task, result);
             }
+            Ok(result)
         };
-        if let Some(result) = &result {
-            recovery.register(&task, result)?;
+        tokio::select! {
+            biased;
+            _ = future_cancel.cancelled() => Ok(None),
+            result = executing => result,
         }
-        Ok(result)
     }
     .boxed();
     Ok(SubmittedTask::from_future(
@@ -371,7 +461,7 @@ fn producer_spec(task: &SwordfishTask) -> Option<(u64, usize)> {
                 shuffle_id,
                 shared: Some(_),
                 ..
-            } if task_replayable(task, true) => Some((*shuffle_id, write.num_partitions)),
+            } if producer_task_replayable(task) => Some((*shuffle_id, write.num_partitions)),
             _ => None,
         },
         _ => None,
@@ -390,6 +480,12 @@ fn uses_shared_shuffle(task: &SwordfishTask) -> bool {
 }
 
 fn scalar_type(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::List(child) | DataType::FixedSizeList(child, _) => return scalar_type(child),
+        DataType::Struct(fields) => return fields.iter().all(|field| scalar_type(&field.dtype)),
+        DataType::Map { key, value } => return scalar_type(key) && scalar_type(value),
+        _ => {}
+    }
     matches!(
         dtype,
         DataType::Null
@@ -419,22 +515,30 @@ fn scalar_type(dtype: &DataType) -> bool {
 }
 
 fn pure_expr(expr: &ExprRef, schema: &Schema) -> bool {
-    matches!(
-        expr.as_ref(),
-        Expr::Column(_)
-            | Expr::Literal(_)
-            | Expr::Alias(..)
-            | Expr::BinaryOp { .. }
-            | Expr::Cast(..)
-            | Expr::Not(_)
-            | Expr::IsNull(_)
-            | Expr::NotNull(_)
-            | Expr::FillNull(..)
-            | Expr::IfElse { .. }
-            | Expr::Between(..)
-            | Expr::IsIn(..)
-            | Expr::Coalesce(_)
-    ) && expr.to_field(schema).is_ok_and(|f| scalar_type(&f.dtype))
+    use daft_dsl::functions::scalar::{BuiltinScalarFnVariant, ScalarFn};
+    let pure_builtin = matches!(expr.as_ref(), Expr::ScalarFn(ScalarFn::Builtin(function))
+        if matches!(&function.func, BuiltinScalarFnVariant::Sync(_))
+        && function.is_deterministic()
+        && matches!(function.name(), "abs" | "ceil" | "floor" | "round" | "sign" | "sqrt" | "exp" | "ln" | "log2" | "log10" | "sin" | "cos" | "tan" | "lower" | "upper" | "length" | "reverse" | "capitalize" | "contains" | "startswith" | "endswith" | "lstrip" | "rstrip" | "strip" | "replace"));
+    (pure_builtin
+        || matches!(
+            expr.as_ref(),
+            Expr::Column(_)
+                | Expr::Literal(_)
+                | Expr::Alias(..)
+                | Expr::BinaryOp { .. }
+                | Expr::Cast(..)
+                | Expr::Not(_)
+                | Expr::IsNull(_)
+                | Expr::NotNull(_)
+                | Expr::FillNull(..)
+                | Expr::IfElse { .. }
+                | Expr::Between(..)
+                | Expr::IsIn(..)
+                | Expr::Coalesce(_)
+                | Expr::List(_)
+        ))
+        && expr.to_field(schema).is_ok_and(|f| scalar_type(&f.dtype))
         && expr.children().iter().all(|child| pure_expr(child, schema))
 }
 
@@ -454,16 +558,16 @@ fn safe_agg(agg: &AggExpr, schema: &Schema) -> bool {
     ) && agg.children().iter().all(|e| pure_expr(e, schema))
 }
 
-fn task_replayable(task: &SwordfishTask, producer: bool) -> bool {
+fn producer_task_replayable(task: &SwordfishTask) -> bool {
     // Retained in-memory inputs and immutable shuffle files are replayable.
     // ScanTasks/GlobPaths do not provide source snapshot guarantees.
     task.inputs()
         .values()
         .all(|input| matches!(input, Input::InMemory(_) | Input::FlightShuffle(_)))
-        && plan_replayable(&task.plan(), producer)
+        && producer_plan_replayable(&task.plan())
 }
 
-fn plan_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef, producer: bool) -> bool {
+fn producer_plan_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef) -> bool {
     if !plan.schema().fields().iter().all(|f| scalar_type(&f.dtype)) {
         return false;
     }
@@ -490,25 +594,67 @@ fn plan_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef, producer: bool)
                 RepartitionSpec::Random(_) => false,
             }
         }
-        LocalPhysicalPlan::HashAggregate(p) if !producer => {
-            p.group_by
-                .iter()
-                .all(|e| pure_expr(e.inner(), p.input.schema()))
+        _ => false,
+    };
+    allowed && plan.arc_children().iter().all(producer_plan_replayable)
+}
+
+// Consumer retry needs absence of external effects, not producer output
+// equivalence. Order-sensitive operators are safe when their task has not committed.
+fn consumer_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef) -> bool {
+    if !plan.schema().fields().iter().all(|f| scalar_type(&f.dtype)) {
+        return false;
+    }
+    let check = |exprs: &[daft_dsl::expr::bound_expr::BoundExpr],
+                 input: &daft_local_plan::LocalPhysicalPlanRef| {
+        exprs.iter().all(|e| pure_expr(e.inner(), input.schema()))
+    };
+    let allowed = match plan.as_ref() {
+        LocalPhysicalPlan::InMemoryScan(_)
+        | LocalPhysicalPlan::ShuffleRead(_)
+        | LocalPhysicalPlan::IntoBatches(_)
+        | LocalPhysicalPlan::Limit(_)
+        | LocalPhysicalPlan::IntoPartitions(_)
+        | LocalPhysicalPlan::GatherWrite(_)
+        | LocalPhysicalPlan::CrossJoin(_)
+        | LocalPhysicalPlan::Concat(_) => true,
+        LocalPhysicalPlan::Sort(p) => check(&p.sort_by, &p.input),
+        LocalPhysicalPlan::TopN(p) => check(&p.sort_by, &p.input),
+        LocalPhysicalPlan::Explode(p) => check(&p.to_explode, &p.input),
+        LocalPhysicalPlan::HashJoin(p) => {
+            check(&p.left_on, &p.left) && check(&p.right_on, &p.right)
+        }
+        LocalPhysicalPlan::SortMergeJoin(p) => {
+            check(&p.left_on, &p.left) && check(&p.right_on, &p.right)
+        }
+        LocalPhysicalPlan::AsofJoin(p) => {
+            check(&p.left_by, &p.left)
+                && check(&p.right_by, &p.right)
+                && pure_expr(p.left_on.inner(), p.left.schema())
+                && pure_expr(p.right_on.inner(), p.right.schema())
+        }
+        LocalPhysicalPlan::Project(p) => check(&p.projection, &p.input),
+        LocalPhysicalPlan::Filter(p) => pure_expr(p.predicate.inner(), p.input.schema()),
+        LocalPhysicalPlan::HashAggregate(p) => {
+            check(&p.group_by, &p.input)
                 && p.aggregations
                     .iter()
                     .all(|a| safe_agg(a.inner(), p.input.schema()))
         }
-        LocalPhysicalPlan::UnGroupedAggregate(p) if !producer => p
+        LocalPhysicalPlan::UnGroupedAggregate(p) => p
             .aggregations
             .iter()
             .all(|a| safe_agg(a.inner(), p.input.schema())),
+        LocalPhysicalPlan::RepartitionWrite(p) => match &p.repartition_spec {
+            RepartitionSpec::Hash(h) => h.by.iter().all(|e| pure_expr(e, p.input.schema())),
+            RepartitionSpec::Range(r) => {
+                r.by.iter().all(|e| pure_expr(e.inner(), p.input.schema()))
+            }
+            RepartitionSpec::Random(_) => true,
+        },
         _ => false,
     };
-    allowed
-        && plan
-            .arc_children()
-            .iter()
-            .all(|p| plan_replayable(p, producer))
+    allowed && plan.arc_children().iter().all(consumer_replayable)
 }
 
 #[cfg(test)]
@@ -538,6 +684,7 @@ mod tests {
         scheduler: SchedulerHandle<SwordfishTask>,
         tasks: JoinSet<DaftResult<()>>,
         workers: Arc<LocalSwordfishWorkerManager>,
+        worker: LocalSwordfishWorker,
         root: tempfile::TempDir,
         shuffle_id: u64,
         config: Arc<DaftExecutionConfig>,
@@ -546,9 +693,10 @@ mod tests {
     impl Harness {
         fn new() -> Self {
             let worker_id: Arc<str> = Arc::from("shuffle-recovery-test");
+            let worker = LocalSwordfishWorker::with_shuffle(worker_id.clone());
             let workers = Arc::new(LocalSwordfishWorkerManager::new(HashMap::from([(
-                worker_id.clone(),
-                LocalSwordfishWorker::with_shuffle(worker_id),
+                worker_id,
+                worker.clone(),
             )])));
             let mut tasks = JoinSet::new();
             let scheduler =
@@ -557,9 +705,13 @@ mod tests {
                 scheduler,
                 tasks,
                 workers,
+                worker,
                 root: tempfile::tempdir().unwrap(),
                 shuffle_id: rand::random(),
-                config: Arc::new(DaftExecutionConfig::default()),
+                config: Arc::new(DaftExecutionConfig {
+                    flight_shuffle_recovery_max_attempts: 2,
+                    ..DaftExecutionConfig::default()
+                }),
             }
         }
 
@@ -662,7 +814,7 @@ mod tests {
             while let Some(result) = self.tasks.join_next().await {
                 result.unwrap().unwrap();
             }
-            tokio::task::spawn_blocking(move || drop(self.workers))
+            tokio::task::spawn_blocking(move || drop((self.workers, self.worker)))
                 .await
                 .unwrap();
         }
@@ -678,6 +830,193 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn ownership_deadline_does_not_limit_producer_or_consumer_execution() -> DaftResult<()> {
+        let mut harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        Arc::make_mut(&mut harness.config).flight_shuffle_recovery_wait_timeout_ms = 5;
+        let original = harness.execute(harness.producer(0, "none", false)).await?;
+        let consumer = harness.consumer(std::slice::from_ref(&original), 0);
+        let expected = values(&harness.execute(consumer.clone()).await?);
+        harness.remove(&output_location(&original, harness.shuffle_id, 3)?);
+        // Both the producer reconstruction and retried consumer exceed 5ms.
+        harness.worker.set_execution_delay_ms(25);
+        let result = harness.execute(consumer).await?;
+        assert_eq!(values(&result), expected);
+        harness.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn byte_cap_and_invalid_bookkeeping_leave_successful_maps_successful() -> DaftResult<()> {
+        let mut harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        Arc::make_mut(&mut harness.config).flight_shuffle_recovery_max_retained_bytes = 1;
+        let task = harness.producer(0, "none", false);
+        let output = harness.execute(task.clone()).await?;
+        let recovery = &harness.scheduler.shuffle_recovery;
+        assert!(recovery.directory.lock().unwrap().outputs.is_empty());
+        let mut config = task.config().as_ref().clone();
+        config.flight_shuffle_recovery_max_retained_bytes = usize::MAX;
+        let task = SwordfishTask::for_recovery_test(
+            task.plan(),
+            HashMap::new(),
+            Arc::new(config),
+            task.task_id(),
+        );
+        let invalid =
+            MaterializedOutput::new(vec![], Arc::from("test"), String::new(), task.task_id());
+        recovery.register(&task, &invalid);
+        assert!(recovery.directory.lock().unwrap().outputs.is_empty());
+        assert!(output_location(&output, harness.shuffle_id, 3).is_ok());
+        harness.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_rebinds_a_deep_queue_after_prioritized_reconstruction() -> DaftResult<()> {
+        let mut harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        Arc::make_mut(&mut harness.config).flight_shuffle_recovery_wait_timeout_ms = 5;
+        let original = harness.execute(harness.producer(0, "none", false)).await?;
+        let consumer = harness.consumer(std::slice::from_ref(&original), 0);
+        let expected = values(&harness.execute(consumer.clone()).await?);
+        let failure = harness.remove(&output_location(&original, harness.shuffle_id, 3)?);
+        // Occupy the only worker so every consumer is queued with the old reference.
+        let blocker = harness.producer(500, "none", false);
+        harness.worker.add_active_task(&blocker);
+        let mut queued = Vec::new();
+        for _ in 0..128 {
+            let task = SwordfishTask::for_recovery_test(
+                consumer.plan(),
+                consumer.inputs().clone(),
+                harness.config.clone(),
+                harness.scheduler.task_id_counter.next(),
+            );
+            // Raw submission deliberately has no consumer retry. A stale dispatch
+            // therefore fails this test instead of silently running a second time.
+            queued.push(SubmittableTask::task_only(task).submit_raw(&harness.scheduler)?);
+        }
+        let scheduler = harness.scheduler.clone();
+        let repairing = tokio::spawn(async move {
+            scheduler
+                .shuffle_recovery
+                .repair(&failure, &scheduler, CancellationToken::new(), vec![])
+                .await
+        });
+        // The reconstruction is queued longer than the configured ownership wait
+        // timeout. Queueing/execution must not consume that timeout.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!repairing.is_finished());
+        harness.worker.mark_task_finished(blocker.task_context());
+        repairing.await.unwrap()?;
+        for result in futures::future::try_join_all(queued).await? {
+            assert_eq!(values(&result.unwrap()), expected);
+        }
+        harness.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebinding_keeps_one_shared_map_list_for_thousands_of_consumers() -> DaftResult<()> {
+        let harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        let original = harness.execute(harness.producer(0, "none", false)).await?;
+        let task = harness.consumer(std::slice::from_ref(&original), 0);
+        let recovery = &harness.scheduler.shuffle_recovery;
+        let failure = harness.remove(&output_location(&original, harness.shuffle_id, 3)?);
+        recovery
+            .repair(
+                &failure,
+                &harness.scheduler,
+                CancellationToken::new(),
+                vec![],
+            )
+            .await?;
+        let mut inputs = task.inputs().clone();
+        let Input::FlightShuffle(reads) = inputs.get_mut(&0).unwrap() else {
+            unreachable!()
+        };
+        let maps = Arc::make_mut(&mut reads[0].inputs_by_server)
+            .values_mut()
+            .next()
+            .unwrap();
+        maps.extend((100_000..109_999).map(|input_id| FlightMapOutput {
+            input_id,
+            attempt: 1,
+        }));
+        let task = task.with_recovery_inputs(inputs);
+        let bound = recovery.bind(&task).unwrap();
+        let Input::FlightShuffle(expected) = &bound.inputs()[&0] else {
+            unreachable!()
+        };
+        for _ in 0..8_000 {
+            let bound = recovery.bind(&task).unwrap();
+            let Input::FlightShuffle(reads) = &bound.inputs()[&0] else {
+                unreachable!()
+            };
+            assert!(Arc::ptr_eq(
+                &expected[0].inputs_by_server,
+                &reads[0].inputs_by_server
+            ));
+        }
+        assert_eq!(recovery.directory.lock().unwrap().bindings.len(), 1);
+        let producer = recovery
+            .lookup((failure.shuffle_id, failure.input_id, failure.attempt))
+            .unwrap();
+        let selected = producer.selected.lock().unwrap().output;
+        {
+            let mut directory = recovery.directory.lock().unwrap();
+            directory
+                .repairing
+                .insert((failure.shuffle_id, selected.input_id, selected.attempt));
+            directory.bindings.clear();
+        }
+        // An original reference must wait when its selected replacement is repaired.
+        assert!(recovery.bind(&task).is_none());
+        drop(producer);
+        harness.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ownership_timeout_and_retention_limits_do_not_poison_producers() -> DaftResult<()> {
+        let mut harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
+        Arc::make_mut(&mut harness.config).flight_shuffle_recovery_max_retained_maps = 1;
+        Arc::make_mut(&mut harness.config).flight_shuffle_recovery_wait_timeout_ms = 5;
+        let original = harness.execute(harness.producer(0, "none", false)).await?;
+        // Reaching the retention cap must not turn a successful map into a failure.
+        harness.execute(harness.producer(90, "none", false)).await?;
+        let failure = harness.remove(&output_location(&original, harness.shuffle_id, 3)?);
+        let recovery = &harness.scheduler.shuffle_recovery;
+        assert_eq!(recovery.directory.lock().unwrap().retained_maps, 1);
+        let producer = recovery
+            .lookup((failure.shuffle_id, failure.input_id, failure.attempt))
+            .unwrap();
+        let held = producer.repair.lock().await;
+        let error = recovery
+            .repair(
+                &failure,
+                &harness.scheduler,
+                CancellationToken::new(),
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ownership wait deadline"));
+        assert_eq!(held.attempts, 0);
+        assert!(held.terminal.is_none());
+        drop(held);
+        recovery
+            .repair(
+                &failure,
+                &harness.scheduler,
+                CancellationToken::new(),
+                vec![],
+            )
+            .await?;
+        assert_eq!(producer.repair.lock().await.attempts, 1);
+        drop(producer);
+        harness.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -754,9 +1093,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_recovery_does_not_retain_or_reconstruct_outputs() -> DaftResult<()> {
         let mut harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
-        Arc::get_mut(&mut harness.scheduler.shuffle_recovery)
-            .unwrap()
-            .max_attempts = 0;
+        Arc::make_mut(&mut harness.config).flight_shuffle_recovery_max_attempts = 0;
         let original = harness.execute(harness.producer(0, "none", false)).await?;
         let failure = harness.remove(&output_location(&original, harness.shuffle_id, 3)?);
         let result = harness.execute(harness.consumer(&[original], 0)).await;
@@ -764,9 +1101,10 @@ mod tests {
             harness
                 .scheduler
                 .shuffle_recovery
-                .outputs
+                .directory
                 .lock()
                 .unwrap()
+                .outputs
                 .is_empty()
         );
         harness.shutdown().await;
@@ -779,15 +1117,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_replayable_consumer_uses_repaired_refs_on_first_execution() -> DaftResult<()> {
+    async fn limit_consumer_uses_repaired_refs_on_first_execution() -> DaftResult<()> {
         let harness = tokio::task::spawn_blocking(Harness::new).await.unwrap();
         let original = harness.execute(harness.producer(0, "none", false)).await?;
         let old = output_location(&original, harness.shuffle_id, 3)?;
         harness.remove(&old);
         let read = harness.consumer(std::slice::from_ref(&original), 0);
         let expected = values(&harness.execute(read.clone()).await?);
-        // Limit is deliberately outside the retry allowlist, but its first
-        // execution should use the replacement already published by another task.
+        // Order-sensitive consumers are safe to restart with replay-equivalent inputs.
+        // First execution also observes replacements published by another task.
         let limit = LocalPhysicalPlan::limit(
             read.plan(),
             1_000,
@@ -801,7 +1139,7 @@ mod tests {
             harness.config.clone(),
             harness.scheduler.task_id_counter.next(),
         );
-        assert!(!task_replayable(&task, false));
+        assert!(consumer_replayable(&task.plan()));
         let result = harness.execute(task).await;
         harness.shutdown().await;
         assert_eq!(values(&result?), expected);
@@ -820,7 +1158,12 @@ mod tests {
             .lookup((harness.shuffle_id, old.output.input_id, old.output.attempt))
             .unwrap();
         // Hold all reconstruction slots to cancel at a deterministic wait point.
-        let slots = recovery.slots.acquire_many(4).await.unwrap();
+        let slots = recovery
+            .slots
+            .get_or_init(|| Arc::new(Semaphore::new(4)))
+            .acquire_many(4)
+            .await
+            .unwrap();
         let cancel = CancellationToken::new();
         let (notify, mut notifications) = TaskNotifyToken::new();
         let consumer = harness.consumer(std::slice::from_ref(&original), 0);
@@ -850,7 +1193,7 @@ mod tests {
         drop(slots);
         // Cancellation releases ownership; a remaining consumer can still repair.
         harness.execute(harness.consumer(&[original], 0)).await?;
-        assert_eq!(producer.repair.lock().await.attempts, 2);
+        assert_eq!(producer.repair.lock().await.attempts, 1);
         drop(producer);
         drop(recovery);
         harness.shutdown().await;
@@ -914,9 +1257,10 @@ mod tests {
             harness
                 .scheduler
                 .shuffle_recovery
-                .outputs
+                .directory
                 .lock()
                 .unwrap()
+                .outputs
                 .len(),
             4
         );
@@ -940,9 +1284,10 @@ mod tests {
             harness
                 .scheduler
                 .shuffle_recovery
-                .outputs
+                .directory
                 .lock()
                 .unwrap()
+                .outputs
                 .is_empty()
         );
         harness.shutdown().await;

@@ -108,9 +108,12 @@ impl RuntimeNodeManager {
         &self.node_info
     }
 
-    /// Record that a task touching this node has been submitted. Returns
-    /// `true` iff this is the first such submission, i.e. the caller should
-    /// fire an `OperatorStart` event for this node.
+    /// Hold logical completion without starting the operator before submission.
+    pub fn reserve_task_completion(&self) {
+        self.lifecycle.lock().unwrap().pending_tasks += 1;
+    }
+
+    /// Record submission; return true only for the first OperatorStart.
     pub fn on_task_submitted(&self) -> bool {
         let mut s = self.lifecycle.lock().unwrap();
         s.pending_tasks += 1;
@@ -385,6 +388,20 @@ mod tests {
             StatSnapshot::Default(s) => s.num_tasks,
             other => panic!("expected Default snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recovery_reservation_waits_for_submission_to_start_operator() {
+        let manager = runtime_node_manager(7);
+        manager.reserve_task_completion();
+        assert_eq!(
+            manager.lifecycle.lock().unwrap().phase,
+            LifecyclePhase::Pending
+        );
+        assert!(manager.on_task_submitted());
+        assert!(!manager.on_task_finished());
+        assert!(!manager.on_produce_complete());
+        assert!(manager.on_task_finished());
     }
 
     #[test]

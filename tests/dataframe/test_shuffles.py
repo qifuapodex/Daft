@@ -78,7 +78,7 @@ def shared_flight_shuffle_ctx():
     """
 
     @contextmanager
-    def _ctx(read_source="auto", durability="background"):
+    def _ctx(read_source="auto", durability="background", recovery_attempts=0):
         with (
             tempfile.TemporaryDirectory() as local_dir,
             tempfile.TemporaryDirectory() as shared_dir,
@@ -89,6 +89,7 @@ def shared_flight_shuffle_ctx():
                 flight_shuffle_shared_dir=shared_dir,
                 flight_shuffle_shared_durability=durability,
                 flight_shuffle_read_source=read_source,
+                flight_shuffle_recovery_max_attempts=recovery_attempts,
             ),
         ):
             yield shared_dir
@@ -804,7 +805,8 @@ def test_flight_shuffle_shared_config_validation():
 )
 @pytest.mark.parametrize("durability", ["none", "background", "sync"])
 @pytest.mark.parametrize("read_source", ["auto", "rpc", "shared"])
-def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, durability, read_source):
+@pytest.mark.parametrize("nested_builtin", [False, True])
+def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, durability, read_source, nested_builtin):
     """Delete an acknowledged output inside the real Flotilla scheduler actor."""
     import ray
 
@@ -814,7 +816,7 @@ def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, d
     daft.from_pydict({"warmup": [1]}).select("warmup").collect()
     actor = get_or_create_runner().flotilla_plan_runner.runner
 
-    with shared_flight_shuffle_ctx(durability=durability, read_source=read_source) as shared_root:
+    with shared_flight_shuffle_ctx(durability=durability, read_source=read_source, recovery_attempts=2) as shared_root:
 
         def install(actor_self):
             from pathlib import Path
@@ -860,7 +862,14 @@ def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, d
         ray.get(actor.__ray_call__.remote(install))
         try:
             rows = list(range(180))
-            got = daft.from_pydict({"id": rows}).into_partitions(2).repartition(3, "id").to_pydict()["id"]
+            if nested_builtin:
+                df = daft.from_pydict({"id": [-i for i in rows], "payload": [[{"value": i}] for i in rows]})
+                df = df.into_partitions(2).with_column("id", daft.col("id").abs()).repartition(3, "id")
+                result = df.sort("id").limit(len(rows)).to_pydict()
+                assert result["payload"] == [[{"value": i}] for i in rows]
+                got = result["id"]
+            else:
+                got = daft.from_pydict({"id": rows}).into_partitions(2).repartition(3, "id").to_pydict()["id"]
         finally:
             state = ray.get(actor.__ray_call__.remote(uninstall))
 
@@ -868,5 +877,7 @@ def test_shared_shuffle_recovers_published_map_loss(shared_flight_shuffle_ctx, d
         assert sorted(got) == rows
         lost_shuffle = state["deleted"][0][0]
         same_shuffle = [entry for entry in state["published"] if entry[0] == lost_shuffle]
-        assert len(same_shuffle) == 2, "one merged original map plus exactly one reconstruction"
-        assert len(set(same_shuffle)) == 2, "reconstruction must publish a fresh physical output"
+        # The simple input merges into one map; the nested projection retains two.
+        original_maps = 2 if nested_builtin else 1
+        assert len(same_shuffle) == original_maps + 1, "exactly one reconstruction"
+        assert len(set(same_shuffle)) == original_maps + 1, "reconstruction must publish a fresh physical output"

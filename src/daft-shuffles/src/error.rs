@@ -34,6 +34,11 @@ pub(crate) fn from_flight(error: FlightError) -> DaftError {
                 && let Ok(failure) = serde_json::from_slice::<ShuffleFetchFailure>(status.details())
             {
                 DaftError::ShuffleFetchFailure(Box::new(failure))
+            } else if matches!(
+                status.code(),
+                Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted
+            ) {
+                DaftError::MiscTransient(Box::new(status))
             } else {
                 DaftError::External(Box::new(status))
             }
@@ -72,6 +77,19 @@ mod tests {
         let remote = from_flight(FlightError::Tonic(Box::new(received)));
         assert_eq!(remote.shuffle_fetch_failure(), Some(expected));
         assert!(!remote.is_transient());
+    }
+
+    #[test]
+    fn transport_statuses_keep_transient_retry_classification() {
+        for code in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::ResourceExhausted,
+        ] {
+            let error = from_flight(FlightError::Tonic(Box::new(Status::new(code, "retry"))));
+            assert!(error.is_transient());
+            assert!(error.shuffle_fetch_failure().is_none());
+        }
     }
 
     #[test]

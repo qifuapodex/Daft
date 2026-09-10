@@ -153,15 +153,10 @@ where
                     scheduled_tasks = %format!("{:#?}", scheduled_tasks)
                 );
 
-                for task in &scheduled_tasks {
-                    self.statistics_manager.handle_event(TaskEvent::Scheduled {
-                        context: task.task().task_context(),
-                        worker_id: task.worker_id(),
-                    })?;
-                }
-
                 self.dispatcher
                     .dispatch_tasks(scheduled_tasks, &self.worker_manager)?;
+                self.scheduler
+                    .enqueue_tasks(self.dispatcher.take_deferred_tasks());
             }
 
             // 3b: Ask the worker manager to retire idle workers when downscaling is configured.
@@ -264,14 +259,17 @@ where
 {
     let (scheduler_sender, scheduler_receiver) = create_unbounded_channel();
     let recovery_statistics = statistics_manager.clone();
-    let loop_state = SchedulerLoop::new(
+    let mut handle = SchedulerHandle::new(scheduler_sender);
+    let mut loop_state = SchedulerLoop::new(
         scheduler,
         scheduler_receiver,
         worker_manager,
         statistics_manager,
     );
+    loop_state
+        .dispatcher
+        .set_shuffle_recovery(handle.shuffle_recovery.clone());
     joinset.spawn(loop_state.run());
-    let mut handle = SchedulerHandle::new(scheduler_sender);
     handle.recovery_statistics = recovery_statistics;
     handle
 }
@@ -403,13 +401,25 @@ impl<T: Task> SubmittableTask<T> {
     }
 
     pub fn submit(self, scheduler_handle: &SchedulerHandle<T>) -> DaftResult<SubmittedTask> {
+        T::submit(self, scheduler_handle)
+    }
+
+    pub(crate) fn submit_raw(
+        self,
+        scheduler_handle: &SchedulerHandle<T>,
+    ) -> DaftResult<SubmittedTask> {
         scheduler_handle.submit_task(self)
     }
 }
 
+enum SubmittedResult {
+    Receiver(OneshotReceiver<DaftResult<Option<MaterializedOutput>>>),
+    Recovery(futures::future::BoxFuture<'static, DaftResult<Option<MaterializedOutput>>>),
+}
+
 pub(crate) struct SubmittedTask {
     _task_id: TaskID,
-    result: futures::future::BoxFuture<'static, DaftResult<Option<MaterializedOutput>>>,
+    result: SubmittedResult,
     cancel_token: Option<CancellationToken>,
     notify_tokens: Vec<TaskNotifyToken>,
     finished: bool,
@@ -431,12 +441,13 @@ impl SubmittedTask {
         cancel_token: Option<CancellationToken>,
         notify_tokens: Vec<TaskNotifyToken>,
     ) -> Self {
-        Self::from_future(
-            task_id,
-            async move { result_rx.await.unwrap_or(Ok(None)) }.boxed(),
+        Self {
+            _task_id: task_id,
+            result: SubmittedResult::Receiver(result_rx),
             cancel_token,
             notify_tokens,
-        )
+            finished: false,
+        }
     }
 
     pub(crate) fn from_future(
@@ -447,7 +458,7 @@ impl SubmittedTask {
     ) -> Self {
         Self {
             _task_id: task_id,
-            result,
+            result: SubmittedResult::Recovery(result),
             cancel_token,
             notify_tokens,
             finished: false,
@@ -464,7 +475,11 @@ impl Future for SubmittedTask {
     type Output = DaftResult<Option<MaterializedOutput>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.result.poll_unpin(cx) {
+        let result = match &mut self.result {
+            SubmittedResult::Receiver(rx) => rx.poll_unpin(cx).map(|r| r.unwrap_or(Ok(None))),
+            SubmittedResult::Recovery(future) => future.poll_unpin(cx),
+        };
+        match result {
             Poll::Ready(result) => {
                 self.finished = true;
                 let task_id = self._task_id;

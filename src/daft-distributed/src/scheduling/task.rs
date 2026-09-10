@@ -16,7 +16,7 @@ use crate::{
         MaterializedOutput, NodeID, PipelineNodeContext, PipelineNodeImpl, PlanFingerprint,
     },
     plan::{QueryIdx, TaskIDCounter},
-    scheduling::scheduler::SubmittableTask,
+    scheduling::scheduler::{SchedulerHandle, SubmittableTask, SubmittedTask},
     utils::channel::{UnboundedReceiver, UnboundedSender, create_unbounded_channel},
 };
 
@@ -61,6 +61,7 @@ pub(crate) struct TaskContext {
     /// Assigned by pipeline nodes: tasks with the same fingerprint have structurally
     /// identical plans and can share a single pipeline for execution.
     pub plan_fingerprint: PlanFingerprint,
+    pub reconstruction_of: Option<TaskID>,
 }
 
 impl TaskContext {
@@ -77,6 +78,7 @@ impl TaskContext {
             task_id,
             node_ids,
             plan_fingerprint,
+            reconstruction_of: None,
         }
     }
 }
@@ -96,6 +98,22 @@ impl From<(&PipelineNodeContext, TaskID)> for TaskContext {
 pub(crate) trait TaskPriority: PartialOrd + PartialEq + Ord + Eq + Copy + Clone {}
 
 pub(crate) trait Task: Send + Sync + Clone + Debug + 'static {
+    fn submit(
+        task: SubmittableTask<Self>,
+        scheduler: &SchedulerHandle<Self>,
+    ) -> common_error::DaftResult<SubmittedTask> {
+        task.submit_raw(scheduler)
+    }
+    fn prepare_dispatch(&mut self, _recovery: &super::shuffle_recovery::ShuffleRecovery) -> bool {
+        true
+    }
+    fn recovery_slot(
+        &self,
+        _recovery: &super::shuffle_recovery::ShuffleRecovery,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+        Ok(None)
+    }
+
     fn priority(&self) -> impl TaskPriority;
     fn task_context(&self) -> TaskContext;
     fn resource_request(&self) -> &TaskResourceRequest;
@@ -204,11 +222,13 @@ struct SwordfishTaskPriority {
     query_idx: QueryIdx,
     node_id: NodeID,
     task_id: TaskID,
+    recovery: u8,
 }
 
 impl PartialEq for SwordfishTaskPriority {
     fn eq(&self, other: &Self) -> bool {
-        self.task_id == other.task_id
+        self.recovery == other.recovery
+            && self.task_id == other.task_id
             && self.query_idx == other.query_idx
             && self.node_id == other.node_id
     }
@@ -226,11 +246,13 @@ impl Ord for SwordfishTaskPriority {
     fn cmp(&self, other: &Self) -> Ordering {
         // Rules for swordfish task priority:
         // 1. Query Idx: Lower query_idx, higher priority
-        // 2. Node ID:   Higher node_id, higher priority
-        // 3. Task ID:   Lower task_id, higher priority
+        // 2. Reconstruction, then recovering consumer, then ordinary tasks
+        // 3. Node ID:   Higher node_id, higher priority
+        // 4. Task ID:   Lower task_id, higher priority
         other
             .query_idx
             .cmp(&self.query_idx)
+            .then_with(|| self.recovery.cmp(&other.recovery))
             .then_with(|| self.node_id.cmp(&other.node_id))
             .then_with(|| other.task_id.cmp(&self.task_id))
     }
@@ -298,16 +320,33 @@ impl SwordfishTask {
     }
 
     /// A reconstruction is a new physical execution, not another completion of
-    /// the original producer. A new fingerprint also isolates failed pipelines.
+    /// the original producer. Worker generations isolate failed pipelines.
     pub(crate) fn recovery_attempt(&self, task_id: TaskID, producer: bool) -> Self {
         let mut task = self.clone();
         task.task_context.task_id = task_id;
-        task.task_context.plan_fingerprint =
-            hash_fingerprint(&[self.task_context.plan_fingerprint, task_id, u32::MAX]);
+        // Worker execution generations isolate failed state while keeping the
+        // logical fingerprint reusable by all consumers of this pipeline.
         if producer {
             // The original operator already completed. Reconstruction work has
             // task-level telemetry but does not reopen its logical lifecycle.
             task.task_context.node_ids.clear();
+            task.task_context.reconstruction_of = Some(
+                self.task_context
+                    .reconstruction_of
+                    .unwrap_or(self.task_context.task_id),
+            );
+            task.context
+                .insert("shuffle_reconstruction".into(), "true".into());
+        }
+        if producer {
+            task.context.insert(
+                "shuffle_reconstruction_of".into(),
+                task.task_context.reconstruction_of.unwrap().to_string(),
+            );
+            task.context.insert(
+                "shuffle_reconstruction_node".into(),
+                task.task_context.last_node_id.to_string(),
+            );
         }
         task.context.insert("task_id".into(), task_id.to_string());
         task.context.insert(
@@ -319,6 +358,10 @@ impl SwordfishTask {
             self.task_context.task_id.to_string(),
         );
         task
+    }
+
+    pub(crate) fn is_reconstruction(&self) -> bool {
+        self.context.contains_key("shuffle_reconstruction")
     }
 
     pub fn plan(&self) -> LocalPhysicalPlanRef {
@@ -347,12 +390,44 @@ impl SwordfishTask {
 }
 
 impl Task for SwordfishTask {
+    fn submit(
+        task: SubmittableTask<Self>,
+        scheduler: &SchedulerHandle<Self>,
+    ) -> common_error::DaftResult<SubmittedTask> {
+        super::shuffle_recovery::submit(task, scheduler)
+    }
+    fn prepare_dispatch(&mut self, recovery: &super::shuffle_recovery::ShuffleRecovery) -> bool {
+        if !recovery.has_updates() {
+            return true;
+        }
+        if let Some(bound) = recovery.bind(self) {
+            *self = bound;
+            true
+        } else {
+            false
+        }
+    }
+    fn recovery_slot(
+        &self,
+        recovery: &super::shuffle_recovery::ShuffleRecovery,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+        recovery.try_execution_slot(self)
+    }
+
     fn task_context(&self) -> TaskContext {
         self.task_context.clone()
     }
 
     fn task_name(&self) -> TaskName {
-        self.name().into()
+        if self.is_reconstruction() {
+            format!(
+                "Shuffle reconstruction of task {}: {}",
+                self.context["shuffle_reconstruction_of"],
+                self.name()
+            )
+        } else {
+            self.name()
+        }
     }
 
     fn resource_request(&self) -> &TaskResourceRequest {
@@ -368,6 +443,11 @@ impl Task for SwordfishTask {
             query_idx: self.task_context.query_idx,
             node_id: self.task_context.last_node_id,
             task_id: self.task_context.task_id,
+            recovery: if self.is_reconstruction() {
+                2
+            } else {
+                u8::from(self.context.contains_key("shuffle_recovery_of"))
+            },
         }
     }
 
@@ -655,6 +735,7 @@ impl SwordfishTaskBuilder {
 
         let task_id = task_id_counter.next();
         let task_context = TaskContext {
+            reconstruction_of: None,
             query_idx,
             last_node_id: *self
                 .pending_node_ids
@@ -1005,11 +1086,13 @@ pub(super) mod tests {
 
         // Test 1: Different query_idxs (lower query_idx should have higher priority)
         let task1 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 1,
         };
         let task2 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 2,
             node_id: 1,
             task_id: 1,
@@ -1018,11 +1101,13 @@ pub(super) mod tests {
 
         // Test 2: Same query_idx, different task_ids (higher task_id should have higher priority)
         let task1 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 2,
             task_id: 1,
         };
         let task2 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 1,
@@ -1031,11 +1116,13 @@ pub(super) mod tests {
 
         // Test 3: Same query_idx and node_id, different task_ids (lower task_id should have higher priority)
         let task1 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 1,
         };
         let task2 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 2,
@@ -1044,11 +1131,13 @@ pub(super) mod tests {
 
         // Test 4: Complex case with multiple differences
         let task1 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 2,
             task_id: 1,
         };
         let task2 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 2,
             node_id: 1,
             task_id: 1,
@@ -1057,11 +1146,13 @@ pub(super) mod tests {
 
         // Test 5: Equality
         let task1 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 1,
         };
         let task2 = SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 1,
@@ -1079,21 +1170,25 @@ pub(super) mod tests {
 
         // Add tasks in random order - ensuring unique task_ids within each stage
         heap.push(SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 2,
             node_id: 1,
             task_id: 1,
         });
         heap.push(SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 2,
             task_id: 3,
         });
         heap.push(SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 2,
         });
         heap.push(SwordfishTaskPriority {
+            recovery: 0,
             query_idx: 1,
             node_id: 1,
             task_id: 1,
@@ -1109,6 +1204,7 @@ pub(super) mod tests {
         assert_eq!(
             heap.pop().unwrap(),
             SwordfishTaskPriority {
+                recovery: 0,
                 query_idx: 1,
                 node_id: 2,
                 task_id: 3
@@ -1117,6 +1213,7 @@ pub(super) mod tests {
         assert_eq!(
             heap.pop().unwrap(),
             SwordfishTaskPriority {
+                recovery: 0,
                 query_idx: 1,
                 node_id: 1,
                 task_id: 1
@@ -1125,6 +1222,7 @@ pub(super) mod tests {
         assert_eq!(
             heap.pop().unwrap(),
             SwordfishTaskPriority {
+                recovery: 0,
                 query_idx: 1,
                 node_id: 1,
                 task_id: 2
@@ -1133,6 +1231,7 @@ pub(super) mod tests {
         assert_eq!(
             heap.pop().unwrap(),
             SwordfishTaskPriority {
+                recovery: 0,
                 query_idx: 2,
                 node_id: 1,
                 task_id: 1

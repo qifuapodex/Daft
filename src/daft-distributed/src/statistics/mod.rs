@@ -169,9 +169,7 @@ impl StatisticsManager {
         let mut node_ids = Vec::new();
         for node_id in &context.node_ids {
             if let Some(manager) = self.runtime_node_managers.get(node_id) {
-                if manager.on_task_submitted() {
-                    self.dispatch_operator_start(manager.node_info());
-                }
+                manager.reserve_task_completion();
                 node_ids.push(*node_id);
             }
         }

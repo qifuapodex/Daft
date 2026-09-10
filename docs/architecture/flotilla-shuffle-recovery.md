@@ -1,271 +1,211 @@
 # Flotilla shared shuffle recovery
 
-Status: initial implementation; validation results below. This is a restricted
-reconstruction path, not general stage rollback or full coverage of A5-012.
-
-## 设计摘要
-
-借鉴 Spark 的职责划分：读取层报告带身份的 FetchFailure，调度层保留生产任务，
-输出目录维护逻辑 Map 到当前物理 attempt 的映射。文件丢失后，只重建对应 Map，
-再用新引用重新执行失败的消费者。同一个 Map 的并发失败合并为一次重建。
-
-首版只允许能够证明分区内容等价的生产任务，以及可安全重新执行的消费者。
-不确定性任务需要完整 stage/下游回滚；目前缺少这样的提交与回滚协议，因此明确
-拒绝自动重建这类生产任务。不会仅凭固定随机种子或 hash 分区器就认定整个任务可重放。
-
-实现放在 Flotilla 中。无需修改 Ray 项目或旧 Ray runner；共享 Rust 读取、异常转换
-和本地执行器需要配合，才能把文件身份和失败状态完整传回 Flotilla。正常执行保留
-pipeline 复用，不新增逐文件元数据 RPC、不扫描目录、不预先排序全部数据。
+Status: opt-in, restricted map reconstruction. This is not full coverage of A5-012
+or general stage rollback. In particular, **`read_parquet → repartition` is not
+covered**: retaining an external scan task does not guarantee an input snapshot.
 
 ## Problem and scope
 
-A successful map task publishes an immutable, attempt-specific shared shuffle file.
-If the file subsequently disappears, retrying a consumer with its original input
-references cannot restore it. Flotilla needs to invalidate the physical output,
-reconstruct its producer, and bind consumers to the replacement output.
+An attempt-specific shared shuffle file can disappear after its map succeeds.
+Retrying a reduce task with the same references cannot restore it. Flotilla retains
+eligible producer recipes, reconstructs unavailable maps, and resolves consumers to
+the selected replacement immediately before dispatch.
 
-This design applies to Flotilla and its Ray worker adapter. It does not modify Ray
-itself or introduce recovery in the legacy Ray runner. Shared error and reader code
-must continue to fail normally when used without the Flotilla recovery coordinator.
-Worker loss alone does not invalidate shared storage.
+The recovery coordinator belongs to Flotilla. Ray itself and the legacy Ray runner
+need no changes. Shared Rust readers, exception conversion, and the local executor
+preserve structured errors and isolate failed pipeline state. Worker loss alone
+does not invalidate shared storage.
 
 ## Spark comparison
 
-The reference baseline is Apache Spark v4.0.1, with the development branch consulted
-for subsequent work on nondeterministic output and query-level rollback.
+The reference is Apache Spark v4.0.1:
 
-* [FetchFailed](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/TaskEndReason.scala)
-  separates unavailable shuffle output from ordinary task failure.
 * [DAGScheduler](https://github.com/apache/spark/blob/v4.0.1/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala)
-  invalidates output registrations and resubmits missing work, consolidates failures,
-  and rejects stale attempts. Indeterminate output can require complete producer and
-  descendant recomputation; a result stage that cannot be rolled back aborts.
+  distinguishes fetch failures from ordinary task failures, consolidates missing
+  producer work, and rejects obsolete attempt reports. Indeterminate output may
+  require producer and descendant rollback.
 * [MapOutputTracker](https://github.com/apache/spark/blob/v4.0.1/core/src/main/scala/org/apache/spark/MapOutputTracker.scala)
-  separates logical partitions from current physical output and invalidates metadata
-  caches using an epoch.
+  separates logical map identities from physical locations; executor caches use an
+  epoch to observe changed output registrations.
 * [RDD determinism](https://github.com/apache/spark/blob/v4.0.1/core/src/main/scala/org/apache/spark/rdd/RDD.scala)
-  distinguishes equal ordered output, equal unordered output, and indeterminate output.
-* [ShuffleExchangeExec](https://github.com/apache/spark/blob/v4.0.1/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleExchangeExec.scala)
-  can sort before round-robin partitioning to stabilize partition membership.
+  distinguishes equal ordered output, equal unordered output, and indeterminate
+  output. Producer replay equivalence and consumer restart safety differ.
 
-Flotilla adopts these responsibilities, not Spark's service topology. Initially,
-the coordinator binds an immutable output snapshot before submitting a task; workers
-do not need an additional metadata RPC service. The reader never switches to another
-map attempt after emitting part of a stream.
+Flotilla adopts those responsibilities using its existing coordinator and dispatch
+boundary. It does not add a per-file metadata RPC. Binding at submission is too
+early: an entire reduce stage can already be queued when a map is reconstructed.
+A worker-side epoch service remains an extension if worker-side queueing becomes a
+measured bottleneck. Tasks already dispatched before reconstruction can still fail
+and restart; queued coordinator tasks observe the replacement on first execution.
 
 ## Correctness contract
 
-1. Each consumer execution reads one immutable selected attempt per logical map.
-2. A missing-output report only invalidates the physical attempt it names. A late
-   report for a replaced attempt cannot invalidate the replacement.
-3. Concurrent failures for the same output share a reconstruction. Different
-   outputs have bounded reconstruction concurrency and independent budgets.
-4. A consumer that already consumed batches restarts from the beginning with fresh
-   operator state. Its failed execution contributes no committed task result.
-5. Partial recovery is allowed only when producer partition contents are replay
-   equivalent and the failed consumer can execute again without external effects.
-6. A completed producer is not emitted a second time through the original map result
-   stream. Replacement publication changes the output directory, not stream cardinality.
-7. Cancellation and exhausted recovery budgets terminate recovery. References and
-   replay descriptors are owned by the plan run and released before shuffle cleanup.
+1. One consumer execution reads one immutable selected attempt per logical map.
+   Readers never switch map attempts after emitting part of a stream.
+2. A late report for an old attempt cannot invalidate a replacement.
+3. Concurrent reports for a map share one reconstruction owner and completion budget.
+4. A failed consumer commits no task result and restarts with fresh operator state.
+   A fetch can fail after earlier maps emitted batches or expressions ran; this is
+   why external side effects remain excluded despite ordinary worker-loss retries.
+5. Reconstructed producers must preserve partition contents. Consumers need safe
+   restart semantics, not the producer's stronger replay-equivalence allowlist.
+6. Replacement publication updates the directory; it never re-emits a producer's
+   original result or notification token.
+7. Cancellation releases ownership and stops new submissions/publication. All
+   retained state belongs to the plan and is dropped before normal shuffle cleanup.
 
-Replay equivalence concerns the full producer plan and inputs, not just its hash
-partitioner. A fixed random seed is insufficient when row order or batching changes.
-An expression's determinism flag alone is not a guarantee of side-effect freedom.
+## Eligibility
 
-## Initial supported subset
+Eligible producers are shared hash/range repartition writes over retained in-memory
+partitions or retained Flight shuffle inputs, with pure projections/filters and
+batching. Range boundaries are retained, not sampled again. Primitive and nested
+List/FixedSizeList/Struct/Map schemas are supported. Expressions include primitive
+operators and an audited subset of synchronous deterministic numeric/string builtins.
+Arbitrary functions are not assumed side-effect-free merely because they are builtins.
 
-The initial implementation uses a conservative allowlist of replayable local plans
-and expressions. Shared hash/range repartition writes over retained stable inputs
-and pure row transformations can be replayed. The same checks apply to consumers;
-arbitrary UDFs, external writes, sampling, order-sensitive selection, and unknown
-operators must not be automatically replayed. Range boundaries must be retained,
-not sampled again during recovery. External scan inputs, if admitted, require an
-explicit stability contract; retaining a path alone does not create a snapshot.
+External scans/globs, Python/UDF expressions, random repartition, sampling, joins,
+aggregates, sort/limit, and external writes remain ineligible **as producers**.
+Indeterminate producers require a future stage/descendant commit and rollback protocol.
 
-Unproven/indeterminate producers report an actionable unsupported recovery error.
-Unsupported consumers propagate the fetch error without replay. Neither enters an
-output-reconstruction loop. No full result buffering, global
-commit barrier, or general nondeterministic stage rollback is included initially.
-This restriction is a deliberate first implementation boundary, not full coverage
-of A5-012. Allowlist additions require evidence and tests of replay semantics.
+Consumers additionally admit limit, sort/top-N, joins, explode, gather/partitioning,
+concatenation, and selected builtin aggregates when their expressions are safe.
+Unknown functions, UDFs and external writes remain excluded. All submissions bind
+at dispatch regardless of consumer retry eligibility, including direct submissions
+from sort, into-partitions and as-of join. Unsupported consumers propagate failures;
+missing unretained producers return an explicit unsupported-recovery error.
 
-## Components
+## Structured errors and fallback
 
-### Structured shuffle failure
+`ShuffleFetchFailure` identifies shuffle, physical input, attempt, reduce partition,
+and diagnostic path. Only a shared map open returning `NotFound` creates it.
+Permission/configuration errors and transient transport errors stay distinct.
+The payload survives local pipeline broadcasts, Flight status details and Python/Ray
+serialization; classification does not parse error strings.
 
-A shared error payload identifies `shuffle_id`, physical `input_id`, map `attempt`,
-`partition_idx`, and diagnostic path/message. The exception type identifies the
-missing-output category; only `File::open` returning `NotFound` creates it. Missing output is
-distinct from permission/configuration failure and transient transport/access failure.
-Integrity failures can use the same protocol but are not automatically considered
-transient. Recovery classification must not use error-string/path parsing.
+If the alternate route fails transiently, preserve that transient error for ordinary
+scheduler retries. Otherwise retain the original missing-output identity when the
+fallback has no structured fetch identity of its own.
 
-The payload survives Arrow Flight conversion and Python/Ray serialization. A Python
-exception carries structured fields and is pickle-safe; the driver reconstructs the
-payload by exception type and attributes. RPC status details must preserve the same
-identity if the RPC path reports the failure. Route fallback must not discard the
-original missing-output identity when the fallback also fails.
+## Output directory, retention and binding
 
-### Replay descriptors and output directory
+A recipe retains the producer task, configuration and input partition references.
+Original and replacement physical identities resolve to the same logical producer.
+Registration occurs only after successful output validation. Invalid bookkeeping or
+an exhausted retention cap logs a warning and skips the recipe; a successful map
+still succeeds normally.
 
-Each recoverable producer retains its local plan, input descriptors/partition refs,
-configuration, and original logical identity. Physical output is recorded only after
-successful task completion. Combined map files need one directory entry per map,
-not one entry per map/reduce pair. Retained inputs remain live until the plan ends;
-this can extend object lifetime and is part of the cost of enabling recovery.
+Recovery is disabled by default. Enabling it extends input/ObjectRef lifetimes until
+plan completion. Retention has separate map-count and estimated-input-byte caps.
+The byte charge conservatively sums retained partition sizes and Flight map descriptors;
+shared inputs may be counted repeatedly. It is not an exact coordinator heap limit:
+plans, hash tables, aliases and binding-cache overhead are additional, with map count
+and attempt limits bounding recipe/alias counts. No eviction invalidates an existing
+recipe; new recipes are skipped when a cap is reached.
 
-The directory resolves original references and references from replacement attempts
-to the same logical producer. Its selected output includes physical input identity,
-attempt, and server address. A replacement can therefore run as a new physical task
-without changing the logical dependency. New attempts preserve file-name isolation.
+The directory caches rebinding by `(shuffle_id, original Arc address)` for the current
+directory version. Holding the original Arc prevents address reuse. All reducers
+sharing an original list also share one replacement `Arc<BTreeMap>`. Unchanged lists
+reuse their original Arc. Binding acquires the directory lock once, rather than once
+per map; a cache hit does not scan the map list.
 
-### Recovery coordinator
+A reconstruction marks its failed output as being repaired before scheduling work.
+Dispatch defers consumers referencing that output until replacement publication.
+This also covers the interval between physical task completion and the recovery
+owner processing its result. Blocked binding results are cached. Publication and
+ownership release clear the cache, including on cancellation or failure.
 
-The coordinator sits above resource scheduling. It submits reconstruction tasks
-through the existing scheduler, so it never blocks the scheduler event loop waiting
-for work that only that loop can dispatch. Per-output synchronization consolidates
-reports; a bounded global semaphore limits concurrent reconstructions. Dependency
-recovery is bounded and rejects cycles. Recursive recovery uses the same protocol
-and terminates at retained inputs or an unsupported producer.
+## Scheduling, budgets and cancellation
 
-The implemented coordinator supports recursive recovery of retained shuffle inputs.
-`DAFT_SHUFFLE_RECOVERY_MAX_ATTEMPTS` defaults to 2 per logical map; 0 disables
-reconstruction. Additional bounds are 4 simultaneous producer executions per plan,
-64 further fetch failures per consumer execution loop, dependency depth 16, and a
-120-second deadline starting at the first fetch failure. Waiting for a repair lock
-or execution slot counts toward that deadline. Ordinary execution has no new timeout.
-Cancellation releases reconstruction ownership; an interrupted attempt consumes budget.
+Reconstruction runs through the existing resource scheduler without blocking its
+event loop. Within a query, reconstruction tasks outrank recovering consumers, which
+outrank ordinary tasks; existing node/task ordering breaks ties. Earlier queries
+retain their priority. Tasks awaiting a dependency or execution permit are deferred.
+A reconstruction permit is acquired only at actual dispatch and released with the
+physical result, before recursive dependency recovery. Queueing holds no permit.
 
-An output follows this state machine:
+There is **no recovery deadline on producer or consumer queueing/execution**. An
+optional timeout applies only while waiting for another reconstruction owner; it is
+also disabled by default. Query cancellation remains the mechanism for stopping
+long-running physical work. Ownership wait timeout and dropped unfinished recovery
+futures do not consume a completed-attempt budget. Completed infrastructure failures
+consume budget, but transient errors do not mark a producer permanently terminal.
+Ordinary dispatcher transient/worker-loss retries still run first.
 
-```text
-Available(selected attempt)
-  -> reconstructing(selected attempt, retry budget)
-  -> Available(replacement attempt)
-  or TerminalFailure(reason)
+Configuration uses `DaftExecutionConfig` and `daft.set_execution_config`:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `flight_shuffle_recovery_max_attempts` | 0 | Completed reconstruction attempts per map; 0 disables recovery/retention |
+| `flight_shuffle_recovery_max_inflight` | 4 | Concurrent physical reconstruction executions |
+| `flight_shuffle_recovery_max_consumer_failures` | 64 | Fetch recovery rounds per logical consumer |
+| `flight_shuffle_recovery_max_depth` | 16 | Maximum reconstruction dependency chain |
+| `flight_shuffle_recovery_wait_timeout_ms` | 0 | Ownership wait timeout; 0 disables it |
+| `flight_shuffle_recovery_max_retained_maps` | 10000 | Retained producer recipes per plan |
+| `flight_shuffle_recovery_max_retained_bytes` | 268435456 | Estimated retained input bytes per plan |
+
+```python
+daft.set_execution_config(flight_shuffle_recovery_max_attempts=2)
 ```
 
-After acquiring reconstruction ownership, recheck the selected attempt: another
-consumer may already have repaired it. Publish only a complete, validated task result.
-Transient retries within reconstruction retain the existing scheduler policy; output
-recovery has its own finite budget so many consumers cannot multiply it indefinitely.
+Dependency traversal rejects cycles and excessive depth. All aliases share the
+producer's attempt budget. Successful replacement selection is atomic under the
+directory lock. Partial/failed reconstruction outputs are never published.
 
-### Consumer submission and lifecycle
+## Worker generations and lifecycle
 
-Before each execution, resolve shuffle dependencies to the selected immutable output
-snapshot. On a typed failure, check consumer replay eligibility, reconstruct the
-producer, rebind, and resubmit. Original pipeline notification tokens must complete
-exactly once, after final success/failure/cancellation, not after the failed execution.
+The release branch's general `DaftError::Shared` broadcast reaches every unfinished
+and queued pipeline input. A shared failure cell publishes the same error before
+closing enqueue; an input rejected during closure retains that identity and still
+runs `try_finish`.
 
-Binding the first execution does not require consumer retry eligibility. A consumer
-outside the retry allowlist still uses a replacement that another task has already
-published. Ordinary tasks and node-local shuffles bypass replay analysis and the
-logical-completion guard entirely.
+Each `PlanState` has an execution generation distinct from its logical fingerprint.
+A new task replaces a dead cached plan immediately. Unfinished receivers retain the
+old generation, and `try_finish(fingerprint, input_id, generation)` can only remove
+that execution. A late old finisher cannot remove the replacement. Retired states
+are released by finishing inputs or plan cancellation. The statistics manager closes
+its request channel before the final drain, preventing late snapshot requests from
+blocking failed-input finalization. Retries preserve the logical
+fingerprint so healthy same-plan tasks can reuse pipelines.
 
-Physical execution attempts and logical pipeline completion are distinct. Recovery
-must not prematurely end an operator, double-decrement running-task counters, or
-re-emit a completed producer's original completion token. Reconstructed producers
-must have distinguishable task execution identities. Recovery events/logs should
-include the logical producer, failed/replacement attempts, consumer, and budget.
+Original notifications complete once after the logical submission finishes. Physical
+attempts use child cancellation tokens and new task IDs. A completion reservation
+keeps consumer operators alive between attempts without firing `OperatorStart` before
+the scheduler's Submitted event. Reconstruction task events identify the original
+producer and node without reopening completed operators. Ordinary submissions store
+an inline oneshot receiver; only recovery futures require a Box allocation.
 
-The implementation holds original notification tokens on a logical submission future.
-Physical attempts use child cancellation tokens and new task IDs/fingerprints.
-A statistics completion guard keeps consumer operators alive between attempts;
-reconstructed producers emit task events without reopening completed operator nodes.
+Remote cancellation and directory deletion follow the existing Ray protocol. This
+design does not add a distributed fence against an already-running worker completing
+a write after cancellation; stronger cleanup barriers are a separate extension.
 
-### Shared local pipeline failure
+## Validation
 
-Several tasks can share a local pipeline. Recovery depends on every unfinished or
-queued input receiving the pipeline error before it can commit successful metadata.
-The release branch provides this through `finish_input_streams` and
-`DaftError::Shared(Arc<DaftError>)` (#4). This change reuses that mechanism and unwraps
-`Shared` when classifying or serializing shuffle failures; no shuffle-specific failure
-cell is added. Each input retains its error independently of cached-plan lifetime.
-The pipeline also publishes this same error Arc in a `OnceLock` before closing its
-enqueue channel. Inputs rejected during closure receive a failed result handle with
-that original error, so they preserve recovery classification and still execute
-`try_finish`. Failed cached plans remain registered until all tracked inputs finish;
-late finishers cannot remove a new pipeline instance using the same fingerprint.
-New recovery executions use fresh fingerprints so failed local operator state is not
-reused. Normal executions continue to share pipelines.
+Regression coverage includes exact row multisets across concurrent consumers,
+all durability modes, stale reports, repeated deletion and budget exhaustion,
+cancellation/notifications, recursive dependencies, unsupported producers and
+recovery disabled. Additional review regressions cover:
 
-### Cleanup and cancellation
+* 128 consumers queued with stale references, with consumer retries disabled,
+  followed by prioritized repair and first-dispatch replacement binding.
+* Reconstruction queueing longer than the configured ownership timeout, and a
+  separate ownership timeout that leaves the producer budget usable.
+* 8,000 bindings of a shared 10,000-map list retaining one replacement Arc.
+* Retention caps preserving successful map execution.
+* Replacement pipeline generation created before the old receiver finishes.
+* Transient fallback classification, configuration serialization, and rejection of
+  snapshot requests after the statistics manager's final drain.
 
-The plan owns replay state and recovery futures. Dropping/cancelling the plan stops
-submission and cancels outstanding reconstruction attempts before normal cleanup.
-Old files may remain until plan cleanup; deletion during active recovery is avoided.
-No worker failure handler should delete still-valid shared files.
+End-to-end tests inject deletion in the Flotilla scheduler actor after real Ray
+workers publish output, across `auto/rpc/shared` and `none/background/sync`.
+These are single-node tests. No multi-node storage-failure validation or large-scale
+throughput/heap benchmark is claimed. Extending scan recovery requires snapshot
+validation; indeterminate output requires stage/descendant rollback.
 
-Cancellation here guarantees that the coordinator stops submitting and publishing
-replacement references. Remote task cancellation and directory deletion use the existing
-Ray cleanup protocol; this change does not introduce a distributed fence against a
-worker finishing a write after cancellation. The cancellation test covers a coordinator
-waiting for reconstruction capacity, not an interrupted remote write. A stronger
-worker-completion/cleanup barrier remains a separate extension.
-
-## Extension points
-
-* Add explicit stage dependency and attempt state for indeterminate rollback; invalidate
-  affected descendants and refuse rollback across externally committed results.
-* Add source snapshot/version validation and additional verified pure operators.
-* Add worker metadata caching by output-directory version if submission payloads become
-  a measured bottleneck. Do not add a per-file coordinator round trip.
-* Consider deterministic repartition separately. Sorting every map input changes normal
-  execution cost; runtime checksums alone are not a general proof of semantic equality.
-* Add reconstruction checkpoints or replicas for expensive/non-replayable producers.
-
-The current allowlist admits scalar primitive schemas, retained partition references
-and Flight shuffle inputs, scans of those retained inputs, projections/filters of pure
-scalar expressions, batching, and shared hash/range writes with retained boundaries.
-Consumers additionally admit selected builtin aggregates (count, distinct count, sum,
-min/max, mean, boolean and/or). Aggregates are excluded from replayable producers.
-External scan tasks/globs, Python/complex schemas, functions/UDFs, random repartition,
-sampling, sort/limit, joins, and external writes are outside the initial allowlist.
-Specialized submission paths such as sort and into-partitions are not recovery-enabled.
-Supporting those paths requires a separate semantic and lifecycle review.
-
-## Validation and acceptance
-
-Tests must cover payload preservation through local Flight and Python/Ray, missing
-files after publication, simultaneous failures for one map, stale reports after
-replacement, fresh consumer state after partial reads, budgets, cancellation, and
-unsupported replay plans. Check row multisets with unique IDs against an independent
-oracle, not only row counts. Check original map output is not emitted twice.
-
-Use dedicated temporary directories for fault injection. Rust state-machine tests
-provide deterministic scheduling coverage; an end-to-end Flotilla/Ray test must prove
-actual reconstruction and reference replacement. Run the relevant existing shuffle,
-scheduler, lifecycle, and cleanup regressions. Test sync/background/none publication
-without confusing normal visibility with persistence under storage failure.
-
-Validation after rebasing onto release #4 and self-review fixes (2026-09-10):
-
-* Distributed Rust suite: 99 passed, 1 existing ignored test. New tests cover exact
-  row multisets across concurrent consumers and two maps, all durability modes, stale
-  reports, repeated deletion/budget exhaustion, cancellation while waiting for capacity,
-  exactly-once completion notification, recursive dependency reconstruction, and rejection
-  of random repartition, disabled recovery, and first-execution binding for consumers
-  outside the retry allowlist.
-* Shuffle Rust suite: 43 passed, 3 existing ignored tests, including typed Flight
-  status/header round trips and rejection of ordinary NotFound/permission errors.
-* Common-error Rust suite: 2 passed. The local execution regression for finished,
-  partial, queued and rejected inputs passed.
-* Flotilla/Ray: 87 tests passed across the complete shuffle suite, generator retry,
-  transient errors and exception serialization. This includes 18 shared-shuffle
-  tests and 9 actual
-  deletion/reconstruction tests (`auto/rpc/shared` ×
-  `none/background/sync`). The hook runs inside the scheduler actor after real worker
-  publication, deletes the referenced file, and checks exact rows and exactly one fresh
-  replacement output. A local monkeypatch alone would not reach this actor.
-  Existing placement, durability, normal/failure cleanup, and node-local routing
-  regressions also passed.
-* Python exception pickle and Ray exception serialization round trip passed, including
-  maximum-width unsigned identities.
-* `make build` passed with the repository-supported `DAFT_DASHBOARD_SKIP_BUILD=1`;
-  dashboard frontend assets are unrelated and were not built.
-
-These are single-node tests using temporary directories and real local Ray workers.
-They do not validate multi-node mount failures, worker power loss, storage corruption,
-or recovery of external scans. Retained lineage can extend input memory/object-store
-lifetimes until plan completion; no large-scale memory or throughput benchmark is claimed.
+Final review validation (2026-09-10): 246 Rust tests passed across distributed
+(105), local execution (95), shuffle (44), and common error (2), with four existing
+unit-test ignores and one ignored doctest. Python/Ray validation covered 97 passing
+cases across shuffle, generator retry, transient error, exception serialization and
+configuration tests; the nine nested cases passed after correcting the injection
+test's assumptions about physical map count. The repeated-deletion regression also
+passed 100 isolated runs after the statistics shutdown fix. `make build` passed with
+`DAFT_DASHBOARD_SKIP_BUILD=1`; Rust formatting and scoped Python lint checks passed.

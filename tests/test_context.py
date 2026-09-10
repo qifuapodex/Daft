@@ -381,3 +381,29 @@ def test_min_cpu_per_task_is_deprecated():
     with pytest.warns(DeprecationWarning, match="min_cpu_per_task"):
         with daft.execution_config_ctx(min_cpu_per_task=0.1):
             assert daft.context.get_context().daft_execution_config.min_cpu_per_task == 0.1
+
+
+def test_shuffle_recovery_configuration_roundtrip():
+    import pickle
+
+    from daft.daft import PyDaftExecutionConfig
+
+    config = PyDaftExecutionConfig()
+    assert config.flight_shuffle_recovery_max_attempts == 0
+    assert config.flight_shuffle_recovery_wait_timeout_ms == 0
+    options = {
+        "flight_shuffle_recovery_max_attempts": 2,
+        "flight_shuffle_recovery_max_inflight": 3,
+        "flight_shuffle_recovery_max_consumer_failures": 7,
+        "flight_shuffle_recovery_max_depth": 8,
+        "flight_shuffle_recovery_wait_timeout_ms": 50,
+        "flight_shuffle_recovery_max_retained_maps": 100,
+        "flight_shuffle_recovery_max_retained_bytes": 4096,
+    }
+    configured = config.with_config_values(**options)
+    restored = pickle.loads(pickle.dumps(configured))
+    for key, value in options.items():
+        assert getattr(restored, key) == value
+    for key in options.keys() - {"flight_shuffle_recovery_max_attempts", "flight_shuffle_recovery_wait_timeout_ms"}:
+        with pytest.raises(ValueError, match="must be positive"):
+            config.with_config_values(**{key: 0})

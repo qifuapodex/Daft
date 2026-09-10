@@ -201,6 +201,23 @@ impl<T: Task> ScheduledTask<T> {
         }
     }
 
+    pub fn prepare_dispatch(
+        &mut self,
+        recovery: &super::shuffle_recovery::ShuffleRecovery,
+    ) -> bool {
+        self.task.prepare_dispatch(recovery)
+    }
+    pub fn defer(self) -> PendingTask<T> {
+        PendingTask {
+            task: self.task,
+            result_tx: self.result_tx,
+            cancel_token: self.cancel_token,
+            attempts: self.attempts,
+            not_before: None,
+            avoid_worker: None,
+        }
+    }
+
     pub fn worker_id(&self) -> WorkerId {
         self.worker_id.clone()
     }

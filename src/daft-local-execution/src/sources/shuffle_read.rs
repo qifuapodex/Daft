@@ -475,7 +475,8 @@ fn rpc_stream_with_shared_fallback(
 // A failed alternate route must not erase the map identity needed by the
 // coordinator. Prefer the alternate route's identity when it has one.
 fn preserve_fetch_failure(original: &DaftError, fallback: DaftError) -> DaftError {
-    if fallback.shuffle_fetch_failure().is_none()
+    if !fallback.is_transient()
+        && fallback.shuffle_fetch_failure().is_none()
         && let Some(failure) = original.shuffle_fetch_failure()
     {
         DaftError::ShuffleFetchFailure(Box::new(failure))
@@ -571,6 +572,28 @@ mod tests {
 
     fn dummy_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("ints", DataType::UInt8)]))
+    }
+
+    #[test]
+    fn transient_fallback_keeps_transport_retry_classification() {
+        let original =
+            DaftError::ShuffleFetchFailure(Box::new(common_error::ShuffleFetchFailure {
+                shuffle_id: 1,
+                input_id: 2,
+                attempt: 3,
+                partition_idx: 0,
+                path: "missing.arrow".into(),
+                message: "missing".into(),
+            }));
+        let transient = DaftError::SocketError("connection reset".into());
+        let error = preserve_fetch_failure(&original, transient);
+        assert!(error.is_transient());
+        assert!(error.shuffle_fetch_failure().is_none());
+        let error = preserve_fetch_failure(
+            &original,
+            DaftError::InternalError("fallback failed".into()),
+        );
+        assert_eq!(error.shuffle_fetch_failure().unwrap().input_id, 2);
     }
 
     #[test]

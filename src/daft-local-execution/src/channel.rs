@@ -11,7 +11,6 @@ impl<T> Sender<T> {
         self.0.send(val).await
     }
 
-    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.0.is_closed()
     }
