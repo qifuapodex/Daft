@@ -49,6 +49,10 @@ impl From<Error> for DaftError {
     fn from(value: Error) -> Self {
         match value {
             Error::DaftCoreCompute { source } => source,
+            // Keep Python exception types available to the task retry classifier.
+            // External errors become a generic DaftCoreException at the Python boundary.
+            #[cfg(feature = "python")]
+            Error::PyIO { source } => Self::PyO3Error(source),
             _ => Self::External(value.into()),
         }
     }

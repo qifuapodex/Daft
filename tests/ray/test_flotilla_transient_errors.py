@@ -134,6 +134,31 @@ def test_get_result_lets_transient_errors_through():
         asyncio.run(handle._get_result())
 
 
+def test_get_result_does_not_commit_partitions_when_final_metadata_fails():
+    """Already-emitted Ray objects must not become a successful partial result."""
+    error = _wrap_like_ray(SocketError("failure after output"))
+
+    class _FailedMetadata:
+        def __await__(self):
+            async def fail():
+                raise error
+
+            return fail().__await__()
+
+    class _PartiallyEmittedHandle:
+        async def completed(self):
+            pass
+
+        def __iter__(self):
+            yield object()  # A partition reference emitted before the error.
+            yield _FailedMetadata()
+
+    handle = RaySwordfishTaskHandle(result_handle=_PartiallyEmittedHandle())
+    with pytest.raises(SocketError) as raised:
+        asyncio.run(handle._get_result())
+    assert raised.value is error
+
+
 def test_actor_death_is_not_classified_as_transient():
     """Worker loss goes down the `worker_died` path, not the transient-retry path.
 

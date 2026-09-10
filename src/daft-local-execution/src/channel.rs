@@ -18,6 +18,10 @@ impl<T> Sender<T> {
 
 pub(crate) struct Receiver<T>(tokio::sync::mpsc::Receiver<T>);
 impl<T> Receiver<T> {
+    pub(crate) fn close(&mut self) {
+        self.0.close();
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<T> {
         self.0.recv().await
     }
