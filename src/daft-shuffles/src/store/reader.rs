@@ -13,6 +13,7 @@
 //! reported as an error rather than decoded into plausible-looking rows.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::SeekFrom,
     sync::{Arc, LazyLock, Mutex},
@@ -197,12 +198,28 @@ pub(super) async fn read_index_region(
     Ok((probe, num_partitions))
 }
 
-/// Stream the raw IPC messages of one output partition out of one map file,
-/// verifying the range against the index before the stream ends.
+/// Keep the common single-bucket request inline: an ordinary shuffle can have
+/// millions of (map, bucket) reads, so even a one-element Vec per read is costly.
+enum PartitionIndices {
+    Single(u32),
+    Multiple(Vec<u32>),
+}
+
+impl PartitionIndices {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Single(index) => std::slice::from_ref(index),
+            Self::Multiple(indices) => indices,
+        }
+    }
+}
+
+/// Stream the raw IPC messages of the requested partitions out of one map file,
+/// verifying each range against the index before the stream ends.
 fn read_one_map_file(
     shuffle_id: u64,
     path: String,
-    partition_indices: Vec<u32>,
+    partition_indices: PartitionIndices,
     stats: Arc<ReadStats>,
 ) -> BoxStream<'static, DaftResult<FlightData>> {
     Box::pin(async_stream::try_stream! {
@@ -253,8 +270,15 @@ fn read_one_map_file(
             }
         };
         add(&stats.index_us, elapsed_us(started));
-        let entries = partition_indices.iter().map(|&idx| index::partition_entry(&region, idx as usize, &path))
-            .collect::<DaftResult<Vec<_>>>()?;
+        let partition_indices = partition_indices.as_slice();
+        let first_idx = partition_indices.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
+        let first_entry = index::partition_entry(&region, *first_idx as usize, &path)?;
+        let entries: Cow<'_, [index::PartitionEntry]> = if partition_indices.len() == 1 {
+            Cow::Borrowed(std::slice::from_ref(&first_entry))
+        } else {
+            Cow::Owned(partition_indices.iter().map(|&idx| index::partition_entry(&region, idx as usize, &path))
+                .collect::<DaftResult<Vec<_>>>()?)
+        };
         if entries.iter().all(|entry| entry.is_empty()) {
             add(&stats.empty_ranges, entries.len() as u64);
             add(&stats.completed_files, 1);
@@ -267,10 +291,10 @@ fn read_one_map_file(
         // and verifies exactly its original partition's bytes.
         let capacity = if entries.len() > 1 {
             entries.last().unwrap().end.saturating_sub(first.start).min(1024 * 1024).max(1) as usize
-        } else { 1 };
+        } else { 0 }; // Zero-capacity BufReader bypasses buffering without allocating.
         let mut file = BufReader::with_capacity(capacity, file);
         let mut position = first.start;
-        for (&partition_idx, entry) in partition_indices.iter().zip(&entries) {
+        for (&partition_idx, entry) in partition_indices.iter().zip(entries.iter()) {
             if entry.is_empty() {
                 add(&stats.empty_ranges, 1);
                 continue;
@@ -323,13 +347,12 @@ pub fn read_partition_stream(
     schema: SchemaRef,
     concurrency: usize,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
-    read_map_ranges_stream(
+    read_ranges_stream(
         shared_root,
         shuffle_id,
         inputs
             .iter()
-            .map(|&input| (input, vec![partition_idx]))
-            .collect(),
+            .map(|&input| (input, PartitionIndices::Single(partition_idx))),
         schema,
         concurrency,
     )
@@ -353,12 +376,29 @@ pub fn read_map_ranges_stream(
             ));
         }
     }
-    let mut stats = ReadStats::default();
-    stats.shuffle_id = shuffle_id;
-    stats.map_files = inputs.len();
-    stats.coalesced = inputs.iter().any(|(_, indices)| indices.len() > 1);
-    stats.started = Some(Instant::now());
-    let stats = Arc::new(stats);
+    read_ranges_stream(
+        shared_root,
+        shuffle_id,
+        inputs.into_iter().map(|(input, indices)| {
+            let indices = if indices.len() == 1 {
+                PartitionIndices::Single(indices[0])
+            } else {
+                PartitionIndices::Multiple(indices)
+            };
+            (input, indices)
+        }),
+        schema,
+        concurrency,
+    )
+}
+
+fn read_ranges_stream(
+    shared_root: &str,
+    shuffle_id: u64,
+    inputs: impl IntoIterator<Item = (MapInput, PartitionIndices)>,
+    schema: SchemaRef,
+    concurrency: usize,
+) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let paths = inputs
         .into_iter()
         .map(|(input, indices)| {
@@ -368,6 +408,14 @@ pub fn read_map_ranges_stream(
             )
         })
         .collect::<Vec<_>>();
+    let mut stats = ReadStats::default();
+    stats.shuffle_id = shuffle_id;
+    stats.map_files = paths.len();
+    stats.coalesced = paths
+        .iter()
+        .any(|(_, indices)| indices.as_slice().len() > 1);
+    stats.started = Some(Instant::now());
+    let stats = Arc::new(stats);
 
     let arrow_schema = schema.to_arrow()?;
     let flight_schema: FlightData =
@@ -503,10 +551,14 @@ pub(super) mod tests {
             write_shared(root, shuffle_id, input, schema.clone(), compression, 50).await?;
             let path = shared_map_file(root, shuffle_id, input.input_id, input.attempt);
             let stats = Arc::new(ReadStats::default());
-            let messages: Vec<_> =
-                read_one_map_file(shuffle_id, path.clone(), vec![0, 1, 2], stats.clone())
-                    .try_collect()
-                    .await?;
+            let messages: Vec<_> = read_one_map_file(
+                shuffle_id,
+                path.clone(),
+                PartitionIndices::Multiple(vec![0, 1, 2]),
+                stats.clone(),
+            )
+            .try_collect()
+            .await?;
             use std::sync::atomic::Ordering::Relaxed;
             assert_eq!(stats.opens.load(Relaxed), 1);
             assert_eq!(stats.index_misses.load(Relaxed), 1);
