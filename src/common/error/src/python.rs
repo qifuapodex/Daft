@@ -14,21 +14,26 @@ import_exception!(daft.exceptions, MiscTransientError);
 
 impl std::convert::From<DaftError> for pyo3::PyErr {
     fn from(err: DaftError) -> Self {
-        match err {
-            DaftError::PyO3Error(pyerr) => pyerr,
-            DaftError::TypeError(msg) => DaftTypeError::new_err(msg),
-            other => {
-                let formatted = format_error_for_user(&other);
-                match other {
-                    DaftError::FileNotFound { .. } => PyFileNotFoundError::new_err(formatted),
-                    DaftError::ConnectTimeout(_) => ConnectTimeoutError::new_err(formatted),
-                    DaftError::ReadTimeout(_) => ReadTimeoutError::new_err(formatted),
-                    DaftError::ByteStreamError(_) => ByteStreamError::new_err(formatted),
-                    DaftError::SocketError(_) => SocketError::new_err(formatted),
-                    DaftError::ThrottledIo(_) => ThrottleError::new_err(formatted),
-                    DaftError::MiscTransient(_) => MiscTransientError::new_err(formatted),
-                    _ => DaftCoreException::new_err(formatted),
-                }
+        to_pyerr(&err)
+    }
+}
+
+fn to_pyerr(err: &DaftError) -> pyo3::PyErr {
+    match err {
+        DaftError::Shared(error) => to_pyerr(error),
+        DaftError::PyO3Error(pyerr) => pyo3::Python::attach(|py| pyerr.clone_ref(py)),
+        DaftError::TypeError(msg) => DaftTypeError::new_err(msg.clone()),
+        other => {
+            let formatted = format_error_for_user(other);
+            match other {
+                DaftError::FileNotFound { .. } => PyFileNotFoundError::new_err(formatted),
+                DaftError::ConnectTimeout(_) => ConnectTimeoutError::new_err(formatted),
+                DaftError::ReadTimeout(_) => ReadTimeoutError::new_err(formatted),
+                DaftError::ByteStreamError(_) => ByteStreamError::new_err(formatted),
+                DaftError::SocketError(_) => SocketError::new_err(formatted),
+                DaftError::ThrottledIo(_) => ThrottleError::new_err(formatted),
+                DaftError::MiscTransient(_) => MiscTransientError::new_err(formatted),
+                _ => DaftCoreException::new_err(formatted),
             }
         }
     }

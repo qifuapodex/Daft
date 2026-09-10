@@ -5,6 +5,9 @@ pub type GenericError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum DaftError {
+    /// A pipeline failure delivered to each input that did not finish.
+    #[error(transparent)]
+    Shared(std::sync::Arc<DaftError>),
     #[error("DaftError::AmbiguousReference {0}")]
     AmbiguousReference(String),
     #[error("DaftError::FieldNotFound {0}")]
@@ -85,6 +88,7 @@ impl DaftError {
     /// Data errors (OOM, schema mismatches, casts, corrupt files) are never transient.
     pub fn is_transient(&self) -> bool {
         match self {
+            Self::Shared(error) => error.is_transient(),
             Self::ConnectTimeout(_)
             | Self::ReadTimeout(_)
             | Self::ByteStreamError(_)
@@ -186,6 +190,8 @@ mod tests {
         ];
         for error in transient {
             assert!(error.is_transient(), "{error:?} should be transient");
+            let shared = DaftError::Shared(std::sync::Arc::new(error));
+            assert!(shared.is_transient(), "{shared:?} should stay transient");
         }
     }
 
@@ -205,6 +211,8 @@ mod tests {
         ];
         for error in permanent {
             assert!(!error.is_transient(), "{error:?} should not be transient");
+            let shared = DaftError::Shared(std::sync::Arc::new(error));
+            assert!(!shared.is_transient(), "{shared:?} should stay permanent");
         }
     }
 }

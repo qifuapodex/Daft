@@ -9,7 +9,7 @@ use std::{
 
 use common_daft_config::DaftExecutionConfig;
 use common_display::{DisplayLevel, mermaid::MermaidDisplayOptions};
-use common_error::DaftResult;
+use common_error::{DaftError, DaftResult};
 use common_metrics::{QueryEndState, QueryID};
 use common_runtime::RuntimeTask;
 use common_tracing::flush_opentelemetry_providers;
@@ -58,6 +58,7 @@ use crate::{
 enum ExecutionEngineResultItem {
     Partition(MicroPartition),
     FlightPartitionRef(FlightPartitionRef),
+    Error(Arc<DaftError>),
 }
 
 /// Global tokio runtime shared by all NativeExecutor instances
@@ -408,9 +409,8 @@ async fn run_execution_loop(
                         message_router.route_message(msg);
                     }
                     None => {
-                        // Pipeline finished. Close result channels so waiters
-                        // unblock, then drain runtime tasks.
-                        drop(message_router);
+                        // Drain runtime tasks before closing result channels so an
+                        // error can reach every input that did not receive a Flush.
                         let res = runtime_handle.shutdown().await;
                         let status = if res.is_ok() { QueryEndState::Finished } else { QueryEndState::Failed };
                         break (res, status);
@@ -420,9 +420,27 @@ async fn run_execution_loop(
         }
     };
 
+    let result = result.map_err(|error| {
+        let error = Arc::new(error);
+        for sender in message_router.output_senders.values() {
+            let _ = sender.send(ExecutionEngineResultItem::Error(error.clone()));
+        }
+        error
+    });
+    // Inputs accepted just before the pipeline failed must receive its error too.
+    enqueue_input_rx.close();
+    while let Some(message) = enqueue_input_rx.recv().await {
+        if let Err(error) = &result {
+            let _ = message
+                .result_sender
+                .send(ExecutionEngineResultItem::Error(error.clone()));
+        }
+    }
+    drop(message_router);
+
     stats_manager.finish(finish_status).await;
     flush_opentelemetry_providers();
-    result
+    result.map_err(DaftError::Shared)
 }
 
 pub struct NativeExecutor {
@@ -590,6 +608,7 @@ impl NativeExecutor {
 
                 Ok(ExecutionEngineResult {
                     receiver: result_rx,
+                    error: None,
                 })
             }
             .boxed(),
@@ -706,11 +725,18 @@ impl Drop for NativeExecutor {
 
 pub struct ExecutionEngineResult {
     receiver: crate::channel::UnboundedReceiver<ExecutionEngineResultItem>,
+    error: Option<Arc<DaftError>>,
 }
 
 impl ExecutionEngineResult {
     async fn next(&mut self) -> Option<ExecutionEngineResultItem> {
-        self.receiver.recv().await
+        match self.receiver.recv().await {
+            Some(ExecutionEngineResultItem::Error(error)) => {
+                self.error = Some(error);
+                None
+            }
+            item => item,
+        }
     }
 
     /// Consume all pipeline output for this input_id until EOF, returning any
@@ -760,6 +786,7 @@ impl PyResultReceiver {
             Python::attach(|py| {
                 Ok(match part {
                     None => py.None(),
+                    Some(ExecutionEngineResultItem::Error(_)) => unreachable!("next stores errors"),
                     Some(ExecutionEngineResultItem::Partition(partition)) => {
                         PyMicroPartition::from(partition)
                             .into_pyobject(py)?
@@ -785,14 +812,22 @@ impl PyResultReceiver {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Take the result to drop the receiver
             let mut result = result.lock().await;
-            let _ = result
+            let error = result
                 .take()
-                .expect("PyResultReceiver.try_finish() should not be called more than once.");
+                .expect("PyResultReceiver.try_finish() should not be called more than once.")
+                .error;
             drop(result);
 
             // Delegate to NativeExecutor::try_finish
             let finish_future = executor.lock().unwrap().try_finish(fingerprint, input_id)?;
-            let stats = finish_future.await?;
+            let stats = finish_future.await;
+            // Always finish tracking this input before returning its pipeline error.
+            // Another input may already have removed the shared plan and consumed
+            // the execution task's error, so its result alone is not sufficient.
+            if let Some(error) = error {
+                return Err(DaftError::Shared(error).into());
+            }
+            let stats = stats?;
             Ok(PyExecutionStats::from(stats))
         })
     }
