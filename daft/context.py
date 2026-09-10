@@ -233,6 +233,8 @@ def set_execution_config(
     read_sql_partition_size_bytes: int | None = None,
     default_morsel_size: int | None = None,
     shuffle_algorithm: str | None = None,
+    experimental_shuffle_aqe: bool | None = None,
+    experimental_shuffle_aqe_target_bytes: int | None = None,
     pre_shuffle_merge_threshold: int | None = None,
     pre_shuffle_merge_partition_threshold: int | None = None,
     scantask_max_parallel: int | None = None,
@@ -287,6 +289,8 @@ def set_execution_config(
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
         default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
         shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
+        experimental_shuffle_aqe: Opt-in coalescing of internal Flight aggregation and distinct exchanges. Defaults to False. User repartitions and join inputs are excluded.
+        experimental_shuffle_aqe_target_bytes: Advisory uncompressed input bytes per coalesced task; defaults to 256 MiB. This is not a peak-memory limit.
         pre_shuffle_merge_threshold: Memory threshold in bytes for pre-shuffle merge. Defaults to 1GB
         pre_shuffle_merge_partition_threshold: Number of partitions threshold to enable pre-shuffle merge when shuffle_algorithm is "auto". Defaults to 200.
         scantask_max_parallel: Set the max parallelism for running scan tasks simultaneously. Currently, this only works for Native Runner. If set to 0, all available CPUs will be used. Defaults to 8.
@@ -343,6 +347,8 @@ def set_execution_config(
             read_sql_partition_size_bytes=read_sql_partition_size_bytes,
             default_morsel_size=default_morsel_size,
             shuffle_algorithm=shuffle_algorithm,
+            experimental_shuffle_aqe=experimental_shuffle_aqe,
+            experimental_shuffle_aqe_target_bytes=experimental_shuffle_aqe_target_bytes,
             pre_shuffle_merge_threshold=pre_shuffle_merge_threshold,
             pre_shuffle_merge_partition_threshold=pre_shuffle_merge_partition_threshold,
             scantask_max_parallel=scantask_max_parallel,

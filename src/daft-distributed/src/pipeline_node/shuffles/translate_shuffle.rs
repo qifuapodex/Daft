@@ -9,6 +9,7 @@ use daft_schema::schema::SchemaRef;
 use crate::pipeline_node::{
     DistributedPipelineNode,
     shuffles::{
+        aqe::ShuffleOrigin,
         backends::{DistributedShuffleBackend, FlightShuffleBackendConfig},
         gather::GatherNode,
         pre_shuffle_merge::PreShuffleMergeNode,
@@ -52,6 +53,7 @@ impl LogicalPlanToPipelineNodeTranslator {
 
     pub fn gen_repartition_node(
         &mut self,
+        origin: ShuffleOrigin,
         repartition_spec: RepartitionSpec,
         schema: SchemaRef,
         child: DistributedPipelineNode,
@@ -59,6 +61,7 @@ impl LogicalPlanToPipelineNodeTranslator {
     ) -> DaftResult<DistributedPipelineNode> {
         let backend = self.select_backend();
         self.gen_repartition_node_with_backend(
+            origin,
             repartition_spec,
             schema,
             child,
@@ -69,12 +72,18 @@ impl LogicalPlanToPipelineNodeTranslator {
 
     pub fn gen_repartition_node_with_backend(
         &mut self,
+        origin: ShuffleOrigin,
         repartition_spec: RepartitionSpec,
         schema: SchemaRef,
         child: DistributedPipelineNode,
         backend: DistributedShuffleBackend,
         input_size_bytes: usize,
     ) -> DaftResult<DistributedPipelineNode> {
+        let aqe_skip_reason = origin.skip_reason(
+            self.plan_config.config.experimental_shuffle_aqe,
+            matches!(&backend, DistributedShuffleBackend::Flight(_)),
+            self.join_depth > 0,
+        );
         let input_num_partitions = child.config().clustering_spec.num_partitions();
         let num_partitions = match &repartition_spec {
             RepartitionSpec::Hash(c) => c.num_partitions,
@@ -113,6 +122,7 @@ impl LogicalPlanToPipelineNodeTranslator {
                 self.get_next_pipeline_node_id(),
                 &self.plan_config,
                 repartition_spec,
+                aqe_skip_reason,
                 schema,
                 num_partitions,
                 backend,

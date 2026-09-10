@@ -28,7 +28,7 @@ use crate::{
         into_partitions::IntoPartitionsNode, limit::LimitNode,
         monotonically_increasing_id::MonotonicallyIncreasingIdNode, pivot::PivotNode,
         project::ProjectNode, random_shuffle::RandomShuffleNode, sample::SampleNode,
-        scan_source::ScanSourceNode, sink::SinkNode, sort::SortNode,
+        scan_source::ScanSourceNode, shuffles::aqe::ShuffleOrigin, sink::SinkNode, sort::SortNode,
         stage_checkpoint_keys::StageCheckpointKeysNode, top_n::TopNNode, udf::UDFNode,
         unpivot::UnpivotNode, vllm::VLLMNode, window::WindowNode,
     },
@@ -62,6 +62,7 @@ pub(crate) struct LogicalPlanToPipelineNodeTranslator {
     psets: Arc<HashMap<String, Vec<PartitionRef>>>,
     curr_node: Vec<DistributedPipelineNode>,
     pub(crate) hints: Vec<String>,
+    pub(crate) join_depth: usize,
 }
 
 impl LogicalPlanToPipelineNodeTranslator {
@@ -77,6 +78,7 @@ impl LogicalPlanToPipelineNodeTranslator {
             psets,
             curr_node: Vec::new(),
             hints: Vec::new(),
+            join_depth: 0,
         }
     }
 
@@ -121,7 +123,12 @@ impl LogicalPlanToPipelineNodeTranslator {
 impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
     type Node = LogicalPlanRef;
 
-    fn f_down(&mut self, _node: &Self::Node) -> DaftResult<TreeNodeRecursion> {
+    fn f_down(&mut self, node: &Self::Node) -> DaftResult<TreeNodeRecursion> {
+        // Conservatively protect every join input, including upstream aggregates.
+        // Join strategy is selected only after translating its children.
+        if matches!(node.as_ref(), LogicalPlan::Join(_)) {
+            self.join_depth += 1;
+        }
         Ok(TreeNodeRecursion::Continue)
     }
 
@@ -377,6 +384,7 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                         .approx_stats
                         .size_bytes;
                     self.gen_repartition_node(
+                        ShuffleOrigin::UserRepartition,
                         repartition.repartition_spec.clone(),
                         node.schema(),
                         child,
@@ -463,6 +471,7 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
 
                     // Second stage: Repartition to distribute the dataset
                     let repartition = self.gen_repartition_node(
+                        ShuffleOrigin::Distinct,
                         RepartitionSpec::Hash(HashRepartitionConfig::new(
                             None,
                             columns.clone().into_iter().map(|e| e.into()).collect(),
@@ -502,6 +511,7 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                     input_node
                 } else {
                     self.gen_repartition_node(
+                        ShuffleOrigin::Window,
                         RepartitionSpec::Hash(HashRepartitionConfig::new(
                             None,
                             partition_by.clone().into_iter().map(|e| e.into()).collect(),
@@ -691,6 +701,9 @@ impl TreeNodeVisitor for LogicalPlanToPipelineNodeTranslator {
                 )
             }
         };
+        if matches!(node.as_ref(), LogicalPlan::Join(_)) {
+            self.join_depth -= 1;
+        }
         self.curr_node.push(output);
         Ok(TreeNodeRecursion::Continue)
     }

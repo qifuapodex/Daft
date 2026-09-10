@@ -13,6 +13,7 @@ use std::{
     fs::File,
     io::{self, BufWriter, Write},
     sync::Arc,
+    time::Instant,
 };
 
 use common_error::{DaftError, DaftResult};
@@ -121,6 +122,7 @@ pub async fn write_partitions_one_shot(
     partitions: Vec<MicroPartition>,
 ) -> DaftResult<Vec<PartitionCache>> {
     let num_partitions = partitions.len();
+    let queued = Instant::now();
 
     // IPC encode + disk write all run on a single spawn_blocking thread.
     // Previously we fanned out per-partition `tokio::spawn` calls, but at
@@ -128,6 +130,8 @@ pub async fn write_partitions_one_shot(
     // scheduling overhead exceeded the actual work.
     get_io_runtime(true)
         .spawn_blocking(move || -> DaftResult<Vec<PartitionCache>> {
+            let queue_us = queued.elapsed().as_micros() as u64;
+            let started = Instant::now();
             let (mut commit, file, base_offset, file_path) =
                 open_target(&target, shuffle_id, input_id, attempt, num_partitions)?;
 
@@ -178,6 +182,8 @@ pub async fn write_partitions_one_shot(
             // EOS marker falls outside every range.
             offsets.push(writer.get_ref().bytes_written);
 
+            let encode_write_us = started.elapsed().as_micros() as u64;
+            let flush_started = Instant::now();
             writer.finish().map_err(|e| {
                 DaftError::InternalError(format!("IPC writer finish failed: {}", e))
             })?;
@@ -186,6 +192,9 @@ pub async fn write_partitions_one_shot(
                 .flush()
                 .map_err(|e| DaftError::InternalError(format!("IPC writer flush failed: {}", e)))?;
 
+            let flush_us = flush_started.elapsed().as_micros() as u64;
+            let file_bytes = writer.get_ref().bytes_written;
+            let commit_started = Instant::now();
             if let Some(commit) = commit.take() {
                 let durability = match &target {
                     OneShotTarget::Shared { durability, .. } => *durability,
@@ -202,6 +211,27 @@ pub async fn write_partitions_one_shot(
                 commit.commit(file, &offsets, &crcs, durability)?;
             }
 
+            tracing::info!(
+                shuffle_id,
+                input_id,
+                attempt,
+                placement = if matches!(target, OneShotTarget::Shared { .. }) {
+                    "shared"
+                } else {
+                    "local"
+                },
+                partitions = num_partitions,
+                nonempty_partitions = caches.iter().filter(|cache| cache.num_rows > 0).count(),
+                rows = caches.iter().map(|cache| cache.num_rows).sum::<usize>(),
+                uncompressed_bytes = caches.iter().map(|cache| cache.size_bytes).sum::<usize>(),
+                partition_disk_bytes = offsets.last().unwrap() - offsets.first().unwrap(),
+                file_bytes,
+                queue_us,
+                encode_write_us,
+                flush_us,
+                commit_us = commit_started.elapsed().as_micros() as u64,
+                "Shuffle map write statistics"
+            );
             Ok(caches)
         })
         .await?

@@ -214,11 +214,17 @@ impl ShuffleBackend {
         &self,
         materialized_stream: impl futures::Stream<Item = DaftResult<MaterializedOutput>> + Send + Unpin,
         num_partitions: usize,
+        aqe_skip_reason: Option<&'static str>,
         node: &dyn PipelineNodeImpl,
         result_tx: Sender<SwordfishTaskBuilder>,
     ) -> DaftResult<()> {
         match &self.backend {
             DistributedShuffleBackend::Ray => {
+                tracing::info!(
+                    node_id = self.node_id,
+                    aqe_skip_reason = aqe_skip_reason.unwrap_or("unsupported_backend"),
+                    "Shuffle AQE decision"
+                );
                 let partition_groups =
                     crate::utils::transpose::transpose_materialized_outputs_from_stream(
                         materialized_stream,
@@ -240,6 +246,10 @@ impl ShuffleBackend {
                     num_partitions,
                     cfg.shuffle_id,
                     self.backend.shared_root(),
+                    aqe_skip_reason,
+                    node.config()
+                        .execution_config
+                        .experimental_shuffle_aqe_target_bytes,
                 )
                 .await?;
                 flight::emit_read_tasks(

@@ -1,3 +1,4 @@
+pub(crate) mod aqe;
 pub mod backends;
 pub mod gather;
 pub mod pre_shuffle_merge;

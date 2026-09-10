@@ -185,3 +185,79 @@ If you're unsure whether your shuffle has crossed the thresholds, run it once wi
 - [Partitioning and Batching](partitioning.md): how to pick the number of partitions for `repartition` (the input to shuffle cost) and how `into_batches` controls batch sizes within a partition.
 - [Managing Memory Usage](memory.md): general memory tuning, including reducer-side memory.
 - [Join Strategies](join-strategies.md): hash joins are one of the main shuffle producers. Covers when each join strategy triggers one.
+
+## Shuffle diagnostics and experimental AQE
+
+Flight repartition exchanges emit structured `INFO` summaries independently of AQE.
+To retain the fields for analysis, set these variables on the driver **and Ray workers**
+before starting the processes (or supply the worker variables through Ray's runtime environment):
+
+```bash
+export DAFT_TRACE=daft_shuffles=info,daft_distributed=info,daft_local_execution=info
+export DAFT_TRACE_FORMAT=json
+export RAY_DEDUP_LOGS=0
+```
+
+Collect worker stderr as well as driver stderr. Correlate `shuffle_id` with the
+existing `Assigned flight shuffle id` event, which includes the query and node IDs.
+Do not count every map attempt as accepted output: retries have different `attempt`
+values. Read summaries include failed/cancelled streams with `complete=false`; their
+`verified_bytes` can be partial and must not be treated as unique logical bytes.
+
+| Event | Measurements |
+|---|---|
+| `Shuffle map write statistics` | Map/attempt identity, rows, uncompressed bytes, partition bytes on disk, complete file bytes, nonempty buckets, blocking-pool queue time, encoding/write time, flush time and commit time. |
+| `Shuffle map statistics and AQE decision` | Accepted map count, bucket size p50/p95/max, uncompressed fragment counts, original/revised task count, AQE status, and time waiting for map outputs. |
+| `Shuffle read routing` | Ref counts initially assigned to in-process, shared-mount and RPC routes. Fallbacks are logged separately. |
+| `Shuffle shared read statistics` | File-open attempts, completed files, index-cache hits/misses, empty/nonempty ranges, ranges below 64 KiB/1 MiB, indexed/verified on-disk bytes, IPC messages and cumulative slot/open/index/read waits. |
+| `Shuffle source consumption statistics` | Successfully consumed rows/uncompressed bytes, stream-poll time and time waiting to send downstream. |
+
+Range counts are application-level ranges, **not storage requests or syscalls**.
+The two small-range counters are cumulative (`<64 KiB` is also `<1 MiB`). Shared-read
+waits sum overlapping operations; they are not stage wall time. Stream wall time can
+include downstream backpressure. Source poll time includes fetching and decoding;
+downstream wait is backpressure, not a direct measurement of Parquet encoding time.
+Map encoding/write time includes file creation and IPC/CRC work. Commit time excludes
+asynchronous background fsync completion. RPC/in-process reads do not emit the
+shared-mount breakdown; use routing and source consumption to avoid attributing their
+costs to shared reads. These summaries do not measure process RSS or filesystem cache
+hits. Use storage/cgroup measurements alongside them.
+
+Experimental adaptive coalescing is **off by default**. Enable it explicitly:
+
+```python
+daft.set_execution_config(
+    shuffle_algorithm="flight_shuffle",
+    experimental_shuffle_aqe=True,
+    experimental_shuffle_aqe_target_bytes=256 * 1024 * 1024,
+)
+```
+
+The initial implementation coalesces adjacent buckets of **internal aggregation and
+distinct exchanges**, using actual uncompressed map-output sizes after all maps finish.
+It never splits an oversized bucket. The target is advisory input size, not a bound on
+hash-table or aggregate memory. Each task takes at most 64 original buckets to bound
+ref reconstruction even when buckets are empty. Coordinator statistics remain
+O(map tasks + original buckets); full map-by-bucket matrices are not retained.
+
+AQE skips hash-join exchanges and conservatively skips exchanges anywhere in a join's
+input subtree, since the join strategy is chosen after translating its children. It
+also skips user `repartition` calls, including explicit partition counts and `None`
+(which currently promises to keep the count). `into_partitions`, sorts, windows,
+random row shuffles and non-Flight backends retain their existing execution behavior.
+An internal aggregation partition count derived from configuration is not a user
+`repartition` contract.
+
+`explain(show_all=True)` shows eligibility or the skip reason. Runtime decision logs
+report `disabled`, `join_input`, `user_partition_contract`, `unsupported_backend`,
+`unsupported_operator`, `coalesced`, or `no_small_partitions`. Planning-time partition
+counts for eligible exchanges remain upper bounds; inspect the runtime decision
+event for the actual number of reduce tasks.
+
+For eligible coalesced tasks reading the shared mount directly, the reader opens each
+map file once and reuses an at-most-1-MiB prefetch buffer across its original bucket
+ranges. The task's shared-read concurrency budget applies across the entire group.
+Original per-bucket length/CRC checks and selected map attempts are preserved. The
+RPC/in-process paths and RPC-to-shared fallback retain their existing read layout.
+AQE does not merge already-written map files, automatically choose a different
+shuffle algorithm, resize the cluster, or compact final Parquet files.

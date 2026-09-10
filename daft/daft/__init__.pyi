@@ -2641,6 +2641,8 @@ class PyDaftExecutionConfig:
         read_sql_partition_size_bytes: int | None = None,
         default_morsel_size: int | None = None,
         shuffle_algorithm: str | None = None,
+        experimental_shuffle_aqe: bool | None = None,
+        experimental_shuffle_aqe_target_bytes: int | None = None,
         pre_shuffle_merge_threshold: int | None = None,
         pre_shuffle_merge_partition_threshold: int | None = None,
         scantask_max_parallel: int | None = None,
@@ -2733,6 +2735,10 @@ class PyDaftExecutionConfig:
     def flight_shuffle_read_source(self) -> str: ...
     @property
     def flight_shuffle_shared_read_concurrency(self) -> int: ...
+    @property
+    def experimental_shuffle_aqe(self) -> bool: ...
+    @property
+    def experimental_shuffle_aqe_target_bytes(self) -> int: ...
     @property
     def enable_multi_glob_path_tasks(self) -> bool: ...
     @property

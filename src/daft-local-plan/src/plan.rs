@@ -2529,6 +2529,9 @@ pub struct FlightMapOutput {
 pub struct FlightShuffleReadInput {
     pub shuffle_id: u64,
     pub partition_idx: u32,
+    /// Set only by an eligible, explicitly enabled AQE exchange.
+    #[serde(default)]
+    pub coalesce_ranges: bool,
     pub inputs_by_server: Arc<BTreeMap<String, Vec<FlightMapOutput>>>,
     /// Shared mount holding this shuffle's map files, when it was written with
     /// shared placement. A per-shuffle constant, shared by `Arc` across every

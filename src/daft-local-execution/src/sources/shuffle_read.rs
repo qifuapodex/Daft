@@ -18,7 +18,7 @@ use daft_shuffles::{
     shuffle_cache::partition_ref_id,
     store::{
         ShuffleReadSource as ReadRoute,
-        reader::{MapInput, read_partition_stream},
+        reader::{MapInput, read_map_ranges_stream, read_partition_stream},
     },
 };
 use futures::{FutureExt, StreamExt, stream::BoxStream};
@@ -121,7 +121,13 @@ impl ShuffleReadSource {
         shared_read_concurrency: usize,
     ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
         let shared_roots = Self::shared_roots(&inputs);
+        let coalesce_ranges = inputs.iter().all(|input| input.coalesce_ranges);
         let requests = Self::to_server_requests(&inputs);
+        let shuffle_ids: std::collections::BTreeSet<_> =
+            inputs.iter().map(|i| i.shuffle_id).collect();
+        let mut local_refs = 0usize;
+        let mut shared_refs = 0usize;
+        let mut rpc_refs = 0usize;
 
         let mut streams: Vec<BoxStream<'static, DaftResult<RecordBatch>>> = Vec::new();
         // Shared-route reads are accumulated per shuffle rather than issued per
@@ -142,6 +148,7 @@ impl ShuffleReadSource {
             // coordinator selected even if another attempt of the same task also
             // registered here.
             if address == local_address {
+                local_refs += refs.len();
                 streams.push(local_server.get_partition_local(shuffle_id, &refs).await?);
                 continue;
             }
@@ -156,12 +163,15 @@ impl ShuffleReadSource {
             };
 
             if use_shared {
+                shared_refs += refs.len();
                 let root = shared_root.expect("checked above");
                 let group = shared_by_shuffle
                     .entry(shuffle_id)
                     .or_insert_with(|| SharedReadGroup::new(root));
+                group.coalesce_ranges = coalesce_ranges;
                 group.push(address, refs);
             } else {
+                rpc_refs += refs.len();
                 streams.push(rpc_stream_with_shared_fallback(
                     client_manager.clone(),
                     shuffle_id,
@@ -188,6 +198,15 @@ impl ShuffleReadSource {
             ));
         }
 
+        tracing::info!(
+            ?shuffle_ids,
+            local_refs,
+            shared_refs,
+            rpc_refs,
+            coalesce_ranges,
+            shared_read_concurrency,
+            "Shuffle read routing"
+        );
         Ok(futures::stream::select_all(streams).boxed())
     }
 
@@ -215,8 +234,9 @@ impl ShuffleReadSource {
                 while task_set.len() < num_parallel_tasks
                     && let Some((input_id, inputs)) = pending_tasks.pop_front()
                 {
+                    let shuffle_ids = inputs.iter().map(|input| input.shuffle_id).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
                     let stream = Self::get_partition_stream(client_manager.clone(), local_server.clone(), &local_address, inputs, schema.clone(), read_route, shared_read_concurrency).await?;
-                    task_set.spawn(forward_partition_stream(stream, schema.clone(), output_sender.clone(), input_id));
+                    task_set.spawn(forward_partition_stream(stream, schema.clone(), output_sender.clone(), input_id, shuffle_ids));
                 }
 
                 tokio::select! {
@@ -282,6 +302,7 @@ fn refs_by_partition_idx(refs: &[(u64, u64)]) -> HashMap<u32, Vec<MapInput>> {
 /// files, since the mount does not care who wrote them) and grouped by the worker
 /// that wrote them (what the RPC fallback needs, because gRPC does).
 struct SharedReadGroup {
+    coalesce_ranges: bool,
     shared_root: Arc<str>,
     merged_refs: Vec<(u64, u64)>,
     by_server: Vec<(String, Vec<(u64, u64)>)>,
@@ -290,6 +311,7 @@ struct SharedReadGroup {
 impl SharedReadGroup {
     fn new(shared_root: Arc<str>) -> Self {
         Self {
+            coalesce_ranges: false,
             shared_root,
             merged_refs: Vec::new(),
             by_server: Vec::new(),
@@ -332,6 +354,7 @@ fn shared_stream_with_rpc_fallback(
             &group.merged_refs,
             schema.clone(),
             concurrency,
+            group.coalesce_ranges,
         ) {
             Ok(mut stream) => {
                 while let Some(batch) = stream.next().await {
@@ -389,7 +412,27 @@ fn shared_stream_for_refs(
     refs: &[(u64, u64)],
     schema: SchemaRef,
     concurrency: usize,
+    coalesce_ranges: bool,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+    if coalesce_ranges {
+        let mut by_map: HashMap<MapInput, Vec<u32>> = HashMap::new();
+        for &(attempt, ref_id) in refs {
+            by_map
+                .entry(MapInput {
+                    input_id: (ref_id >> 32) as u32,
+                    attempt,
+                })
+                .or_default()
+                .push(ref_id as u32);
+        }
+        return read_map_ranges_stream(
+            shared_root,
+            shuffle_id,
+            by_map.into_iter().collect(),
+            schema,
+            concurrency,
+        );
+    }
     let mut streams = Vec::new();
     for (partition_idx, inputs) in refs_by_partition_idx(refs) {
         streams.push(read_partition_stream(
@@ -464,6 +507,7 @@ fn rpc_stream_with_shared_fallback(
                 &refs,
                 schema,
                 shared_read_concurrency,
+                false,
             )?;
             while let Some(batch) = fallback.next().await {
                 yield batch?;
@@ -477,11 +521,27 @@ async fn forward_partition_stream(
     schema: SchemaRef,
     sender: Sender<PipelineMessage>,
     input_id: InputId,
+    shuffle_ids: Vec<u64>,
 ) -> DaftResult<InputId> {
     let mut emitted_any = false;
-    while let Some(batch) = stream.next().await {
-        let mp = MicroPartition::new_loaded(schema.clone(), vec![batch?].into(), None);
+    let started = std::time::Instant::now();
+    let mut read_poll_us = 0u64;
+    let mut downstream_wait_us = 0u64;
+    let mut rows = 0usize;
+    let mut uncompressed_bytes = 0usize;
+    loop {
+        let poll_started = std::time::Instant::now();
+        let batch = stream.next().await;
+        read_poll_us += poll_started.elapsed().as_micros() as u64;
+        let Some(batch) = batch else {
+            break;
+        };
+        let batch = batch?;
+        rows += batch.len();
+        uncompressed_bytes += batch.size_bytes();
+        let mp = MicroPartition::new_loaded(schema.clone(), vec![batch].into(), None);
         emitted_any = true;
+        let send_started = std::time::Instant::now();
         if sender
             .send(PipelineMessage::Morsel {
                 input_id,
@@ -492,7 +552,18 @@ async fn forward_partition_stream(
         {
             return Ok(input_id);
         }
+        downstream_wait_us += send_started.elapsed().as_micros() as u64;
     }
+    tracing::info!(
+        ?input_id,
+        ?shuffle_ids,
+        rows,
+        uncompressed_bytes,
+        read_poll_us,
+        downstream_wait_us,
+        wall_us = started.elapsed().as_micros() as u64,
+        "Shuffle source consumption statistics"
+    );
     // If the stream produced no batches (no read inputs, or all refs were
     // zero-row / file-less), still emit a single empty `MicroPartition` so the
     // downstream pipeline sees one output per input.
@@ -592,6 +663,63 @@ mod tests {
                 attempt: 0xa
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn shared_ref_adapter_preserves_rows_with_and_without_coalescing() -> DaftResult<()> {
+        let shuffle_id = rand::random::<u64>();
+        let dir = std::env::temp_dir().join(format!("daft_aqe_adapter_{shuffle_id}"));
+        std::fs::create_dir_all(&dir)?;
+        let root = dir.to_str().unwrap();
+        let schema = dummy_schema();
+        let mut refs = Vec::new();
+        for input_id in 0..2 {
+            let attempt = input_id as u64 + 7;
+            write_partitions_one_shot(
+                input_id,
+                shuffle_id,
+                attempt,
+                OneShotTarget::Shared {
+                    shared_root: root.into(),
+                    durability: ShuffleDurability::None,
+                },
+                schema.clone(),
+                None,
+                vec![
+                    make_dummy_mp(30),
+                    MicroPartition::empty(Some(schema.clone())),
+                    make_dummy_mp(40),
+                ],
+            )
+            .await?;
+            // Deliberately different from map/bucket order.
+            for idx in [2, 0, 1] {
+                refs.push((attempt, partition_ref_id(input_id, idx)));
+            }
+        }
+        let mut results = Vec::new();
+        for coalesce in [false, true] {
+            let batches: Vec<_> =
+                shared_stream_for_refs(root, shuffle_id, &refs, schema.clone(), 2, coalesce)?
+                    .try_collect()
+                    .await?;
+            let mut values: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let values = batch.get_column(0).u8().unwrap();
+                    (0..values.len())
+                        .map(|i| values.get(i).unwrap())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            values.sort_unstable();
+            results.push(values);
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0].len(), 140);
+        daft_shuffles::store::forget_shuffle(shuffle_id);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     /// A worker that has gone away shows up as an RPC that fails before yielding

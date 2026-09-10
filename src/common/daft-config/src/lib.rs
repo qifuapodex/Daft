@@ -141,6 +141,11 @@ pub struct DaftExecutionConfig {
     pub read_sql_partition_size_bytes: usize,
     pub default_morsel_size: NonZeroUsize,
     pub shuffle_algorithm: String,
+    /// Opt-in coalescing of eligible internal Flight exchanges.
+    #[serde(default)]
+    pub experimental_shuffle_aqe: bool,
+    #[serde(default = "default_shuffle_aqe_target_bytes")]
+    pub experimental_shuffle_aqe_target_bytes: usize,
     pub pre_shuffle_merge_threshold: usize,
     pub pre_shuffle_merge_partition_threshold: usize,
     pub scantask_max_parallel: usize,
@@ -173,6 +178,10 @@ impl std::fmt::Debug for DaftExecutionConfig {
     }
 }
 
+fn default_shuffle_aqe_target_bytes() -> usize {
+    256 * 1024 * 1024
+}
+
 impl Default for DaftExecutionConfig {
     fn default() -> Self {
         Self {
@@ -199,6 +208,8 @@ impl Default for DaftExecutionConfig {
             read_sql_partition_size_bytes: 512 * 1024 * 1024, // 512MB
             default_morsel_size: NonZeroUsize::new(128 * 1024).unwrap(),
             shuffle_algorithm: "auto".to_string(),
+            experimental_shuffle_aqe: false,
+            experimental_shuffle_aqe_target_bytes: default_shuffle_aqe_target_bytes(),
             pre_shuffle_merge_threshold: 1024 * 1024 * 1024, // 1GB
             pre_shuffle_merge_partition_threshold: 200,
             scantask_max_parallel: 8,

@@ -112,6 +112,8 @@ impl PyDaftExecutionConfig {
         read_sql_partition_size_bytes=None,
         default_morsel_size=None,
         shuffle_algorithm=None,
+        experimental_shuffle_aqe=None,
+        experimental_shuffle_aqe_target_bytes=None,
         pre_shuffle_merge_threshold=None,
         pre_shuffle_merge_partition_threshold=None,
         scantask_max_parallel=None,
@@ -155,6 +157,8 @@ impl PyDaftExecutionConfig {
         read_sql_partition_size_bytes: Option<usize>,
         default_morsel_size: Option<usize>,
         shuffle_algorithm: Option<&str>,
+        experimental_shuffle_aqe: Option<bool>,
+        experimental_shuffle_aqe_target_bytes: Option<usize>,
         pre_shuffle_merge_threshold: Option<usize>,
         pre_shuffle_merge_partition_threshold: Option<usize>,
         scantask_max_parallel: Option<usize>,
@@ -260,6 +264,18 @@ impl PyDaftExecutionConfig {
                 ));
             }
             config.shuffle_algorithm = shuffle_algorithm.to_string();
+        }
+
+        if let Some(enabled) = experimental_shuffle_aqe {
+            config.experimental_shuffle_aqe = enabled;
+        }
+        if let Some(target) = experimental_shuffle_aqe_target_bytes {
+            if target == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "experimental_shuffle_aqe_target_bytes must be greater than 0",
+                ));
+            }
+            config.experimental_shuffle_aqe_target_bytes = target;
         }
 
         if let Some(pre_shuffle_merge_threshold) = pre_shuffle_merge_threshold {
@@ -404,6 +420,16 @@ impl PyDaftExecutionConfig {
         Ok(Self {
             config: Arc::new(config),
         })
+    }
+
+    #[getter]
+    fn experimental_shuffle_aqe(&self) -> bool {
+        self.config.experimental_shuffle_aqe
+    }
+
+    #[getter]
+    fn experimental_shuffle_aqe_target_bytes(&self) -> usize {
+        self.config.experimental_shuffle_aqe_target_bytes
     }
 
     #[getter]
