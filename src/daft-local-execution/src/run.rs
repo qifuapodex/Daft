@@ -213,7 +213,17 @@ impl PyNativeExecutor {
         self.address.clone()
     }
 
-    /// Called by the coordinator once a query's shuffle files have been removed.
+    /// Process-wide IO count for cleanup of an actor exclusive to one managed execution.
+    pub fn shuffle_active_operations(&self, py: Python<'_>) -> usize {
+        let executor = self.executor.lock_py_attached(py).unwrap();
+        executor
+            .shuffle_server
+            .as_ref()
+            .map_or(0, |server| server.active_reads())
+            + daft_shuffles::store::writer::background_fsyncs_in_flight()
+    }
+
+    /// Forget registrations for a quiescent query during shuffle cleanup.
     ///
     /// Takes the executor lock only to reach the shuffle server; the registry has
     /// its own lock and nothing under it blocks, so this cannot stall a worker

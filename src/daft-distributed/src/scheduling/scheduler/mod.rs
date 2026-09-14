@@ -278,6 +278,7 @@ pub(crate) struct WorkerSnapshot {
     total_num_cpus: f64,
     total_num_gpus: f64,
     active_task_details: HashMap<TaskContext, TaskDetails>,
+    drain_state: super::drain::DrainState,
 }
 
 impl WorkerSnapshot {
@@ -292,6 +293,7 @@ impl WorkerSnapshot {
             total_num_cpus,
             total_num_gpus,
             active_task_details,
+            drain_state: super::drain::DrainState::Active,
         }
     }
 
@@ -333,6 +335,13 @@ impl WorkerSnapshot {
 
     // TODO: Potentially include memory as well, and also be able to overschedule tasks.
     pub fn can_schedule_task(&self, task: &impl Task) -> bool {
+        use super::drain::DrainState;
+        match self.drain_state {
+            DrainState::Active => {}
+            DrainState::Draining if matches!(task.strategy(), SchedulingStrategy::WorkerAffinity { worker_id, soft: false } if worker_id == &self.worker_id) =>
+                {}
+            _ => return false,
+        }
         if task.resource_request().num_gpus() > 0.0 && self.available_num_gpus() == 0.0 {
             return false;
         }
@@ -352,12 +361,14 @@ impl std::fmt::Debug for WorkerSnapshot {
 
 impl<W: Worker> From<&W> for WorkerSnapshot {
     fn from(worker: &W) -> Self {
-        Self::new(
+        let mut snapshot = Self::new(
             worker.id().clone(),
             worker.total_num_cpus(),
             worker.total_num_gpus(),
             worker.active_task_details(),
-        )
+        );
+        snapshot.drain_state = worker.drain_state();
+        snapshot
     }
 }
 
@@ -372,6 +383,56 @@ pub(super) mod test_utils {
         tests::{MockTask, MockTaskBuilder},
         worker::tests::MockWorker,
     };
+
+    fn check_drain_scheduling<S: Scheduler<MockTask> + Default>() {
+        use crate::scheduling::drain::DrainState;
+        let target: WorkerId = Arc::from("draining");
+        let other: WorkerId = Arc::from("active");
+        let mut draining = WorkerSnapshot::new(target.clone(), 4.0, 0.0, HashMap::new());
+        draining.drain_state = DrainState::Draining;
+        let active = WorkerSnapshot::new(other.clone(), 4.0, 0.0, HashMap::new());
+        let mut scheduler = S::default();
+        scheduler.update_worker_state(&[draining.clone(), active.clone()]);
+        scheduler.enqueue_tasks(vec![
+            create_spread_task(Some(1)),
+            create_worker_affinity_task(&target, false, Some(2)),
+        ]);
+        let (mut tasks, _) = scheduler.schedule_tasks();
+        if tasks.len() == 1 {
+            // LinearScheduler intentionally runs one task at a time.
+            scheduler.update_worker_state(&[draining.clone(), active.clone()]);
+            tasks.extend(scheduler.schedule_tasks().0);
+        }
+        assert_eq!(tasks.len(), 2);
+        for task in tasks {
+            let expected = if task.task_ref().task_context().task_id == 1 {
+                &other
+            } else {
+                &target
+            };
+            assert_eq!(&task.worker_id(), expected);
+        }
+        // With no local dependency left, a future Ray-backed affinity task can
+        // move to another worker rather than deadlocking a ready target.
+        for state in [DrainState::ReadyToRetire, DrainState::Unknown] {
+            draining.drain_state = state;
+            scheduler.update_worker_state(&[draining.clone(), active.clone()]);
+            scheduler.enqueue_tasks(vec![create_worker_affinity_task(&target, false, Some(3))]);
+            let (tasks, _) = scheduler.schedule_tasks();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].worker_id(), other);
+        }
+    }
+
+    #[test]
+    fn default_scheduler_drains_without_starving_affinity() {
+        check_drain_scheduling::<super::default::DefaultScheduler<MockTask>>();
+    }
+
+    #[test]
+    fn linear_scheduler_drains_without_starving_affinity() {
+        check_drain_scheduling::<super::linear::LinearScheduler<MockTask>>();
+    }
 
     #[test]
     fn deferral_preserves_retry_backoff_and_worker_exclusion() {

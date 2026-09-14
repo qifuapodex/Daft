@@ -396,6 +396,24 @@ impl SwordfishTask {
         self.task_context.recovery.producer_id().is_some()
     }
 
+    /// Detect service/file-producing plans before they can publish any output.
+    /// Keep a single query hold across consumers and all retry attempts.
+    pub fn retains_local_data(&self) -> bool {
+        use common_treenode::DynTreeNode;
+        use daft_local_plan::{LocalPhysicalPlan, ShuffleBackend};
+        fn has_local_output(plan: &LocalPhysicalPlanRef) -> bool {
+            let backend = match plan.as_ref() {
+                LocalPhysicalPlan::RepartitionWrite(write) => Some(&write.backend),
+                LocalPhysicalPlan::GatherWrite(write) => Some(&write.backend),
+                LocalPhysicalPlan::IntoPartitions(write) => Some(&write.backend),
+                _ => None,
+            };
+            matches!(backend, Some(ShuffleBackend::Flight { .. }))
+                || plan.arc_children().iter().any(has_local_output)
+        }
+        has_local_output(&self.plan)
+    }
+
     pub fn plan(&self) -> LocalPhysicalPlanRef {
         self.plan.clone()
     }

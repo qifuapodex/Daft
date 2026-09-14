@@ -67,6 +67,19 @@ impl<T: Task> LinearScheduler<T> {
                 return Some(worker.worker_id.clone());
             }
             // Target worker exists but is busy: soft affinity falls back, hard affinity waits
+            // Ready targets no longer hold local dependencies. Current affinity
+            // producers use Ray-owned inputs, which can be moved safely.
+            Some(worker)
+                if matches!(
+                    worker.drain_state,
+                    crate::scheduling::drain::DrainState::ReadyToRetire
+                        | crate::scheduling::drain::DrainState::Retiring
+                        | crate::scheduling::drain::DrainState::Retired
+                        | crate::scheduling::drain::DrainState::Unknown
+                ) =>
+            {
+                AffinityTarget::Missing
+            }
             Some(_) => AffinityTarget::Busy,
             // Target worker is missing from the snapshots
             None => AffinityTarget::Missing,

@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 
 use super::{task::RayTaskResultHandle, worker::RaySwordfishWorker};
 use crate::scheduling::{
+    drain::{DrainBarrier, DrainState},
     scheduler::WorkerSnapshot,
     task::{SwordfishTask, TaskContext, TaskResourceRequest},
     worker::{RefreshAction, Worker, WorkerId, WorkerManager, next_refresh_action},
@@ -23,6 +24,9 @@ const RAY_AUTOSCALER_UPDATE_INTERVAL_ENV: &str = "AUTOSCALER_UPDATE_INTERVAL_S";
 
 struct RayWorkerManagerState {
     ray_workers: HashMap<WorkerId, RaySwordfishWorker>,
+    node_drains: HashMap<String, DrainBarrier>,
+    closed: bool,
+    cleanup_error: Option<String>,
     /// When the last refresh *completed*. `None` means "refresh at the next opportunity",
     /// which is how `try_autoscale` and `retire_idle_workers` force one.
     last_refresh: Option<Instant>,
@@ -58,19 +62,35 @@ impl RayWorkerManagerState {
 
         let mut ids = self
             .ray_workers
-            .keys()
-            .map(|id| id.as_ref().to_string())
+            .values()
+            .filter(|worker| !worker.known_dead)
+            .map(|worker| worker.node_id().to_string())
             .collect::<Vec<_>>();
         ids.extend(
             self.pending_release_blacklist
                 .keys()
                 .map(|id| id.as_ref().to_string()),
         );
+        ids.extend(
+            self.node_drains
+                .iter()
+                .filter(|(_, d)| d.state != DrainState::Active)
+                .map(|(id, _)| id.clone()),
+        );
         ids
     }
 
     fn install_refresh(&mut self, workers: Vec<RaySwordfishWorker>) {
-        for worker in workers {
+        for mut worker in workers {
+            if let Some(drain) = self.node_drains.get(worker.node_id()) {
+                worker.drain.epoch = drain.epoch;
+                worker.drain.state = drain.state;
+            }
+            // A refresh already in progress when an execution finishes still
+            // installs its protected actors so the runtime can retire them.
+            if self.closed {
+                worker.drain.state = DrainState::Draining;
+            }
             self.ray_workers.insert(worker.id().clone(), worker);
         }
         self.last_refresh = Some(Instant::now());
@@ -94,14 +114,240 @@ struct BackgroundRefresh {
 pub(crate) struct RayWorkerManager {
     state: Arc<Mutex<RayWorkerManagerState>>,
     refresh: Mutex<BackgroundRefresh>,
+    retirement: Mutex<()>,
+    session: Option<Arc<Py<PyAny>>>,
 }
 
 impl RayWorkerManager {
-    pub fn new(worker_startup_timeout: usize) -> Self {
+    /// Reclaim only this completed execution's actors, without draining or
+    /// excluding their shared nodes from other executions.
+    pub fn retire_completed_workers(&self) -> DaftResult<()> {
+        let _retirement = self.retirement.lock().unwrap();
+        self.collect_refresh()?;
+        let workers = {
+            let mut state = self.state.lock().unwrap();
+            if self.session.is_none() || !state.closed || state.cleanup_error.is_some() {
+                return Ok(());
+            }
+            state
+                .ray_workers
+                .values_mut()
+                .filter_map(|worker| {
+                    if worker.known_dead || worker.drain.state == DrainState::Retired {
+                        return None;
+                    }
+                    if worker.can_retire() || worker.drain.state == DrainState::Retiring {
+                        worker.drain.state = DrainState::Retiring;
+                        Some(worker.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for worker in workers {
+            let result = Python::attach(|py| worker.retire(py));
+            let mut state = self.state.lock().unwrap();
+            let current = state.ray_workers.get_mut(worker.id()).unwrap();
+            match result {
+                Ok(()) => {
+                    current.drain.state = DrainState::Retired;
+                    current.drain.unknown = None;
+                }
+                Err(error) => {
+                    current.drain.unknown =
+                        Some(format!("Retirement acknowledgement failed: {error}"));
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop_execution(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        for worker in state.ray_workers.values_mut() {
+            if !worker.active_task_details().is_empty() {
+                worker.drain.unknown =
+                    Some("Execution cancelled; remote termination unconfirmed".into());
+            }
+        }
+    }
+
+    fn check_health(&self) -> DaftResult<()> {
+        if let Some(session) = &self.session {
+            // A local latch updated by the Python reporting loop, never a network call.
+            Python::attach(|py| session.call_method0(py, "check_health"))?;
+        }
+        Ok(())
+    }
+
+    pub fn usage_snapshot(&self) -> String {
+        // Harvest completed discovery even after the query's scheduler exited.
+        // This does not start a new refresh or wait for the discovery RPC.
+        if let Err(error) = self.collect_refresh() {
+            if let Some(session) = &self.session {
+                Python::attach(|py| {
+                    let _ = session.call_method1(py, "invalidate", (error.to_string(),));
+                });
+            }
+        }
+        let discovery_pending = self
+            .refresh
+            .try_lock()
+            .map_or(true, |r| r.pending.is_some());
+        let state = self.state.lock().unwrap();
+        serde_json::json!({
+            "discovery_pending": discovery_pending || (!state.initial_refresh_done && !state.closed),
+            "workers": state.ray_workers.values().map(RaySwordfishWorker::usage).collect::<Vec<_>>(),
+            "closed": state.closed,
+            "cleanup_error": state.cleanup_error,
+            "nodes": state.node_drains,
+        }).to_string()
+    }
+
+    pub fn prepare_drain(&self, node_id: String, epoch: u64) -> DaftResult<()> {
+        let mut state = self.state.lock().unwrap();
+        let mut barrier = state.node_drains.get(&node_id).cloned().unwrap_or_default();
+        barrier.prepare(epoch)?;
+        for worker in state.ray_workers.values_mut().filter(|w| {
+            w.node_id() == node_id
+                && !w.known_dead
+                && !matches!(w.drain.state, DrainState::Retiring | DrainState::Retired)
+        }) {
+            worker.drain.prepare(epoch)?;
+        }
+        state.node_drains.insert(node_id, barrier);
+        Ok(())
+    }
+
+    pub fn cancel_drain(&self, node_id: String, epoch: u64) -> DaftResult<()> {
+        let mut state = self.state.lock().unwrap();
+        let mut barrier = state
+            .node_drains
+            .get(&node_id)
+            .cloned()
+            .ok_or_else(|| DaftError::ValueError("Unknown drain node".into()))?;
+        barrier.cancel(epoch)?;
+        for worker in state.ray_workers.values_mut().filter(|w| {
+            w.node_id() == node_id
+                && !w.known_dead
+                && !matches!(w.drain.state, DrainState::Retiring | DrainState::Retired)
+        }) {
+            worker.drain.cancel(epoch)?;
+        }
+        state.node_drains.insert(node_id, barrier);
+        Ok(())
+    }
+
+    pub fn retire_node(&self, node_id: String, epoch: u64) -> DaftResult<()> {
+        let _retirement = self.retirement.lock().unwrap();
+        self.collect_refresh()?;
+        // The refresh mutex prevents a protected actor from arriving after the
+        // retirement acknowledgement. Never wait for network while holding state.
+        let refresh = self.refresh.lock().unwrap();
+        if refresh.pending.is_some() {
+            return Err(DaftError::ValueError(
+                "Worker discovery is still in progress".into(),
+            ));
+        }
+        let workers = {
+            let mut state = self.state.lock().unwrap();
+            let barrier = state
+                .node_drains
+                .get(&node_id)
+                .ok_or_else(|| DaftError::ValueError("Unknown drain node".into()))?;
+            barrier.check_epoch(epoch)?;
+            if barrier.state == DrainState::Retired {
+                return Ok(());
+            }
+            let committed = barrier.state == DrainState::Retiring;
+            if barrier.state != DrainState::Draining && !committed {
+                return Err(DaftError::ValueError("Node is not draining".into()));
+            }
+            if !committed
+                && state
+                    .ray_workers
+                    .values()
+                    .filter(|w| w.node_id() == node_id)
+                    .any(|w| {
+                        !w.known_dead
+                            && !matches!(
+                                w.drain_state(),
+                                DrainState::ReadyToRetire | DrainState::Retired
+                            )
+                    })
+            {
+                return Err(DaftError::ValueError(
+                    "Node still has dependencies or unknown state".into(),
+                ));
+            }
+            state.node_drains.get_mut(&node_id).unwrap().state = DrainState::Retiring;
+            let mut workers = Vec::new();
+            for worker in state
+                .ray_workers
+                .values_mut()
+                .filter(|w| w.node_id() == node_id)
+            {
+                if worker.known_dead || worker.drain.state == DrainState::Retired {
+                    continue;
+                }
+                if !committed {
+                    worker
+                        .drain
+                        .commit(epoch, worker.active_task_details().len())?;
+                }
+                workers.push(worker.clone());
+            }
+            workers
+        };
+        drop(refresh);
+        for worker in workers {
+            let result = Python::attach(|py| worker.retire(py));
+            let mut state = self.state.lock().unwrap();
+            let current = state.ray_workers.get_mut(worker.id()).unwrap();
+            match result {
+                Ok(()) => {
+                    current.drain.state = DrainState::Retired;
+                    current.drain.unknown = None;
+                }
+                Err(e) => {
+                    current.drain.unknown = Some(format!("Retirement acknowledgement failed: {e}"));
+                    return Err(e.into());
+                }
+            }
+        }
+        self.state
+            .lock()
+            .unwrap()
+            .node_drains
+            .get_mut(&node_id)
+            .unwrap()
+            .state = DrainState::Retired;
+        Ok(())
+    }
+
+    fn query_quiescent(&self, query_idx: crate::plan::QueryIdx) -> bool {
+        self.state.lock().unwrap().ray_workers.values().all(|w| {
+            w.drain.unknown.is_none()
+                && !w
+                    .active_task_details()
+                    .keys()
+                    .any(|t| t.query_idx == query_idx)
+        })
+    }
+
+    pub fn new(worker_startup_timeout: usize, session: Option<Py<PyAny>>) -> Self {
         Self {
             refresh: Mutex::new(BackgroundRefresh::default()),
+            retirement: Mutex::new(()),
+            session: session.map(Arc::new),
             state: Arc::new(Mutex::new(RayWorkerManagerState {
                 ray_workers: HashMap::new(),
+                node_drains: HashMap::new(),
+                closed: false,
+                cleanup_error: None,
                 last_refresh: None,
                 initial_refresh_done: false,
                 max_resources_requested: ResourceRequest::default(),
@@ -122,7 +368,10 @@ impl RayWorkerManager {
     /// Python: `submit_tasks_to_workers`, `mark_task_finished` and `mark_worker_died` all
     /// take that same lock from the scheduler thread, so holding it here would just move
     /// the stall from the event loop onto the mutex.
-    fn run_refresh(state: &Arc<Mutex<RayWorkerManagerState>>) -> DaftResult<RefreshOutcome> {
+    fn run_refresh(
+        state: &Arc<Mutex<RayWorkerManagerState>>,
+        session: Option<&Py<PyAny>>,
+    ) -> DaftResult<RefreshOutcome> {
         let (nodes_to_skip, worker_startup_timeout) = {
             let mut state = state.lock().expect("Failed to lock RayWorkerManagerState");
             (state.nodes_to_skip(), state.worker_startup_timeout)
@@ -130,6 +379,13 @@ impl RayWorkerManager {
 
         let started = Instant::now();
         let workers = Python::attach(|py| {
+            if let Some(session) = session {
+                return DaftResult::Ok(
+                    session
+                        .call_method1(py, "start_workers", (nodes_to_skip, worker_startup_timeout))?
+                        .extract::<Vec<RaySwordfishWorker>>(py)?,
+                );
+            }
             let flotilla_module = py.import(pyo3::intern!(py, "daft.runners.flotilla"))?;
             DaftResult::Ok(
                 flotilla_module
@@ -178,20 +434,14 @@ impl RayWorkerManager {
             .install_refresh(outcome.workers);
     }
 
-    /// Collect a finished background refresh and start the next one when due.
-    ///
-    /// Never blocks on `start_ray_workers` after the first call. That matters because the
-    /// Python side blocks on `ray.wait` until every actor in a newly-joined batch is ready,
-    /// and this runs at the top of the scheduler's event loop -- for the duration of that
-    /// wait nothing is dispatched, no task results are collected, and no autoscaling
-    /// request is sent, which is exactly the window during a scale-up when the scheduler
-    /// has the most work to do.
-    fn drive_refresh(&self) -> DaftResult<()> {
-        let mut refresh = self
-            .refresh
-            .lock()
-            .expect("Failed to lock BackgroundRefresh");
+    fn collect_refresh(&self) -> DaftResult<()> {
+        if let Ok(mut refresh) = self.refresh.try_lock() {
+            self.collect_pending(&mut refresh)?;
+        }
+        Ok(())
+    }
 
+    fn collect_pending(&self, refresh: &mut BackgroundRefresh) -> DaftResult<()> {
         if let Some(rx) = refresh.pending.as_ref() {
             match rx.try_recv() {
                 Ok(outcome) => {
@@ -211,12 +461,34 @@ impl RayWorkerManager {
             }
         }
 
+        Ok(())
+    }
+
+    /// Collect a finished background refresh and start the next one when due.
+    ///
+    /// Never blocks on `start_ray_workers` after the first call. That matters because the
+    /// Python side blocks on `ray.wait` until every actor in a newly-joined batch is ready,
+    /// and this runs at the top of the scheduler's event loop -- for the duration of that
+    /// wait nothing is dispatched, no task results are collected, and no autoscaling
+    /// request is sent, which is exactly the window during a scale-up when the scheduler
+    /// has the most work to do.
+    fn drive_refresh(&self) -> DaftResult<()> {
+        let mut refresh = self
+            .refresh
+            .lock()
+            .expect("Failed to lock BackgroundRefresh");
+
+        self.collect_pending(&mut refresh)?;
+
         let (initial_refresh_done, is_due) = {
             let state = self
                 .state
                 .lock()
                 .expect("Failed to lock RayWorkerManagerState");
-            (state.initial_refresh_done, state.refresh_is_due())
+            (
+                state.initial_refresh_done,
+                !state.closed && state.refresh_is_due(),
+            )
         };
 
         match next_refresh_action(initial_refresh_done, is_due, refresh.pending.is_some()) {
@@ -226,17 +498,18 @@ impl RayWorkerManager {
             // at all comes up on initial startup -- an error that has to reach the caller
             // rather than surface a tick later against an empty cluster.
             RefreshAction::RunSynchronously => {
-                let outcome = Self::run_refresh(&self.state)?;
+                let outcome = Self::run_refresh(&self.state, self.session.as_deref())?;
                 self.install_refresh(outcome, true);
             }
             RefreshAction::Spawn => {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let state = self.state.clone();
+                let session = self.session.clone();
                 std::thread::Builder::new()
                     .name("daft-flotilla-worker-refresh".to_string())
                     .spawn(move || {
                         // A send failure just means the manager went away; nothing to do.
-                        let _ = tx.send(Self::run_refresh(&state));
+                        let _ = tx.send(Self::run_refresh(&state, session.as_deref()));
                     })
                     .map_err(|e| {
                         DaftError::InternalError(format!(
@@ -258,6 +531,7 @@ impl WorkerManager for RayWorkerManager {
         &self,
         tasks_per_worker: HashMap<WorkerId, Vec<SwordfishTask>>,
     ) -> DaftResult<Vec<RayTaskResultHandle>> {
+        self.check_health()?;
         let mut state = self
             .state
             .lock()
@@ -267,15 +541,18 @@ impl WorkerManager for RayWorkerManager {
 
         Python::attach(|py| {
             for (worker_id, tasks) in tasks_per_worker {
-                let handles = state
-                    .ray_workers
-                    .get_mut(&worker_id)
-                    .ok_or_else(|| {
-                        DaftError::ValueError(format!(
-                            "Worker {worker_id} not found in RayWorkerManager when submitting tasks"
-                        ))
-                    })?
-                    .submit_tasks(tasks, py)?;
+                if state.closed {
+                    continue;
+                }
+                let Some(worker) = state.ray_workers.get_mut(&worker_id) else {
+                    continue;
+                };
+                // Final admission and recording share the prepare/retire mutex.
+                let tasks = tasks
+                    .into_iter()
+                    .filter(|task| worker.accepts_task(task))
+                    .collect::<Vec<_>>();
+                let handles = worker.submit_tasks(tasks, py)?;
                 task_result_handles.extend(handles);
             }
             DaftResult::Ok(())
@@ -285,6 +562,7 @@ impl WorkerManager for RayWorkerManager {
 
     fn worker_snapshots(&self) -> DaftResult<Vec<WorkerSnapshot>> {
         // Kicks off / collects the refresh; only blocks on the very first call.
+        self.check_health()?;
         self.drive_refresh()?;
 
         let state = self
@@ -294,6 +572,7 @@ impl WorkerManager for RayWorkerManager {
         Ok(state
             .ray_workers
             .values()
+            .filter(|worker| !worker.known_dead)
             .map(WorkerSnapshot::from)
             .collect::<Vec<_>>())
     }
@@ -313,10 +592,33 @@ impl WorkerManager for RayWorkerManager {
             .state
             .lock()
             .expect("Failed to lock RayWorkerManagerState");
-        state.ray_workers.remove(&worker_id);
+        if self.session.is_some() {
+            if let Some(worker) = state.ray_workers.get_mut(&worker_id) {
+                worker.mark_died();
+            }
+            state.last_refresh = None;
+        } else {
+            state.ray_workers.remove(&worker_id);
+        }
+    }
+
+    fn mark_task_unknown(&self, _task_context: TaskContext, worker_id: WorkerId) {
+        if self.session.is_none() {
+            return;
+        }
+        if let Some(worker) = self.state.lock().unwrap().ray_workers.get_mut(&worker_id) {
+            if !worker.known_dead {
+                worker.drain.unknown = Some("remote task termination is unconfirmed".into());
+            }
+        }
     }
 
     fn shutdown(&self) -> DaftResult<()> {
+        if self.session.is_some() {
+            return Err(DaftError::ValueError(
+                "Managed shutdown requires acknowledged node retirement".into(),
+            ));
+        }
         let state = self
             .state
             .lock()
@@ -365,6 +667,86 @@ impl WorkerManager for RayWorkerManager {
         })
     }
 
+    fn finish_query(
+        &self,
+        query_idx: crate::plan::QueryIdx,
+        dirs: Vec<String>,
+        shared_dirs: Vec<String>,
+        shuffle_ids: Vec<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DaftResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let result = async move {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if self.session.is_some() {
+                        state.closed = true;
+                    }
+                }
+                if self.session.is_none() {
+                    // The scheduler has settled this query. Preserve standalone
+                    // cleanup on every live node, including disks of dead actors.
+                    for worker in self.state.lock().unwrap().ray_workers.values_mut() {
+                        worker.forget_query_tasks(query_idx);
+                    }
+                    let result = self.cleanup_shuffles(dirs, shared_dirs, shuffle_ids).await;
+                    for worker in self.state.lock().unwrap().ray_workers.values_mut() {
+                        worker.drain.data_queries.remove(&query_idx);
+                    }
+                    return result;
+                }
+                if !self.query_quiescent(query_idx) {
+                    return Err(DaftError::ValueError(
+                        "Query cleanup blocked by unconfirmed remote work".into(),
+                    ));
+                }
+                // Strict worker-local cleanup acknowledges both registration and disk
+                // removal. Keep every hold if even one RPC fails.
+                let workers = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ray_workers
+                    .values()
+                    .filter(|w| w.drain.data_queries.contains(&query_idx))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let node_ids = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ray_workers
+                    .values()
+                    .map(|worker| worker.node_id().to_string())
+                    .collect::<Vec<_>>();
+                let local_dirs = dirs.clone();
+                let refs = Python::attach(|py| -> PyResult<Vec<Py<PyAny>>> {
+                    workers
+                        .iter()
+                        .map(|w| w.cleanup_query(py, &dirs, &shuffle_ids))
+                        .collect()
+                })?;
+                common_runtime::python::execute_python_coroutine::<_, Py<PyAny>>(move |py| {
+                    py.import("daft.runners.flotilla")?.call_method1(
+                        "await_flight_shuffle_cleanup",
+                        (refs, shared_dirs, local_dirs, node_ids),
+                    )
+                })
+                .await?;
+                let mut state = self.state.lock().unwrap();
+                for worker in state.ray_workers.values_mut() {
+                    worker.drain.data_queries.remove(&query_idx);
+                }
+                Ok(())
+            }
+            .await;
+            if self.session.is_some() {
+                self.state.lock().unwrap().cleanup_error =
+                    result.as_ref().err().map(ToString::to_string);
+            }
+            result
+        })
+    }
+
     /// Autoscale the Ray cluster by requesting resources from Ray's autoscaler.
     ///
     /// Constraints we operate under:
@@ -389,6 +771,11 @@ impl WorkerManager for RayWorkerManager {
     /// high-water mark is floored to current cluster resources so the very first cycle
     /// immediately requests scaling beyond current capacity.
     fn try_autoscale(&self, bundles: Vec<TaskResourceRequest>) -> DaftResult<()> {
+        if self.session.is_some() {
+            // Fixed execution demand was registered before admission. Cluster-wide
+            // high-water marks cannot be summed across managed executions.
+            return self.check_health();
+        }
         let mut state = self
             .state
             .lock()
@@ -508,6 +895,11 @@ impl WorkerManager for RayWorkerManager {
         skip_due_to_pending_scale_up: bool,
         force_all_when_cluster_idle: bool,
     ) -> DaftResult<usize> {
+        if self.session.is_some() {
+            // Only the runtime may initiate managed retirement. In particular,
+            // never clear Ray's global demand on query shutdown.
+            return Ok(0);
+        }
         // 1. Read downscale configuration from the environment. The worker manager owns
         //    every gating decision so the scheduler can stay backend-agnostic.
         //
@@ -596,12 +988,12 @@ impl WorkerManager for RayWorkerManager {
                 .filter_map(|(wid, w)| {
                     // Skip the head node entirely from retirement consideration.
                     if let Some(ref head_id) = head_node_id
-                        && wid.as_ref() == head_id
+                        && w.node_id() == head_id
                     {
                         return None;
                     }
 
-                    if w.is_idle() {
+                    if w.can_retire() {
                         let idle_for = w.idle_duration(now);
                         if let Some(threshold) = idle_secs_threshold {
                             if idle_for.as_secs() >= threshold {
@@ -676,5 +1068,301 @@ impl WorkerManager for RayWorkerManager {
         );
 
         Ok(released)
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_cancellation_does_not_quarantine_shared_workers() {
+        Python::initialize();
+        Python::attach(|py| {
+            let manager = RayWorkerManager::new(120, None);
+            manager
+                .state
+                .lock()
+                .unwrap()
+                .install_refresh(vec![worker(py, "worker")]);
+            manager.mark_task_unknown(TaskContext::default(), Arc::from("worker"));
+            assert!(manager.query_quiescent(1));
+            assert_eq!(
+                manager
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ray_workers
+                    .get("worker")
+                    .unwrap()
+                    .drain_state(),
+                DrainState::Active
+            );
+        });
+    }
+
+    #[test]
+    fn completed_discovery_is_harvested_without_a_scheduler() {
+        Python::initialize();
+        Python::attach(|py| {
+            let manager = RayWorkerManager::new(120, None);
+            let (tx, rx) = std::sync::mpsc::channel();
+            manager.refresh.lock().unwrap().pending = Some(rx);
+            manager.stop_execution();
+            tx.send(Ok(RefreshOutcome {
+                workers: vec![worker(py, "late")],
+                elapsed: Duration::ZERO,
+            }))
+            .unwrap();
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&manager.usage_snapshot()).unwrap();
+            assert_eq!(snapshot["discovery_pending"], false);
+            assert_eq!(snapshot["workers"][0]["state"], "READY_TO_RETIRE");
+        });
+    }
+
+    #[test]
+    fn confirmed_failure_allows_replacement_without_crossing_instance_lifetimes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let manager = RayWorkerManager::new(120, Some(py.None()));
+            manager
+                .state
+                .lock()
+                .unwrap()
+                .install_refresh(vec![worker(py, "old")]);
+            manager.mark_worker_died(Arc::from("old"));
+            {
+                let mut state = manager.state.lock().unwrap();
+                assert!(!state.nodes_to_skip().contains(&"node".to_string()));
+                let mut replacement = worker(py, "new");
+                replacement.drain.data_queries.insert(1);
+                state.install_refresh(vec![replacement]);
+            }
+            manager.mark_worker_died(Arc::from("old"));
+            manager.mark_task_unknown(TaskContext::default(), Arc::from("old"));
+            let state = manager.state.lock().unwrap();
+            assert_eq!(
+                state.ray_workers.get("old").unwrap().drain_state(),
+                DrainState::Failed
+            );
+            assert!(!state.ray_workers.get("new").unwrap().can_retire());
+            assert!(
+                state
+                    .ray_workers
+                    .get("new")
+                    .unwrap()
+                    .drain
+                    .data_queries
+                    .contains(&1)
+            );
+        });
+    }
+
+    #[test]
+    fn retirement_ack_can_be_retried_without_reopening_dispatch() {
+        use pyo3::ffi::c_str;
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c_str!(
+                    "
+class Actor:
+    def __init__(self):
+        self.calls = 0
+    def retire(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError('lost acknowledgement')
+"
+                ),
+                c_str!("drain_test.py"),
+                c_str!("drain_test"),
+            )
+            .unwrap();
+            let actor = module.getattr("Actor").unwrap().call0().unwrap().unbind();
+            let manager = RayWorkerManager::new(120, None);
+            manager
+                .state
+                .lock()
+                .unwrap()
+                .install_refresh(vec![RaySwordfishWorker::new(
+                    "attempt".into(),
+                    actor,
+                    1.0,
+                    0.0,
+                    1024,
+                    "localhost".into(),
+                    Some("node".into()),
+                )]);
+            manager.prepare_drain("node".into(), 4).unwrap();
+            assert!(manager.retire_node("node".into(), 4).is_err());
+            assert!(manager.cancel_drain("node".into(), 4).is_err());
+            assert_eq!(
+                manager
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ray_workers
+                    .values()
+                    .next()
+                    .unwrap()
+                    .drain_state(),
+                DrainState::Unknown
+            );
+            manager.retire_node("node".into(), 4).unwrap();
+            manager.retire_node("node".into(), 4).unwrap();
+            assert_eq!(
+                manager
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ray_workers
+                    .values()
+                    .next()
+                    .unwrap()
+                    .drain_state(),
+                DrainState::Retired
+            );
+        });
+    }
+
+    #[test]
+    fn prepare_between_scheduling_and_dispatch_prevents_submission() {
+        use common_daft_config::DaftExecutionConfig;
+        use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan, ShuffleBackend};
+        use daft_logical_plan::stats::StatsState;
+        use daft_schema::schema::Schema;
+
+        Python::initialize();
+        Python::attach(|py| {
+            let manager = RayWorkerManager::new(120, None);
+            manager
+                .state
+                .lock()
+                .unwrap()
+                .install_refresh(vec![worker(py, "attempt")]);
+            let schema = Arc::new(Schema::empty());
+            let scan = LocalPhysicalPlan::in_memory_scan(
+                0,
+                schema.clone(),
+                0,
+                StatsState::NotMaterialized,
+                LocalNodeContext::default(),
+            );
+            let plan = LocalPhysicalPlan::gather_write(
+                scan,
+                schema,
+                ShuffleBackend::Flight {
+                    shuffle_id: 1,
+                    shuffle_dirs: vec![],
+                    compression: None,
+                    shared: None,
+                },
+                StatsState::NotMaterialized,
+                LocalNodeContext::default(),
+            );
+            let task = SwordfishTask::for_recovery_test(
+                plan,
+                HashMap::new(),
+                Arc::new(DaftExecutionConfig::default()),
+                1,
+            );
+            let selected = HashMap::from([(Arc::from("attempt"), vec![task.clone()])]);
+            manager.prepare_drain("node".into(), 1).unwrap();
+            // A real submit would fail because the test actor handle is None.
+            // Returning no handle proves no RPC passed the final drain barrier.
+            assert!(
+                manager
+                    .submit_tasks_to_workers(selected)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                manager
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ray_workers
+                    .values()
+                    .next()
+                    .unwrap()
+                    .can_retire()
+            );
+
+            manager.cancel_drain("node".into(), 1).unwrap();
+            assert!(
+                manager
+                    .submit_tasks_to_workers(HashMap::from([(Arc::from("attempt"), vec![task])]))
+                    .is_err()
+            );
+            let state = manager.state.lock().unwrap();
+            let worker = state.ray_workers.values().next().unwrap();
+            // Even an ambiguous submit failure records both compute and output
+            // protection before entering Python.
+            assert_eq!(worker.active_task_details().len(), 1);
+            assert!(worker.drain.data_queries.contains(&0));
+            assert!(!worker.can_retire());
+        });
+    }
+
+    fn worker(py: Python<'_>, instance: &str) -> RaySwordfishWorker {
+        RaySwordfishWorker::new(
+            instance.into(),
+            py.None(),
+            4.0,
+            0.0,
+            1024,
+            "127.0.0.1".into(),
+            Some("node".into()),
+        )
+    }
+
+    #[test]
+    fn refresh_preserves_drain_and_retired_tombstones() {
+        Python::initialize();
+        Python::attach(|py| {
+            let manager = RayWorkerManager::new(120, None);
+            manager.prepare_drain("node".into(), 7).unwrap();
+            {
+                let mut state = manager.state.lock().unwrap();
+                state.install_refresh(vec![worker(py, "attempt-1")]);
+                let worker = state.ray_workers.values().next().unwrap();
+                assert_eq!(worker.drain.epoch, 7);
+                assert_eq!(worker.drain_state(), DrainState::ReadyToRetire);
+                assert!(state.nodes_to_skip().contains(&"node".to_string()));
+            }
+            manager.cancel_drain("node".into(), 7).unwrap();
+            assert!(manager.prepare_drain("node".into(), 7).is_err());
+            manager.prepare_drain("node".into(), 8).unwrap();
+            let mut state = manager.state.lock().unwrap();
+            // Even a zero TTL and a subsequent scale-up cannot clear a protocol tombstone.
+            state.node_drains.get_mut("node").unwrap().state = DrainState::Retired;
+            state.ray_workers.clear();
+            state.pending_release_blacklist.clear();
+            assert!(state.nodes_to_skip().contains(&"node".to_string()));
+        });
+    }
+
+    #[test]
+    fn data_and_unknown_state_prevent_retirement_before_any_rpc() {
+        Python::initialize();
+        Python::attach(|py| {
+            let manager = RayWorkerManager::new(120, None);
+            let mut w = worker(py, "attempt-1");
+            w.drain.data_queries.insert(1);
+            manager.state.lock().unwrap().install_refresh(vec![w]);
+            manager.prepare_drain("node".into(), 1).unwrap();
+            assert!(manager.retire_node("node".into(), 1).is_err());
+            {
+                let mut state = manager.state.lock().unwrap();
+                let w = state.ray_workers.values_mut().next().unwrap();
+                w.drain.data_queries.clear();
+                w.drain.unknown = Some("cleanup failed".into());
+            }
+            assert!(manager.retire_node("node".into(), 1).is_err());
+            assert!(!manager.query_quiescent(1));
+        });
     }
 }

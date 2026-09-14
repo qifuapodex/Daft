@@ -164,6 +164,13 @@ impl<W: Worker> Dispatcher<W> {
             self.joinset_id_to_task.insert(id, scheduled_task);
         }
 
+        // The manager rechecks the drain barrier under the same lock that admits
+        // tasks. A prepare between scheduling and submission leaves these tasks
+        // unsubmitted; preserve their retry budget and reschedule on fresh state.
+        for (_, (task, _permit)) in task_context_to_task {
+            self.deferred.push(task.defer());
+        }
+
         Ok(())
     }
 
@@ -201,7 +208,12 @@ impl<W: Worker> Dispatcher<W> {
             for CompletedTask { task_result, task } in task_results {
                 let (worker_id, task, result_tx, canc, attempts) = task.into_inner();
 
-                // Always mark the task as finished regardless of the result
+                if matches!(
+                    &task_result,
+                    Ok(TaskStatus::Cancelled | TaskStatus::WorkerUnavailable) | Err(_)
+                ) {
+                    worker_manager.mark_task_unknown(task.task_context(), worker_id.clone());
+                }
                 worker_manager.mark_task_finished(task.task_context(), worker_id.clone());
 
                 // Decide the disposition before emitting the event, so the event's

@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     import dask
     import dask.dataframe
 
+    from daft.runners.cluster_scheduling import ClusterSchedulingConfig
+
 
 logger = logging.getLogger(__name__)
 
@@ -567,6 +569,7 @@ class RayRunner(Runner[ray.ObjectRef]):
             ray.init(address=address)
 
         self.flotilla_plan_runner: FlotillaRunner | None = None
+        self.cluster_scheduling: ClusterSchedulingConfig | None = None
 
     def initialize_partition_set_cache(self) -> PartitionSetCache:
         return PartitionSetCache()
@@ -659,6 +662,7 @@ class RayRunner(Runner[ray.ObjectRef]):
             if self.flotilla_plan_runner is None:
                 self.flotilla_plan_runner = FlotillaRunner(
                     worker_startup_timeout=self.worker_startup_timeout,
+                    cluster_scheduling=self.cluster_scheduling,
                 )
 
             total_rows = 0
