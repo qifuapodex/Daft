@@ -77,6 +77,7 @@
         * [Built on Daft](extensions/projects.md)
         * [Authoring Guide](extensions/authoring.md)
     * [Architecture](architecture/index.md)
+        * [Flotilla shared cluster scheduling](architecture/flotilla-shared-cluster-scheduling.md)
         * [Flotilla shared shuffle recovery](architecture/flotilla-shuffle-recovery.md)
     * Scaling & Performance
         * Scaling Out and Deployment

@@ -414,12 +414,14 @@ pub(super) mod test_utils {
         }
         // With no local dependency left, a future Ray-backed affinity task can
         // move to another worker rather than deadlocking a ready target.
-        draining.drain_state = DrainState::ReadyToRetire;
-        scheduler.update_worker_state(&[draining, active]);
-        scheduler.enqueue_tasks(vec![create_worker_affinity_task(&target, false, Some(3))]);
-        let (tasks, _) = scheduler.schedule_tasks();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].worker_id(), other);
+        for state in [DrainState::ReadyToRetire, DrainState::Unknown] {
+            draining.drain_state = state;
+            scheduler.update_worker_state(&[draining.clone(), active.clone()]);
+            scheduler.enqueue_tasks(vec![create_worker_affinity_task(&target, false, Some(3))]);
+            let (tasks, _) = scheduler.schedule_tasks();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].worker_id(), other);
+        }
     }
 
     #[test]

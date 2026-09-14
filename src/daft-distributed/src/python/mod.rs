@@ -98,7 +98,11 @@ impl PythonPartitionRefStream {
         self.cancel_token.cancel();
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            inner.lock().await.take();
+            if let Some(mut stream) = inner.lock().await.take() {
+                // Drain the coordinator after cancellation instead of aborting
+                // its JoinSet and abandoning shared worker accounting.
+                while stream.next().await.is_some() {}
+            }
             Ok(())
         })
     }
@@ -138,7 +142,7 @@ impl PyDistributedPhysicalPlan {
     }
 
     fn idx(&self) -> String {
-        self.plan.idx().to_string()
+        self.plan.query_id().to_string()
     }
 
     fn num_partitions(&self) -> PyResult<usize> {
@@ -278,6 +282,10 @@ impl PyDistributedPhysicalPlanRunner {
         py.detach(|| self.worker_manager.stop_execution());
     }
 
+    fn retire_completed_workers(&self, py: Python) -> PyResult<()> {
+        Ok(py.detach(|| self.worker_manager.retire_completed_workers())?)
+    }
+
     fn get_node_usage_snapshot(&self, py: Python) -> String {
         py.detach(|| self.worker_manager.usage_snapshot())
     }
@@ -370,8 +378,8 @@ impl PyDistributedPhysicalPlanRunner {
                 .run_plan(query_idx, translation.root, statistics_manager.clone())?;
 
         let part_stream = PythonPartitionRefStream {
+            cancel_token: plan_result.cancel_token.clone(),
             inner: Arc::new(Mutex::new(Some(plan_result.into_stream()))),
-            cancel_token: tokio_util::sync::CancellationToken::new(),
             statistics_manager,
         };
         Ok(part_stream)
@@ -381,6 +389,7 @@ impl PyDistributedPhysicalPlanRunner {
 pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
     parent.add_class::<PyDistributedPhysicalPlan>()?;
     parent.add_class::<PyDistributedPhysicalPlanRunner>()?;
+    parent.add_class::<PythonPartitionRefStream>()?;
     parent.add_class::<RaySwordfishTask>()?;
     parent.add_class::<RaySwordfishWorker>()?;
     parent.add_class::<RayTaskResult>()?;

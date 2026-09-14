@@ -26,7 +26,7 @@ daft.set_runner_ray(
 )
 ```
 
-The factory receives an `ExecutionIdentity` on the head. Each query gets a new
+The factory receives an `ExecutionIdentity` on a background thread on the head. Each query gets a new
 execution UUID, client session, worker manager, and actor instances. Concurrent
 queries share Ray nodes and do not reserve exclusive CPUs. Worker instance UUIDs
 change when actors are replaced; node IDs remain Ray node IDs.
@@ -37,8 +37,9 @@ must deduplicate/aggregate execution records by `job_attempt_id` according to it
 job policy. Setting this value to zero allows job-level capacity registration to
 be the sole source of fixed demand. Adaptive demand aggregation is not enabled.
 
-Without this configuration, the existing standalone autoscaling path remains
-available. In managed mode both the scheduler's scale-up path and the legacy
+Without this configuration, the existing standalone autoscaling and best-effort
+cleanup paths remain available. Standalone queries do not share the managed
+UNKNOWN latch or wait for other queries' Flight reads and fsyncs. In managed mode both the scheduler's scale-up path and the legacy
 idle-downscale path bypass global `request_resources`, including global zero.
 Client failure never switches the execution back to that path.
 
@@ -50,10 +51,10 @@ threads. No control RPC runs under the Rust worker-manager state mutex.
 
 | Method | Acknowledgement |
 | --- | --- |
-| `register_execution(identity, capabilities)` | Return integer protocol version 1. Capabilities include the Ray `control_actor` handle. |
+| `register_execution(identity, capabilities)` | Return integer protocol version 1. Capabilities include the Ray `control_actor` handle and `execution_worker_retirement=True`. |
 | `update_execution_demand(execution_id, revision, requested_total_cpus)` | Persist this execution's total demand. |
 | `register_worker(execution_id, worker_instance_id, node_id)` | Return exactly `True` only after atomically registering the participant and establishing node protection; return `False` when admission is closed. |
-| `report_node_usage(execution_id, node_id, revision, usage)` | Record the summary and verify the participant's node protection is still valid. Raise if protection cannot be verified. |
+| `report_node_usage(execution_id, node_id, revision, usage)` | Record the summary and verify protection for nonterminal participants. A terminal `RETIRED`/`FAILED` worker report acknowledges confirmed actor death; recording it may release only that participant's protection. Raise if recording or protection verification fails. |
 | `finish_execution(execution_id, revision, cleanup_status)` | Withdraw this execution's demand while retaining unresolved participants/data protection. |
 
 Updates use monotonically increasing revisions within each execution. Reports
@@ -82,16 +83,21 @@ The registered `control_actor` exposes these Ray actor methods:
 Epochs are positive, monotonically increasing per node. Prepare and retirement
 are idempotent for their current epochs. Retired nodes retain tombstones and
 cannot be rediscovered or restored through an old cancel request. Discovery in
-progress blocks a retirement acknowledgement.
+progress blocks a retirement acknowledgement. Finished discovery is collected
+by control snapshots as well as by the running scheduler. Control failures only
+block nodes that execution registered or attempted to register; discovery remains
+a barrier until its result is known.
 
 A task selected before prepare is rechecked at final submission. Rejected tasks
 return to the pending queue without consuming retry attempts. Existing hard
 affinity work can finish on a draining worker with retained dependencies.
 Current Ray-backed affinity inputs can move to another worker once the target
-has no local dependencies. Unknown and retired workers receive no new work.
+has no local dependencies or is UNKNOWN. This fallback moves only the existing
+Ray-owned affinity inputs; it does not release any UNKNOWN worker's protection.
+Unknown and retired workers receive no new work.
 
 The runtime must close node participant admission before prepare, aggregate all
-executions/jobs, and only release node protection after retirement acknowledgements.
+executions/jobs, and only release node protection after all participant retirement acknowledgements.
 A READY snapshot or successful prepare is not permission to remove a node.
 Ray's own resources, objects and final drain checks still apply.
 
@@ -106,10 +112,27 @@ Workers that never produced local output can become ready while a query is activ
 On query completion the manager closes dispatch for that query and verifies
 quiescence. Worker cleanup removes Flight registrations, waits for existing local
 and remote response streams and background fsyncs, and removes local files.
-Only after all worker acknowledgements does it remove shared files and release
-query data holds. Any partial failure preserves protection.
+Only after all worker acknowledgements does it remove shared files, using a
+worker node with the shared mount, and release query data holds. Ordinary Ray
+cleanup tasks also sweep surviving nodes of actors that died during the query.
+Any partial failure preserves protection and is exposed as `cleanup_error`.
+The process-wide read/fsync counters are used only by managed actors, which are
+exclusive to one execution.
 
-Cancellation first closes admission and drops the execution stream. Requesting
+After an execution finishes, its dependency-free actors are retired automatically,
+without draining their nodes or excluding those nodes from new queries. Actor
+death must be acknowledged first, followed by a terminal report to the runtime.
+Only after that report succeeds is the execution removed from the head's maps.
+Reports continue while retirement is in progress. Failed cleanup or ambiguous
+remote work keeps the execution available for external reconciliation.
+
+`active_tasks` describes dispatched computation, not an exact count of Flight IO.
+Data holds and `cleanup_error` are separate blockers; the protocol does not expose
+an `inflight_operations` counter or authorize retirement from a zero task count.
+
+Cancellation closes admission, stops task production, and waits for the scheduler
+to account for task cancellations before query cleanup. It does not abort the
+coordinator JoinSet and abandon shared worker accounting. Requesting
 remote cancellation is not proof of termination: unconfirmed tasks become an
 UNKNOWN blocker. Transport ambiguity cannot be interpreted as normal retirement. Confirmed actor
 death is recorded as FAILED, allows a freshly protected replacement instance,

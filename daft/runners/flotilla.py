@@ -9,7 +9,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from daft.context import get_context
 from daft.daft import (
@@ -44,8 +44,9 @@ from daft.subscribers.event_log_sink import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Generator
+    from collections.abc import AsyncGenerator, Generator
 
+    from daft.daft import PythonPartitionRefStream
     from daft.runners.ray_runner import RayMaterializedResult
 
 try:
@@ -712,15 +713,49 @@ def start_ray_workers(
     return handles
 
 
-async def await_flight_shuffle_cleanup(refs: list[ray.ObjectRef], shared_dirs: list[str]) -> None:
+@ray.remote(num_cpus=0)  # type: ignore[untyped-decorator]
+def _remove_shuffle_dirs_strict(directories: list[str]) -> None:
+    for directory in directories:
+        if os.path.exists(directory):
+            shutil.rmtree(directory)
+
+
+async def await_flight_shuffle_cleanup(
+    refs: list[ray.ObjectRef[Any]],
+    shared_dirs: list[str],
+    local_dirs: list[str] | None = None,
+    node_ids: list[str] | None = None,
+) -> None:
     results = await asyncio.gather(*refs, return_exceptions=True)
     failures = [result for result in results if isinstance(result, BaseException)]
     if failures:
         raise RuntimeError(f"Flight cleanup was not acknowledged: {failures!r}")
-    # A shared mount has one tree. The head sees that same mount.
-    for directory in shared_dirs:
-        if os.path.exists(directory):
-            await asyncio.to_thread(shutil.rmtree, directory)
+    if not shared_dirs and not local_dirs:
+        return
+    # Actor death does not remove its node's local disk. After reader/writer
+    # acknowledgements, ordinary Ray tasks also sweep former producers' nodes.
+    nodes = [n for n in ray.nodes() if n.get("Alive", True) and n.get("Resources", {}).get("CPU", 0) > 0]
+    deletes = []
+    if local_dirs:
+        for node in nodes:
+            if node_ids is None or node["NodeID"] in node_ids:
+                deletes.append(
+                    _remove_shuffle_dirs_strict.options(
+                        scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                            node_id=node["NodeID"], soft=False
+                        )
+                    ).remote(local_dirs)
+                )
+    await asyncio.gather(*deletes)
+    if shared_dirs:
+        if not nodes:
+            raise RuntimeError("No worker node is available to acknowledge shared shuffle cleanup")
+        # The head need not have the workers' shared mount.
+        await _remove_shuffle_dirs_strict.options(
+            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=nodes[0]["NodeID"], soft=False
+            )
+        ).remote(shared_dirs)
 
 
 def try_autoscale(bundles: list[dict[str, int]]) -> None:
@@ -748,7 +783,8 @@ class RemoteFlotillaRunner:
         self.cluster_scheduling = cluster_scheduling
         self.worker_startup_timeout = worker_startup_timeout
         self.managed_executions: dict[str, tuple[ManagedExecution, DistributedPhysicalPlanRunner]] = {}
-        self.reporting_tasks: dict[str, asyncio.Task] = {}
+        self.reporting_tasks: dict[str, asyncio.Task[None]] = {}
+        self.retirement_lock = asyncio.Lock()
         self.node_drains: dict[str, int] = {}
         self.cancelled_drain_epochs: dict[str, int] = {}
         self.retiring_nodes: set[str] = set()
@@ -776,7 +812,7 @@ class RemoteFlotillaRunner:
             )
 
         self.curr_plans: dict[str, DistributedPhysicalPlan] = {}
-        self.curr_result_gens: dict[str, AsyncIterator[RayPartitionRef]] = {}
+        self.curr_result_gens: dict[str, PythonPartitionRefStream] = {}
         self.plan_runner = DistributedPhysicalPlanRunner(worker_startup_timeout)
         ray._private.worker.blocking_get_inside_async_warned = True
         set_event_loop(asyncio.get_running_loop())
@@ -795,37 +831,65 @@ class RemoteFlotillaRunner:
         }
         runner = self.plan_runner
         if self.cluster_scheduling is not None:
-            session = ManagedExecution(self.cluster_scheduling, ray.get_runtime_context().current_actor)
-            await asyncio.to_thread(session.open)
+            session = await asyncio.to_thread(
+                ManagedExecution, self.cluster_scheduling, ray.get_runtime_context().current_actor
+            )
             runner = DistributedPhysicalPlanRunner(self.worker_startup_timeout, cluster_session=session)
-            # Install persistent drain exclusions before this execution discovers
-            # workers, including drains prepared before the execution existed.
-            for node_id, epoch in self.node_drains.items():
-                runner.prepare_node_drain(node_id, epoch)
             self.managed_executions[plan.idx()] = (session, runner)
+            try:
+                await asyncio.to_thread(session.open)
+                # No await between applying exclusions and starting the plan.
+                for node_id, epoch in self.node_drains.items():
+                    runner.prepare_node_drain(node_id, epoch)
+            except Exception:
+                runner.stop_execution()
+                try:
+                    await asyncio.to_thread(session.abort_open)
+                except Exception:
+                    logger.exception("Managed startup withdrawal unacknowledged; runtime must reconcile")
+                if session.finished and not session.participant_nodes:
+                    self.managed_executions.pop(plan.idx(), None)
+                raise
             self.reporting_tasks[plan.idx()] = asyncio.create_task(self._report_usage(plan.idx()))
+
         self.curr_plans[plan.idx()] = plan
         try:
             self.curr_result_gens[plan.idx()] = runner.run_plan(plan, psets)
         except Exception:
+            if self.cluster_scheduling is not None:
+                runner.stop_execution()
             await self._finish_managed_execution(plan.idx(), "UNKNOWN")
             self.curr_plans.pop(plan.idx(), None)
             raise
 
+    async def _retire_finished_workers(self, runner: DistributedPhysicalPlanRunner) -> None:
+        try:
+            await asyncio.to_thread(runner.retire_completed_workers)
+        except Exception:
+            logger.warning("Completed worker retirement will be retried", exc_info=True)
+
     async def _report_usage(self, plan_id: str) -> None:
         session, runner = self.managed_executions[plan_id]
+        retirement_task: asyncio.Task[None] | None = None
         try:
             while True:
+                if session.finished and (retirement_task is None or retirement_task.done()):
+                    # Keep heartbeats running while actor-death RPCs are pending.
+                    retirement_task = asyncio.create_task(self._retire_finished_workers(runner))
                 snapshot = json.loads(runner.get_node_usage_snapshot())
                 await asyncio.to_thread(session.report, snapshot)
                 if (
                     session.finished
                     and snapshot["closed"]
                     and not snapshot["discovery_pending"]
+                    and not snapshot.get("cleanup_error")
                     and all(w["state"] in ("RETIRED", "FAILED") for w in snapshot["workers"])
                 ):
                     session.complete_retirement()
+                    if retirement_task is not None:
+                        await retirement_task
                     self.reporting_tasks.pop(plan_id, None)
+                    self.managed_executions.pop(plan_id, None)
                     return
                 await asyncio.sleep(session.config.report_interval_seconds)
         except Exception as error:
@@ -839,7 +903,14 @@ class RemoteFlotillaRunner:
         session, runner = entry
         snapshot = json.loads(runner.get_node_usage_snapshot())
         if status is None:
-            status = "CLEAN" if snapshot["closed"] and all(w["can_retire"] for w in snapshot["workers"]) else "UNKNOWN"
+            status = (
+                "CLEAN"
+                if snapshot["closed"]
+                and not snapshot.get("cleanup_error")
+                and not snapshot["discovery_pending"]
+                and all(w["can_retire"] for w in snapshot["workers"])
+                else "UNKNOWN"
+            )
         try:
             await asyncio.to_thread(session.report, snapshot)
             await asyncio.to_thread(session.finish, status)
@@ -848,16 +919,17 @@ class RemoteFlotillaRunner:
         # Continue reports and retain the manager until its workers are retired.
         # A completed query can still own data after partial cleanup failure.
 
-    def get_node_usage_snapshot(self) -> dict:
+    def get_node_usage_snapshot(self) -> dict[str, Any]:
         return {
             session.identity.execution_id: {
                 **json.loads(runner.get_node_usage_snapshot()),
                 "control_error": session.failure,
+                "participant_nodes": list(session.participant_nodes),
             }
             for session, runner in self.managed_executions.values()
         }
 
-    def prepare_node_drain(self, node_id: str, drain_epoch: int) -> dict:
+    def prepare_node_drain(self, node_id: str, drain_epoch: int) -> dict[str, Any]:
         if self.cluster_scheduling is None:
             raise RuntimeError("Node drain requires managed cluster scheduling")
         if node_id in self.retiring_nodes or node_id in self.retired_nodes:
@@ -874,7 +946,7 @@ class RemoteFlotillaRunner:
             runner.prepare_node_drain(node_id, drain_epoch)
         return self.get_node_drain_status(node_id, drain_epoch)
 
-    def get_node_drain_status(self, node_id: str, drain_epoch: int) -> dict:
+    def get_node_drain_status(self, node_id: str, drain_epoch: int) -> dict[str, Any]:
         if self.node_drains.get(node_id) != drain_epoch:
             raise ValueError("Stale or unknown drain epoch")
         executions = self.get_node_usage_snapshot()
@@ -886,7 +958,10 @@ class RemoteFlotillaRunner:
         )
         if any(s["discovery_pending"] for s in executions.values()):
             state = "DRAINING"
-        if any(w["unknown"] for w in workers) or any(s["control_error"] for s in executions.values()):
+        if any(w["unknown"] for w in workers) or any(
+            (s["control_error"] or s.get("cleanup_error")) and node_id in s["participant_nodes"]
+            for s in executions.values()
+        ):
             state = "UNKNOWN"
         if node_id in self.retiring_nodes and state != "UNKNOWN":
             state = "RETIRING"
@@ -894,7 +969,7 @@ class RemoteFlotillaRunner:
             state = "RETIRED"
         return {"node_id": node_id, "drain_epoch": drain_epoch, "state": state, "workers": workers}
 
-    def cancel_node_drain(self, node_id: str, drain_epoch: int) -> dict:
+    def cancel_node_drain(self, node_id: str, drain_epoch: int) -> dict[str, Any]:
         if node_id in self.retiring_nodes or node_id in self.retired_nodes:
             raise ValueError("Node retirement is committed")
         if self.cancelled_drain_epochs.get(node_id) == drain_epoch:
@@ -906,19 +981,20 @@ class RemoteFlotillaRunner:
         del self.node_drains[node_id]
         return self.get_node_usage_snapshot()
 
-    async def retire_node_workers(self, node_id: str, drain_epoch: int) -> dict:
-        status = self.get_node_drain_status(node_id, drain_epoch)
-        if status["state"] == "RETIRED":
-            return status
-        if status["state"] != "READY_TO_RETIRE" and node_id not in self.retiring_nodes:
-            raise RuntimeError(f"Node is not ready: {status}")
-        self.retiring_nodes.add(node_id)
-        # Rust rechecks under its dispatch lock and waits for actor death outside it.
-        for _, runner in list(self.managed_executions.values()):
-            await asyncio.to_thread(runner.retire_node_workers, node_id, drain_epoch)
-        self.retiring_nodes.remove(node_id)
-        self.retired_nodes.add(node_id)
-        return self.get_node_drain_status(node_id, drain_epoch)
+    async def retire_node_workers(self, node_id: str, drain_epoch: int) -> dict[str, Any]:
+        async with self.retirement_lock:
+            status = self.get_node_drain_status(node_id, drain_epoch)
+            if status["state"] == "RETIRED":
+                return status
+            if status["state"] != "READY_TO_RETIRE" and node_id not in self.retiring_nodes:
+                raise RuntimeError(f"Node is not ready: {status}")
+            self.retiring_nodes.add(node_id)
+            # Rust rechecks under its dispatch lock and waits for actor death outside it.
+            for _, runner in list(self.managed_executions.values()):
+                await asyncio.to_thread(runner.retire_node_workers, node_id, drain_epoch)
+            self.retiring_nodes.discard(node_id)
+            self.retired_nodes.add(node_id)
+            return self.get_node_drain_status(node_id, drain_epoch)
 
     async def cancel_plan(self, plan_id: str) -> None:
         entry = self.managed_executions.get(plan_id)
@@ -942,9 +1018,7 @@ class RemoteFlotillaRunner:
         except StopAsyncIteration:
             next_partition_ref = None
         except Exception:
-            await self._finish_managed_execution(plan_id, "UNKNOWN")
-            self.curr_plans.pop(plan_id, None)
-            self.curr_result_gens.pop(plan_id, None)
+            await self.cancel_plan(plan_id)
             raise
 
         if next_partition_ref is None:
@@ -953,7 +1027,7 @@ class RemoteFlotillaRunner:
             # nodes that started but never naturally drained, dispatching
             # them on the actor's local `DaftContext` (whose `_dashboard`
             # subscriber forwards them straight to the dashboard server).
-            stats: PyExecutionStats = result_gen.finish()  # type: ignore[attr-defined]
+            stats: PyExecutionStats = result_gen.finish()
             self.curr_plans.pop(plan_id, None)
             self.curr_result_gens.pop(plan_id, None)
             return stats

@@ -129,6 +129,14 @@ impl RaySwordfishWorker {
         }
     }
 
+    pub fn forget_query_tasks(&mut self, query_idx: crate::plan::QueryIdx) {
+        self.active_task_details
+            .retain(|task, _| task.query_idx != query_idx);
+        if self.active_task_details.is_empty() {
+            self.set_state(ActorState::Idle);
+        }
+    }
+
     /// Ask this worker's actor to forget `shuffle_ids`, returning the pending
     /// call so the caller can await the whole fan-out at once.
     pub fn unregister_shuffles(&self, py: Python<'_>, shuffle_ids: &[u64]) -> PyResult<Py<PyAny>> {
@@ -221,7 +229,7 @@ impl RaySwordfishWorker {
                 target: "ray_swordfish_worker",
                 worker_id = %self.worker_id,
                 inflight_tasks = inflight,
-                "Cannot release worker because it has active tasks."
+                "Cannot release worker while task, data, or unknown dependencies remain."
             );
             return;
         }

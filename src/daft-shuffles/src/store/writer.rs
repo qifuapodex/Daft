@@ -39,9 +39,9 @@ static BACKGROUND_FSYNCS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Background `fsync`s that have not finished yet.
 ///
-/// Exists so a benchmark can tell when the deferred half of
-/// [`ShuffleDurability::Background`] is actually done; nothing in the execution
-/// path waits on it, which is the entire point of the level.
+/// Counts the deferred half of [`ShuffleDurability::Background`]. Managed actor
+/// cleanup waits on it after its exclusive execution has stopped; task execution
+/// itself does not wait for background durability.
 pub fn background_fsyncs_in_flight() -> usize {
     BACKGROUND_FSYNCS_IN_FLIGHT.load(Ordering::Acquire)
 }

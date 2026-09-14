@@ -197,14 +197,17 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         let runtime = get_or_init_runtime();
         let (result_sender, result_receiver) = create_channel(1);
         let this = self.clone();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let plan_cancel = cancel_token.clone();
         let joinset = runtime.block_on_current_thread(async move {
-            let mut joinset = create_join_set();
+            let mut scheduler_joinset = create_join_set();
             let scheduler_handle = spawn_scheduler_actor(
                 self.worker_manager.clone(),
-                &mut joinset,
+                &mut scheduler_joinset,
                 statistics_manager.clone(),
             );
 
+            let mut joinset = create_join_set();
             joinset.spawn(async move {
                 this.run_plan_impl(
                     pipeline_node,
@@ -212,12 +215,14 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
                     scheduler_handle,
                     statistics_manager,
                     result_sender,
+                    scheduler_joinset,
+                    plan_cancel,
                 )
                 .await
             });
             joinset
         });
-        Ok(PlanResult::new(joinset, result_receiver))
+        Ok(PlanResult::new(joinset, result_receiver, cancel_token))
     }
 
     /// Point out when a shuffle is too narrow to occupy the cluster it is running
@@ -267,6 +272,7 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_plan_impl(
         &self,
         pipeline_node: DistributedPipelineNode,
@@ -274,6 +280,8 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         scheduler_handle: SchedulerHandle<SwordfishTask>,
         statistics_manager: StatisticsManagerRef,
         sender: Sender<MaterializedOutput>,
+        mut scheduler_joinset: JoinSet<DaftResult<()>>,
+        cancel_token: tokio_util::sync::CancellationToken,
     ) -> DaftResult<()> {
         let mut plan_context =
             PlanExecutionContext::new(query_idx, scheduler_handle.clone(), statistics_manager);
@@ -309,11 +317,19 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         // shared mount, and the registrations in every worker's memory, for the
         // lifetime of the cluster.
         let mut plan_result = Ok(());
-        while let Some(result) = materialized_result_stream.next().await {
+        loop {
+            let result = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => break,
+                result = materialized_result_stream.next() => result,
+            };
+            let Some(result) = result else { break };
             match result {
                 Ok(output) => {
-                    if sender.send(output).await.is_err() {
-                        break;
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => break,
+                        sent = sender.send(output) => if sent.is_err() { break; },
                     }
                 }
                 Err(e) => {
@@ -326,6 +342,14 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         // coordinator dispatching further tasks before their output directories
         // are deleted.
         drop(materialized_result_stream);
+
+        // Dropping the task builders requests cancellation. Keep the scheduler
+        // alive until it accounts for completions/cancellations before cleanup.
+        while let Some(result) = scheduler_joinset.join_next().await {
+            if let Err(error) = result.and_then(|result| result) {
+                plan_result = Err(error);
+            }
+        }
 
         if let Err(e) = self
             .worker_manager

@@ -78,11 +78,20 @@ pub(crate) type PlanResultStream =
 pub(crate) struct PlanResult {
     joinset: JoinSet<DaftResult<()>>,
     rx: Receiver<MaterializedOutput>,
+    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl PlanResult {
-    fn new(joinset: JoinSet<DaftResult<()>>, rx: Receiver<MaterializedOutput>) -> Self {
-        Self { joinset, rx }
+    fn new(
+        joinset: JoinSet<DaftResult<()>>,
+        rx: Receiver<MaterializedOutput>,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            joinset,
+            rx,
+            cancel_token,
+        }
     }
 
     pub fn into_stream(self) -> PlanResultStream {

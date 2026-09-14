@@ -40,6 +40,7 @@ def _run():
             self.finished = {}
             self.workers = set()
             self.revisions = {}
+            self.retired = set()
 
         def call(self, method, args):
             if method == "register_execution":
@@ -53,12 +54,14 @@ def _run():
             self.revisions[execution] = revision
             if method == "update_execution_demand":
                 self.demand[execution] = value
+            elif method == "report_node_usage":
+                self.retired.update(w["worker_instance_id"] for w in value["workers"] if w["state"] == "RETIRED")
             elif method == "finish_execution":
                 self.demand.pop(execution)
                 self.finished[execution] = value
 
         def snapshot(self):
-            return self.demand, self.finished, self.workers
+            return self.demand, self.finished, self.workers, self.retired
 
     class Client:
         def __init__(self, ledger):
@@ -94,6 +97,13 @@ def _run():
             # Warm up the driver's lazy runner before concurrent execution.
             cached = daft.from_pydict({"k": [0, 1], "v": [1, 1]}).select((daft.col("v") + 1).alias("v")).collect()
 
+            control = get_or_create_runner().flotilla_plan_runner.runner
+            deadline = time.monotonic() + 20
+            while ray.get(control.get_node_usage_snapshot.remote()) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not ray.get(control.get_node_usage_snapshot.remote())
+            # The same node remains usable after execution-local actor retirement.
+
             def query(offset):
                 return (
                     daft.from_pydict({"k": [0, 1] * 100, "v": list(range(offset, offset + 200))})
@@ -108,14 +118,13 @@ def _run():
                 a, b = list(pool.map(query, [0, 100]))
             assert a == {"k": [0, 1], "v": [9900, 10000]}
             assert b == {"k": [0, 1], "v": [19900, 20000]}
-            demand, finished, workers = ray.get(ledger.snapshot.remote())
+            demand, finished, workers, retired = ray.get(ledger.snapshot.remote())
             assert not demand
             assert len(finished) >= 3 and set(finished.values()) == {"CLEAN"}, finished
             assert len({worker for _, worker, _ in workers}) == len(workers)
 
             control = get_or_create_runner().flotilla_plan_runner.runner
             snapshots = ray.get(control.get_node_usage_snapshot.remote())
-            assert len(snapshots) >= 3
             assert all(w["can_retire"] for s in snapshots.values() for w in s["workers"])
             nodes = {node for _, _, node in workers}
             for node in nodes:
@@ -131,6 +140,12 @@ def _run():
                 assert status["state"] == "RETIRED", status
                 with pytest.raises(ray.exceptions.RayTaskError):
                     ray.get(control.cancel_node_drain.remote(node, 2))
+            deadline = time.monotonic() + 20
+            while ray.get(control.get_node_usage_snapshot.remote()) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not ray.get(control.get_node_usage_snapshot.remote())
+            _, _, workers, retired = ray.get(ledger.snapshot.remote())
+            assert retired == {worker for _, worker, _ in workers}
             # Native Ray result ownership survives Daft actor retirement.
             assert cached.to_pydict() == {"v": [2, 2]}
     finally:
@@ -139,3 +154,39 @@ def _run():
 
 if __name__ == "__main__":
     _run()
+
+
+@pytest.mark.integration
+def test_standalone_limit_and_abandoned_iteration():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tests.ray.test_cluster_scheduling_integration import _run_standalone; _run_standalone()",
+        ],
+        env={**os.environ, "DAFT_RUNNER": "ray", "DAFT_PROGRESS_BAR": "0", "RAY_DISABLE_DASHBOARD": "1"},
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _run_standalone():
+    import ray
+
+    import daft
+
+    ray.init(num_cpus=2, include_dashboard=False, object_store_memory=100 * 1024**2)
+    try:
+        daft.set_runner_ray()
+        for _ in range(3):
+            frame = daft.from_pydict({"v": list(range(64))}).repartition(8)
+            assert len(frame.limit(1).to_pydict()["v"]) == 1
+            rows = frame.iter_rows()
+            next(rows)
+            rows.close()
+            assert frame.agg(daft.col("v").sum()).to_pydict() == {"v": [2016]}
+    finally:
+        ray.shutdown()

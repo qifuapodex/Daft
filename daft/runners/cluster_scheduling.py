@@ -2,8 +2,8 @@
 
 The client runs on the head, must be thread safe, and must acknowledge worker
 protection before returning from register_worker. It owns neither Daft tasks nor
-their data. A runtime must retain protection until retire_node_workers succeeds;
-missing reports are UNKNOWN, never permission to reclaim a node.
+their data. A runtime retains protection until acknowledged actor retirement, either through
+node drain or a terminal execution report. Missing reports are UNKNOWN.
 """
 
 from __future__ import annotations
@@ -99,6 +99,8 @@ class ManagedExecution:
         self._opened = False
         self._has_workers = False
         self._last_ack = time.monotonic()
+        self.participant_nodes: set[str] = set()
+        self._rejected_nodes: dict[str, float] = {}
 
     @property
     def failure(self) -> str | None:
@@ -151,6 +153,7 @@ class ManagedExecution:
                     "capacity_mode": "fixed",
                     "data_retention": "query_cleanup",
                     "worker_retirement": True,
+                    "execution_worker_retirement": True,
                 },
             )
             if type(version) is not int or version != PROTOCOL_VERSION:
@@ -168,19 +171,32 @@ class ManagedExecution:
         with self._lock:
             if self._finished:
                 return False
-            accepted = self._call("register_worker", self.identity.execution_id, worker_instance_id, node_id)
+            try:
+                accepted = self._call("register_worker", self.identity.execution_id, worker_instance_id, node_id)
+            except Exception:
+                # Admission may have committed before its reply was lost.
+                self.participant_nodes.add(node_id)
+                raise
             if type(accepted) is not bool:
+                self.participant_nodes.add(node_id)
                 self._failure = "register_worker did not acknowledge protection with a boolean"
                 self.check_health()
             if accepted:
                 self._has_workers = True
+                self.participant_nodes.add(node_id)
+            else:
+                self._rejected_nodes[node_id] = time.monotonic() + 30
             return accepted
 
     def start_workers(self, existing_worker_ids: list[str], worker_startup_timeout: int) -> list[Any]:
         from daft.runners.flotilla import start_ray_workers
 
         self.check_health()
-        return start_ray_workers(existing_worker_ids, worker_startup_timeout, session=self)
+        now = time.monotonic()
+        self._rejected_nodes = {node: deadline for node, deadline in self._rejected_nodes.items() if deadline > now}
+        return start_ray_workers(
+            list(set(existing_worker_ids) | self._rejected_nodes.keys()), worker_startup_timeout, session=self
+        )
 
     def report(self, snapshot: dict[str, Any]) -> None:
         with self._lock:
@@ -195,12 +211,10 @@ class ManagedExecution:
                     self._next_revision(),
                     {
                         "workers": workers,
+                        "cleanup_error": snapshot.get("cleanup_error"),
                         "active_tasks": sum(w["active_tasks"] for w in workers),
                         "logical_cpus": sum(w["logical_cpus"] for w in workers),
                         "local_data_dependencies": sum(len(w["local_data_queries"]) for w in workers),
-                        # Includes publication/reconstruction and reads: task holds
-                        # precede submission, data holds precede output publication.
-                        "inflight_operations": sum(w["active_tasks"] for w in workers),
                         "unknown": [w["unknown"] for w in workers if w["unknown"]],
                     },
                 )
@@ -211,3 +225,14 @@ class ManagedExecution:
                 return
             self._call("finish_execution", self.identity.execution_id, self._next_revision(), cleanup_status)
             self._finished = True
+
+    def abort_open(self) -> None:
+        """Best-effort demand withdrawal after a negotiated startup fails.
+
+        This does not clear the failure latch or release participant protection.
+        An unacknowledged withdrawal still requires runtime reconciliation.
+        """
+        with self._lock:
+            if self._opened and not self._finished:
+                self.client.finish_execution(self.identity.execution_id, self._next_revision(), "UNKNOWN")
+                self._finished = True

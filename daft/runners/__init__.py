@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from daft.daft import get_runner as _get_runner_internal
 from daft.daft import get_or_create_runner as _get_or_create_runner
 from daft.daft import get_or_infer_runner_type as _get_or_infer_runner_type
@@ -110,7 +110,9 @@ def set_runner_ray(
 
         if not isinstance(cluster_scheduling, ClusterSchedulingConfig):
             raise TypeError("cluster_scheduling must be a ClusterSchedulingConfig")
-        existing = _get_runner()
+        existing: Runner[Any] | None = _get_runner()
+        if existing is not None and existing.name != "ray":
+            raise RuntimeError("Managed cluster scheduling requires a Ray runner")
         if existing is not None and getattr(existing, "flotilla_plan_runner", None) is not None:
             raise RuntimeError("Configure cluster scheduling before the first Ray query")
 
@@ -132,12 +134,16 @@ def set_runner_ray(
             raise ValueError("pending_release_exclude_seconds must be >= 0")
         os.environ["DAFT_AUTOSCALING_PENDING_RELEASE_EXCLUDE_SECONDS"] = str(pending_release_exclude_seconds)
 
-    runner = _set_runner_ray(
+    runner: Runner[Any] = _set_runner_ray(
         address=address,
         noop_if_initialized=noop_if_initialized,
         force_client_mode=force_client_mode,
         worker_startup_timeout=worker_startup_timeout,
     )
     if cluster_scheduling is not None:
+        from daft.runners.ray_runner import RayRunner
+
+        if not isinstance(runner, RayRunner):
+            raise RuntimeError("Managed cluster scheduling requires a Ray runner")
         runner.cluster_scheduling = cluster_scheduling
     return runner

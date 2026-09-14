@@ -75,6 +75,7 @@ impl<T: Task> LinearScheduler<T> {
                     crate::scheduling::drain::DrainState::ReadyToRetire
                         | crate::scheduling::drain::DrainState::Retiring
                         | crate::scheduling::drain::DrainState::Retired
+                        | crate::scheduling::drain::DrainState::Unknown
                 ) =>
             {
                 AffinityTarget::Missing

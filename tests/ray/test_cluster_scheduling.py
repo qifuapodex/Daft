@@ -146,8 +146,34 @@ def test_invalid_total_demand(cpus):
         config(FakeRuntime(), cpus)
 
 
-def test_strict_cleanup_preserves_shared_data_after_unacknowledged_worker(tmp_path):
+def test_strict_cleanup_preserves_shared_data_after_unacknowledged_worker(tmp_path, monkeypatch):
+    import shutil
+
+    from daft.runners import flotilla
     from daft.runners.flotilla import await_flight_shuffle_cleanup
+
+    scheduled = []
+
+    class Delete:
+        def options(self, **kwargs):
+            scheduled.append(kwargs["scheduling_strategy"].node_id)
+            return self
+
+        async def remote(self, dirs):
+            for directory in dirs:
+                if __import__("os").path.exists(directory):
+                    shutil.rmtree(directory)
+
+    node_id = "1" * 56
+    monkeypatch.setattr(
+        flotilla.ray,
+        "nodes",
+        lambda: [
+            {"NodeID": "2" * 56, "Alive": True, "Resources": {"CPU": 0}},
+            {"NodeID": node_id, "Alive": True, "Resources": {"CPU": 2}},
+        ],
+    )
+    monkeypatch.setattr(flotilla, "_remove_shuffle_dirs_strict", Delete())
 
     async def run():
         shared = tmp_path / "shared"
@@ -161,5 +187,208 @@ def test_strict_cleanup_preserves_shared_data_after_unacknowledged_worker(tmp_pa
         assert data.read_bytes() == b"still needed"
         await await_flight_shuffle_cleanup([], [str(shared)])
         assert not shared.exists()
+        assert scheduled == [node_id]
+        # A producer actor may be dead while its node and local files survive.
+        orphan = tmp_path / "orphaned-local-shuffle"
+        orphan.mkdir()
+        (orphan / "map").write_bytes(b"old output")
+        await await_flight_shuffle_cleanup([], [], [str(orphan)], [node_id])
+        assert not orphan.exists()
+        assert scheduled == [node_id, node_id]
 
     asyncio.run(run())
+
+
+def _control(config_value):
+    from daft.runners.flotilla import RemoteFlotillaRunner
+
+    cls = RemoteFlotillaRunner.__ray_metadata__.modified_class
+    control = cls.__new__(cls)
+    control.cluster_scheduling = config_value
+    control.worker_startup_timeout = 120
+    control.managed_executions = {}
+    control.reporting_tasks = {}
+    control.node_drains = {}
+    control.cancelled_drain_epochs = {}
+    control.retiring_nodes = set()
+    control.retired_nodes = set()
+    control.retirement_lock = asyncio.Lock()
+    control.curr_plans = {}
+    control.curr_result_gens = {}
+    control.plan_runner = None
+    return control
+
+
+class _ControlRunner:
+    def __init__(self, closed=True, workers=None):
+        self.closed = closed
+        self.workers = workers or []
+        self.retire_calls = 0
+
+    def get_node_usage_snapshot(self):
+        import json
+
+        return json.dumps({"closed": self.closed, "discovery_pending": not self.closed, "workers": self.workers})
+
+    def retire_node_workers(self, node, epoch):
+        import time
+
+        time.sleep(0.02)
+        self.retire_calls += 1
+
+    def retire_completed_workers(self):
+        for worker in self.workers:
+            worker["state"] = "RETIRED"
+
+    def stop_execution(self):
+        self.closed = True
+
+    def run_plan(self, *args):
+        raise ValueError("injected translation error")
+
+
+def test_unrelated_failed_session_does_not_block_node_retirement():
+    runtime = FakeRuntime()
+    session = ManagedExecution(config(runtime))
+    session.open()
+    session.register_worker("worker-a", "node-a")
+    session.invalidate("lost control acknowledgement")
+    control = _control(config(runtime))
+    control.managed_executions["a"] = (session, _ControlRunner())
+    control.node_drains = {"node-a": 1, "node-b": 1}
+    assert control.get_node_drain_status("node-a", 1)["state"] == "UNKNOWN"
+    assert control.get_node_drain_status("node-b", 1)["state"] == "READY_TO_RETIRE"
+    # Unfinished discovery still blocks even a node not in the installed set.
+    control.managed_executions["a"][1].closed = False
+    assert control.get_node_drain_status("node-b", 1)["state"] == "DRAINING"
+
+
+def test_duplicate_retirement_is_serialized():
+    async def run():
+        runtime = FakeRuntime()
+        session = ManagedExecution(config(runtime))
+        runner = _ControlRunner()
+        control = _control(config(runtime))
+        control.managed_executions["a"] = (session, runner)
+        control.node_drains["node"] = 1
+        results = await asyncio.gather(control.retire_node_workers("node", 1), control.retire_node_workers("node", 1))
+        assert [r["state"] for r in results] == ["RETIRED", "RETIRED"]
+        assert runner.retire_calls == 1
+
+    asyncio.run(run())
+
+
+def test_completed_execution_is_removed_only_after_terminal_report():
+    class Runtime(FakeRuntime):
+        final_ack = False
+        final_allowed = True
+
+        def report_node_usage(self, execution, node, revision, usage):
+            super().report_node_usage(execution, node, revision, usage)
+            if all(w["state"] == "RETIRED" for w in usage["workers"]):
+                if not self.final_allowed:
+                    raise ConnectionError("terminal report lost")
+                self.final_ack = True
+
+    async def run(allow_ack):
+        runtime = Runtime()
+        runtime.final_allowed = allow_ack
+        cfg = replace(config(runtime), report_interval_seconds=0.01, report_timeout_seconds=1)
+        session = ManagedExecution(cfg)
+        session.open()
+        session.register_worker("worker", "node")
+        session.finish("CLEAN")
+        worker = {
+            "worker_instance_id": "worker",
+            "node_id": "node",
+            "state": "ACTIVE",
+            "active_tasks": 0,
+            "logical_cpus": 0,
+            "local_data_queries": [],
+            "unknown": None,
+            "can_retire": True,
+        }
+        control = _control(cfg)
+        control.managed_executions["a"] = (session, _ControlRunner(workers=[worker]))
+        await asyncio.wait_for(control._report_usage("a"), 2)
+        assert runtime.final_ack == allow_ack
+        assert ("a" not in control.managed_executions) == allow_ack
+
+    asyncio.run(run(True))
+    asyncio.run(run(False))
+
+
+def test_startup_failure_closes_execution_and_factory_runs_off_event_loop(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    from daft.runners import flotilla
+
+    runtime = FakeRuntime()
+
+    def factory(identity):
+        assert threading.current_thread() is not threading.main_thread()
+        return runtime
+
+    cfg = replace(config(runtime), client_factory=factory, report_interval_seconds=0.01, report_timeout_seconds=1)
+    runner = _ControlRunner(closed=False)
+    monkeypatch.setattr(flotilla, "DistributedPhysicalPlanRunner", lambda *args, **kwargs: runner)
+    monkeypatch.setattr(flotilla.ray, "get_runtime_context", lambda: SimpleNamespace(current_actor=None))
+
+    async def run():
+        control = _control(cfg)
+        with pytest.raises(ValueError, match="translation"):
+            await control.run_plan(SimpleNamespace(idx=lambda: "query"), {})
+        assert runner.closed
+        assert not runtime.demand
+        await asyncio.gather(*list(control.reporting_tasks.values()))
+        assert not control.managed_executions
+        control.node_drains["node"] = 1
+        assert control.get_node_drain_status("node", 1)["state"] == "READY_TO_RETIRE"
+
+    asyncio.run(run())
+
+
+def test_negotiated_open_failure_withdraws_only_its_own_demand():
+    class Runtime(FakeRuntime):
+        def update_execution_demand(self, execution, revision, total):
+            super().update_execution_demand(execution, revision, total)
+            raise ConnectionError("demand acknowledgement lost")
+
+    runtime = Runtime()
+    runtime.demand["other"] = 2000
+    session = ManagedExecution(config(runtime))
+    with pytest.raises(ConnectionError):
+        session.open()
+    session.abort_open()
+    assert runtime.demand == {"other": 2000}
+    assert session.failure is not None
+    assert session.finished
+
+
+def test_managed_configuration_rejects_native_noop(monkeypatch):
+    from types import SimpleNamespace
+
+    import daft.runners
+
+    monkeypatch.setattr(daft.runners, "_get_runner", lambda: SimpleNamespace(name="native"))
+    with pytest.raises(RuntimeError, match="requires a Ray runner"):
+        daft.runners.set_runner_ray(noop_if_initialized=True, cluster_scheduling=config(FakeRuntime()))
+
+
+def test_rejected_node_is_skipped_until_backoff_expires(monkeypatch):
+    from daft.runners import cluster_scheduling, flotilla
+
+    runtime = FakeRuntime()
+    session = ManagedExecution(config(runtime))
+    session.open()
+    runtime.draining.add("node")
+    assert not session.register_worker("worker", "node")
+    skipped = []
+    monkeypatch.setattr(flotilla, "start_ray_workers", lambda nodes, timeout, **kwargs: skipped.append(nodes) or [])
+    session.start_workers([], 120)
+    assert "node" in skipped[-1]
+    deadline = session._rejected_nodes["node"]
+    monkeypatch.setattr(cluster_scheduling.time, "monotonic", lambda: deadline + 1)
+    session.start_workers([], 120)
+    assert "node" not in skipped[-1]
