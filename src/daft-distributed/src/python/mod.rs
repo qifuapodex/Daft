@@ -51,7 +51,8 @@ fn surface_hints(py: Python, hints: &[String]) -> PyResult<()> {
 
 #[pyclass(frozen)]
 struct PythonPartitionRefStream {
-    inner: Arc<Mutex<PlanResultStream>>,
+    inner: Arc<Mutex<Option<PlanResultStream>>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     statistics_manager: StatisticsManagerRef,
 }
 
@@ -63,11 +64,19 @@ impl PythonPartitionRefStream {
 
     fn __anext__<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, pyo3::PyAny>> {
         let inner = self.inner.clone();
+        let cancel_token = self.cancel_token.clone();
         // future into py requires that the future is Send + 'static, so we wrap the inner in an Arc<Mutex<>>
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let next = {
                 let mut inner = inner.lock().await;
-                inner.next().await
+                match inner.as_mut() {
+                    Some(stream) => tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => None,
+                        next = stream.next() => next,
+                    },
+                    None => None,
+                }
             };
             let next = match next {
                 Some(result) => {
@@ -82,6 +91,15 @@ impl PythonPartitionRefStream {
                 None => None,
             };
             Ok(next)
+        })
+    }
+
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.cancel_token.cancel();
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.lock().await.take();
+            Ok(())
         })
     }
 
@@ -238,17 +256,55 @@ common_py_serde::impl_versioned_bincode_py_state_serialization!(
 #[pyclass(module = "daft.daft", name = "DistributedPhysicalPlanRunner", frozen)]
 struct PyDistributedPhysicalPlanRunner {
     runner: Arc<PlanRunner<RaySwordfishWorker>>,
+    worker_manager: Arc<RayWorkerManager>,
 }
 
 #[pymethods]
 impl PyDistributedPhysicalPlanRunner {
     #[new]
-    #[pyo3(signature = (worker_startup_timeout = 120))]
-    fn new(worker_startup_timeout: usize) -> PyResult<Self> {
-        let worker_manager = Arc::new(RayWorkerManager::new(worker_startup_timeout));
+    #[pyo3(signature = (worker_startup_timeout = 120, cluster_session = None))]
+    fn new(worker_startup_timeout: usize, cluster_session: Option<Py<PyAny>>) -> PyResult<Self> {
+        let worker_manager = Arc::new(RayWorkerManager::new(
+            worker_startup_timeout,
+            cluster_session,
+        ));
         Ok(Self {
-            runner: Arc::new(PlanRunner::new(worker_manager)),
+            runner: Arc::new(PlanRunner::new(worker_manager.clone())),
+            worker_manager,
         })
+    }
+
+    fn stop_execution(&self, py: Python) {
+        py.detach(|| self.worker_manager.stop_execution());
+    }
+
+    fn get_node_usage_snapshot(&self, py: Python) -> String {
+        py.detach(|| self.worker_manager.usage_snapshot())
+    }
+
+    fn prepare_node_drain(
+        &self,
+        py: Python,
+        node_id: String,
+        drain_epoch: u64,
+    ) -> PyResult<String> {
+        py.detach(|| self.worker_manager.prepare_drain(node_id, drain_epoch))?;
+        Ok(py.detach(|| self.worker_manager.usage_snapshot()))
+    }
+
+    fn cancel_node_drain(&self, py: Python, node_id: String, drain_epoch: u64) -> PyResult<String> {
+        py.detach(|| self.worker_manager.cancel_drain(node_id, drain_epoch))?;
+        Ok(py.detach(|| self.worker_manager.usage_snapshot()))
+    }
+
+    fn retire_node_workers(
+        &self,
+        py: Python,
+        node_id: String,
+        drain_epoch: u64,
+    ) -> PyResult<String> {
+        py.detach(|| self.worker_manager.retire_node(node_id, drain_epoch))?;
+        Ok(py.detach(|| self.worker_manager.usage_snapshot()))
     }
 
     fn run_plan(
@@ -314,7 +370,8 @@ impl PyDistributedPhysicalPlanRunner {
                 .run_plan(query_idx, translation.root, statistics_manager.clone())?;
 
         let part_stream = PythonPartitionRefStream {
-            inner: Arc::new(Mutex::new(plan_result.into_stream())),
+            inner: Arc::new(Mutex::new(Some(plan_result.into_stream()))),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
             statistics_manager,
         };
         Ok(part_stream)

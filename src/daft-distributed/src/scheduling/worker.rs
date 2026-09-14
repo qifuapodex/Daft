@@ -2,7 +2,10 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use common_error::DaftResult;
 
-use super::task::{Task, TaskDetails, TaskResultHandle};
+use super::{
+    drain::DrainState,
+    task::{Task, TaskDetails, TaskResultHandle},
+};
 use crate::scheduling::{
     scheduler::WorkerSnapshot,
     task::{TaskContext, TaskResourceRequest},
@@ -15,6 +18,9 @@ pub(crate) trait Worker: Send + Sync + Debug + 'static {
     type TaskResultHandle: TaskResultHandle;
 
     fn id(&self) -> &WorkerId;
+    fn drain_state(&self) -> DrainState {
+        DrainState::Active
+    }
     fn active_task_details(&self) -> HashMap<TaskContext, TaskDetails>;
     fn total_num_cpus(&self) -> f64;
     fn total_num_gpus(&self) -> f64;
@@ -40,9 +46,20 @@ pub(crate) trait WorkerManager: Send + Sync {
         tasks_per_worker: HashMap<WorkerId, Vec<<<Self as WorkerManager>::Worker as Worker>::Task>>,
     ) -> DaftResult<Vec<<<Self as WorkerManager>::Worker as Worker>::TaskResultHandle>>;
     fn mark_task_finished(&self, task_context: TaskContext, worker_id: WorkerId);
+    /// Cancellation / transport failure is not proof that remote execution stopped.
+    fn mark_task_unknown(&self, _task_context: TaskContext, _worker_id: WorkerId) {}
     fn mark_worker_died(&self, worker_id: WorkerId);
     fn worker_snapshots(&self) -> DaftResult<Vec<WorkerSnapshot>>;
     fn try_autoscale(&self, resource_requests: Vec<TaskResourceRequest>) -> DaftResult<()>;
+    fn finish_query(
+        &self,
+        _query_idx: crate::plan::QueryIdx,
+        dirs: Vec<String>,
+        shared_dirs: Vec<String>,
+        shuffle_ids: Vec<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DaftResult<()>> + Send + '_>> {
+        self.cleanup_shuffles(dirs, shared_dirs, shuffle_ids)
+    }
     /// Release everything a completed shuffle is still holding.
     ///
     /// `dirs` are node-local and must be removed on every node; `shared_dirs`

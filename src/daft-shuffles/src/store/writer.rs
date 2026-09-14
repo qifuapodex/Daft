@@ -42,8 +42,7 @@ static BACKGROUND_FSYNCS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Exists so a benchmark can tell when the deferred half of
 /// [`ShuffleDurability::Background`] is actually done; nothing in the execution
 /// path waits on it, which is the entire point of the level.
-#[cfg(test)]
-pub(crate) fn background_fsyncs_in_flight() -> usize {
+pub fn background_fsyncs_in_flight() -> usize {
     BACKGROUND_FSYNCS_IN_FLIGHT.load(Ordering::Acquire)
 }
 

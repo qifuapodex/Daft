@@ -218,6 +218,15 @@ impl PyNativeExecutor {
     /// Takes the executor lock only to reach the shuffle server; the registry has
     /// its own lock and nothing under it blocks, so this cannot stall a worker
     /// that is mid-query.
+    pub fn shuffle_active_operations(&self, py: Python<'_>) -> usize {
+        let executor = self.executor.lock_py_attached(py).unwrap();
+        executor
+            .shuffle_server
+            .as_ref()
+            .map_or(0, |server| server.active_reads())
+            + daft_shuffles::store::writer::background_fsyncs_in_flight()
+    }
+
     pub fn unregister_shuffles(&self, py: Python<'_>, shuffle_ids: Vec<u64>) -> PyResult<usize> {
         Ok(self
             .executor

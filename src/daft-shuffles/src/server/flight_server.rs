@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     io::SeekFrom,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use arrow_flight::{
@@ -136,14 +139,32 @@ type ShuffleFileSpecs = Result<(Vec<FileReadSpec>, SchemaRef), MissingFlightPart
 /// thread that drops a finished shuffle's entries.
 type PartitionRegistry = Mutex<HashMap<FlightPartitionKey, PartitionCache>>;
 
+struct ReadGuard(Arc<AtomicUsize>);
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ShuffleFlightServer {
     shuffle_partitions: Arc<PartitionRegistry>,
+    active_reads: Arc<AtomicUsize>,
 }
 
 impl ShuffleFlightServer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn begin_read(&self) -> ReadGuard {
+        self.active_reads.fetch_add(1, Ordering::AcqRel);
+        ReadGuard(self.active_reads.clone())
+    }
+
+    pub fn active_reads(&self) -> usize {
+        self.active_reads.load(Ordering::Acquire)
     }
 
     fn lock_partitions(
@@ -311,6 +332,7 @@ impl ShuffleFlightServer {
         shuffle_id: u64,
         refs: &[(u64, u64)],
     ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+        let guard = self.begin_read();
         let (specs, schema) = self
             .get_shuffle_file_specs(shuffle_id, refs)
             .map_err(|missing| {
@@ -346,7 +368,10 @@ impl ShuffleFlightServer {
             })
             .try_flatten();
 
-        Ok(Box::pin(flight_data_stream))
+        Ok(Box::pin(flight_data_stream.map(move |item| {
+            let _keep_read_alive = &guard;
+            item
+        })))
     }
 }
 
@@ -404,6 +429,7 @@ impl FlightService for ShuffleFlightServer {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let guard = self.begin_read();
         let ticket = request.into_inner();
         let ticket = ParsedTicket::from_ticket(&ticket)?;
 
@@ -425,7 +451,10 @@ impl FlightService for ShuffleFlightServer {
             .flat_map(open_spec_as_flight_stream)
             .map_err(crate::error::to_status);
         let flight_data = futures::stream::once(async { Ok(flight_schema) }).chain(data_stream);
-        Ok(Response::new(Box::pin(flight_data)))
+        Ok(Response::new(Box::pin(flight_data.map(move |item| {
+            let _keep_read_alive = &guard;
+            item
+        }))))
     }
 
     async fn do_put(
@@ -661,6 +690,27 @@ mod tests {
         handle.shutdown()?;
         std::fs::remove_dir_all(dir)?;
         result
+    }
+
+    #[test]
+    fn cleanup_does_not_erase_readers_that_already_resolved_the_registry() {
+        let server = ShuffleFlightServer::new();
+        server
+            .register_shuffle_partitions(1, 0xaa, vec![cache(10)])
+            .unwrap();
+        let first =
+            futures::executor::block_on(server.get_partition_local(1, &[(0xaa, 10)])).unwrap();
+        let second =
+            futures::executor::block_on(server.get_partition_local(1, &[(0xaa, 10)])).unwrap();
+        assert_eq!(server.active_reads(), 2);
+        server.unregister_shuffles(&[1]);
+        assert_eq!(server.active_reads(), 2);
+        assert!(futures::executor::block_on(server.get_partition_local(1, &[(0xaa, 10)])).is_err());
+        assert_eq!(server.active_reads(), 2);
+        drop(first);
+        assert_eq!(server.active_reads(), 1);
+        drop(second);
+        assert_eq!(server.active_reads(), 0);
     }
 
     #[test]

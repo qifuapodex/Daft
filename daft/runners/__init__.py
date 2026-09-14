@@ -10,6 +10,7 @@ from daft.daft import set_runner_native as _set_runner_native
 from daft.daft import set_runner_ray as _set_runner_ray
 
 if TYPE_CHECKING:
+    from daft.runners.cluster_scheduling import ClusterSchedulingConfig
     from daft.runners.runner import Runner
     from daft.runners.partitioning import PartitionT
 
@@ -74,6 +75,7 @@ def set_runner_ray(
     min_survivor_workers: int | None = None,
     pending_release_exclude_seconds: int | None = None,
     worker_startup_timeout: int | None = None,
+    cluster_scheduling: ClusterSchedulingConfig | None = None,
 ) -> Runner[PartitionT]:
     """Configure Daft to execute dataframes using the Ray distributed computing framework.
 
@@ -91,6 +93,9 @@ def set_runner_ray(
         pending_release_exclude_seconds: Grace period (TTL) for recently-released worker IDs during
             worker discovery, to prevent the autoscaler from immediately respawning them. If not
             provided, falls back to ``DAFT_AUTOSCALING_PENDING_RELEASE_EXCLUDE_SECONDS`` (default: 120).
+        cluster_scheduling: Experimental shared-cluster client and fixed execution demand.
+            Must be supplied before the first query. Managed executions never write
+            Ray's global autoscaling request; the external runtime owns node protection.
         worker_startup_timeout: Timeout in seconds for Ray worker actors to report their addresses during startup.
             Can also be configured via the ``DAFT_RAY_WORKER_STARTUP_TIMEOUT`` environment variable.
 
@@ -100,6 +105,15 @@ def set_runner_ray(
     Note:
         Can also be configured via environment variable: DAFT_RUNNER=ray
     """
+    if cluster_scheduling is not None:
+        from daft.runners.cluster_scheduling import ClusterSchedulingConfig
+
+        if not isinstance(cluster_scheduling, ClusterSchedulingConfig):
+            raise TypeError("cluster_scheduling must be a ClusterSchedulingConfig")
+        existing = _get_runner()
+        if existing is not None and getattr(existing, "flotilla_plan_runner", None) is not None:
+            raise RuntimeError("Configure cluster scheduling before the first Ray query")
+
     # Allow programmatic configuration of autoscaling/downscaling behavior via `daft.set_runner_ray`.
     # These settings are still backed by environment variables so they can propagate to the Rust
     # scheduler/worker-manager components without threading configuration throughout the stack.
@@ -118,9 +132,12 @@ def set_runner_ray(
             raise ValueError("pending_release_exclude_seconds must be >= 0")
         os.environ["DAFT_AUTOSCALING_PENDING_RELEASE_EXCLUDE_SECONDS"] = str(pending_release_exclude_seconds)
 
-    return _set_runner_ray(
+    runner = _set_runner_ray(
         address=address,
         noop_if_initialized=noop_if_initialized,
         force_client_mode=force_client_mode,
         worker_startup_timeout=worker_startup_timeout,
     )
+    if cluster_scheduling is not None:
+        runner.cluster_scheduling = cluster_scheduling
+    return runner

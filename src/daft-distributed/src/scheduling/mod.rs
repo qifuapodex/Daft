@@ -1,4 +1,5 @@
 pub(super) mod dispatcher;
+pub(crate) mod drain;
 #[cfg(test)]
 pub(crate) mod local_worker;
 pub(super) mod scheduler;

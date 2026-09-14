@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
@@ -32,6 +33,7 @@ from daft.daft import (
 from daft.event_loop import set_event_loop
 from daft.expressions import Expression, ExpressionsProjection
 from daft.recordbatch.micropartition import MicroPartition
+from daft.runners.cluster_scheduling import ClusterSchedulingConfig, ManagedExecution
 from daft.runners.partitioning import PartitionMetadata, PartitionSet
 from daft.runners.profiler import profile
 from daft.subscribers.event_log import RemoteEventLogSubscriber
@@ -283,6 +285,19 @@ class RaySwordfishActor:
         """
         return self.native_executor.unregister_shuffles(shuffle_ids)
 
+    async def cleanup_query(self, dirs: list[str], shuffle_ids: list[int]) -> None:
+        # Called only once the coordinator has stopped dispatch and confirmed
+        # task completion. Errors propagate so node protection is retained.
+        self.native_executor.unregister_shuffles(shuffle_ids)
+        deadline = time.monotonic() + 30
+        while self.native_executor.shuffle_active_operations():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Shuffle reads or background writes have not drained")
+            await asyncio.sleep(0.05)
+        for directory in dirs:
+            if os.path.exists(directory):
+                await asyncio.to_thread(shutil.rmtree, directory)
+
     async def _resolve_inputs(
         self,
         context: dict[str, str] | None,
@@ -503,6 +518,22 @@ class RaySwordfishActorHandle:
         """
         return self.actor_handle.unregister_shuffles.remote(shuffle_ids)
 
+    def cleanup_query(self, dirs: list[str], shuffle_ids: list[int]) -> ray.ObjectRef:
+        return self.actor_handle.cleanup_query.remote(dirs, shuffle_ids)
+
+    def retire(self) -> None:
+        ray.kill(self.actor_handle, no_restart=True)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                ray.get(self.actor_handle.get_address.remote(), timeout=1)
+            except ray.exceptions.ActorDiedError:
+                return
+            except ray.exceptions.GetTimeoutError:
+                pass
+            time.sleep(0.05)
+        raise RuntimeError("Worker death was not acknowledged after retirement")
+
     def shutdown(self) -> None:
         ray.kill(self.actor_handle)
 
@@ -532,6 +563,8 @@ def _attach_remote_event_log_subscriber(component: str, node_role: str) -> None:
 def start_ray_workers(
     existing_worker_ids: list[str],
     worker_startup_timeout: int = DEFAULT_WORKER_STARTUP_TIMEOUT,
+    *,
+    session: ManagedExecution | None = None,
 ) -> list[RaySwordfishWorker]:
     event_log_dir = os.environ.get("DAFT_EVENT_LOG_DIR")
     dashboard_url = os.environ.get("DAFT_DASHBOARD_URL")
@@ -626,16 +659,27 @@ def start_ray_workers(
             ):
                 to_skip.append((node, actor))
                 continue
-            handles.append(
-                RaySwordfishWorker(
-                    node["NodeID"],
-                    RaySwordfishActorHandle(actor),
-                    int(node["Resources"]["CPU"]),
-                    int(node["Resources"].get("GPU", 0)),
-                    int(node["Resources"]["memory"]),
-                    ip_address,
-                )
+            worker_id = uuid.uuid4().hex if session else node["NodeID"]
+            if session is not None:
+                try:
+                    accepted = session.register_worker(worker_id, node["NodeID"])
+                except Exception:
+                    # An ambiguous admission retains the runtime's protection.
+                    # No task was submitted; kill the actor and reconcile externally.
+                    logger.exception("Managed worker admission failed")
+                    accepted = False
+                if not accepted:
+                    to_skip.append((node, actor))
+                    continue
+            args = (
+                worker_id,
+                RaySwordfishActorHandle(actor),
+                int(node["Resources"]["CPU"]),
+                int(node["Resources"].get("GPU", 0)),
+                int(node["Resources"]["memory"]),
+                ip_address,
             )
+            handles.append(RaySwordfishWorker(*args, node_id=node["NodeID"]) if session else RaySwordfishWorker(*args))
 
         for _node, actor in to_skip:
             # Kill skipped actors so they don't hold the node's resources and
@@ -668,6 +712,17 @@ def start_ray_workers(
     return handles
 
 
+async def await_flight_shuffle_cleanup(refs: list[ray.ObjectRef], shared_dirs: list[str]) -> None:
+    results = await asyncio.gather(*refs, return_exceptions=True)
+    failures = [result for result in results if isinstance(result, BaseException)]
+    if failures:
+        raise RuntimeError(f"Flight cleanup was not acknowledged: {failures!r}")
+    # A shared mount has one tree. The head sees that same mount.
+    for directory in shared_dirs:
+        if os.path.exists(directory):
+            await asyncio.to_thread(shutil.rmtree, directory)
+
+
 def try_autoscale(bundles: list[dict[str, int]]) -> None:
     from ray.autoscaler.sdk import request_resources
 
@@ -688,7 +743,16 @@ class RemoteFlotillaRunner:
         dashboard_url: str | None = None,
         event_log_dir: str | None = None,
         worker_startup_timeout: int = DEFAULT_WORKER_STARTUP_TIMEOUT,
+        cluster_scheduling: ClusterSchedulingConfig | None = None,
     ) -> None:
+        self.cluster_scheduling = cluster_scheduling
+        self.worker_startup_timeout = worker_startup_timeout
+        self.managed_executions: dict[str, tuple[ManagedExecution, DistributedPhysicalPlanRunner]] = {}
+        self.reporting_tasks: dict[str, asyncio.Task] = {}
+        self.node_drains: dict[str, int] = {}
+        self.cancelled_drain_epochs: dict[str, int] = {}
+        self.retiring_nodes: set[str] = set()
+        self.retired_nodes: set[str] = set()
         _load_extensions_from_env()
         if dashboard_url:
             os.environ["DAFT_DASHBOARD_URL"] = dashboard_url
@@ -717,7 +781,7 @@ class RemoteFlotillaRunner:
         ray._private.worker.blocking_get_inside_async_warned = True
         set_event_loop(asyncio.get_running_loop())
 
-    def run_plan(
+    async def run_plan(
         self,
         plan: DistributedPhysicalPlan,
         partition_sets: dict[str, PartitionSet[ray.ObjectRef]],
@@ -729,8 +793,142 @@ class RemoteFlotillaRunner:
             ]
             for k, v in partition_sets.items()
         }
+        runner = self.plan_runner
+        if self.cluster_scheduling is not None:
+            session = ManagedExecution(self.cluster_scheduling, ray.get_runtime_context().current_actor)
+            await asyncio.to_thread(session.open)
+            runner = DistributedPhysicalPlanRunner(self.worker_startup_timeout, cluster_session=session)
+            # Install persistent drain exclusions before this execution discovers
+            # workers, including drains prepared before the execution existed.
+            for node_id, epoch in self.node_drains.items():
+                runner.prepare_node_drain(node_id, epoch)
+            self.managed_executions[plan.idx()] = (session, runner)
+            self.reporting_tasks[plan.idx()] = asyncio.create_task(self._report_usage(plan.idx()))
         self.curr_plans[plan.idx()] = plan
-        self.curr_result_gens[plan.idx()] = self.plan_runner.run_plan(plan, psets)
+        try:
+            self.curr_result_gens[plan.idx()] = runner.run_plan(plan, psets)
+        except Exception:
+            await self._finish_managed_execution(plan.idx(), "UNKNOWN")
+            self.curr_plans.pop(plan.idx(), None)
+            raise
+
+    async def _report_usage(self, plan_id: str) -> None:
+        session, runner = self.managed_executions[plan_id]
+        try:
+            while True:
+                snapshot = json.loads(runner.get_node_usage_snapshot())
+                await asyncio.to_thread(session.report, snapshot)
+                if (
+                    session.finished
+                    and snapshot["closed"]
+                    and not snapshot["discovery_pending"]
+                    and all(w["state"] in ("RETIRED", "FAILED") for w in snapshot["workers"])
+                ):
+                    session.complete_retirement()
+                    self.reporting_tasks.pop(plan_id, None)
+                    return
+                await asyncio.sleep(session.config.report_interval_seconds)
+        except Exception as error:
+            session.invalidate(str(error))
+            logger.exception("Managed execution reporting failed; new dispatch is blocked")
+
+    async def _finish_managed_execution(self, plan_id: str, status: str | None = None) -> None:
+        entry = self.managed_executions.get(plan_id)
+        if entry is None:
+            return
+        session, runner = entry
+        snapshot = json.loads(runner.get_node_usage_snapshot())
+        if status is None:
+            status = "CLEAN" if snapshot["closed"] and all(w["can_retire"] for w in snapshot["workers"]) else "UNKNOWN"
+        try:
+            await asyncio.to_thread(session.report, snapshot)
+            await asyncio.to_thread(session.finish, status)
+        except Exception:
+            logger.exception("Managed execution finish unacknowledged; runtime must reconcile")
+        # Continue reports and retain the manager until its workers are retired.
+        # A completed query can still own data after partial cleanup failure.
+
+    def get_node_usage_snapshot(self) -> dict:
+        return {
+            session.identity.execution_id: {
+                **json.loads(runner.get_node_usage_snapshot()),
+                "control_error": session.failure,
+            }
+            for session, runner in self.managed_executions.values()
+        }
+
+    def prepare_node_drain(self, node_id: str, drain_epoch: int) -> dict:
+        if self.cluster_scheduling is None:
+            raise RuntimeError("Node drain requires managed cluster scheduling")
+        if node_id in self.retiring_nodes or node_id in self.retired_nodes:
+            if self.node_drains.get(node_id) == drain_epoch:
+                return self.get_node_drain_status(node_id, drain_epoch)
+            raise ValueError("Node retirement is committed")
+        previous = self.node_drains.get(node_id, 0)
+        if drain_epoch <= self.cancelled_drain_epochs.get(node_id, 0) or drain_epoch < previous:
+            raise ValueError("Stale drain epoch")
+        # Persist before per-execution calls: partial preparation still excludes
+        # the node from subsequently created executions.
+        self.node_drains[node_id] = drain_epoch
+        for _, runner in self.managed_executions.values():
+            runner.prepare_node_drain(node_id, drain_epoch)
+        return self.get_node_drain_status(node_id, drain_epoch)
+
+    def get_node_drain_status(self, node_id: str, drain_epoch: int) -> dict:
+        if self.node_drains.get(node_id) != drain_epoch:
+            raise ValueError("Stale or unknown drain epoch")
+        executions = self.get_node_usage_snapshot()
+        workers = [w for s in executions.values() for w in s["workers"] if w["node_id"] == node_id]
+        state = (
+            "READY_TO_RETIRE"
+            if all(w["state"] in ("READY_TO_RETIRE", "RETIRED", "FAILED") for w in workers)
+            else "DRAINING"
+        )
+        if any(s["discovery_pending"] for s in executions.values()):
+            state = "DRAINING"
+        if any(w["unknown"] for w in workers) or any(s["control_error"] for s in executions.values()):
+            state = "UNKNOWN"
+        if node_id in self.retiring_nodes and state != "UNKNOWN":
+            state = "RETIRING"
+        if node_id in self.retired_nodes:
+            state = "RETIRED"
+        return {"node_id": node_id, "drain_epoch": drain_epoch, "state": state, "workers": workers}
+
+    def cancel_node_drain(self, node_id: str, drain_epoch: int) -> dict:
+        if node_id in self.retiring_nodes or node_id in self.retired_nodes:
+            raise ValueError("Node retirement is committed")
+        if self.cancelled_drain_epochs.get(node_id) == drain_epoch:
+            return self.get_node_usage_snapshot()
+        self.get_node_drain_status(node_id, drain_epoch)
+        for _, runner in self.managed_executions.values():
+            runner.cancel_node_drain(node_id, drain_epoch)
+        self.cancelled_drain_epochs[node_id] = drain_epoch
+        del self.node_drains[node_id]
+        return self.get_node_usage_snapshot()
+
+    async def retire_node_workers(self, node_id: str, drain_epoch: int) -> dict:
+        status = self.get_node_drain_status(node_id, drain_epoch)
+        if status["state"] == "RETIRED":
+            return status
+        if status["state"] != "READY_TO_RETIRE" and node_id not in self.retiring_nodes:
+            raise RuntimeError(f"Node is not ready: {status}")
+        self.retiring_nodes.add(node_id)
+        # Rust rechecks under its dispatch lock and waits for actor death outside it.
+        for _, runner in list(self.managed_executions.values()):
+            await asyncio.to_thread(runner.retire_node_workers, node_id, drain_epoch)
+        self.retiring_nodes.remove(node_id)
+        self.retired_nodes.add(node_id)
+        return self.get_node_drain_status(node_id, drain_epoch)
+
+    async def cancel_plan(self, plan_id: str) -> None:
+        entry = self.managed_executions.get(plan_id)
+        if entry is not None:
+            entry[1].stop_execution()
+        result_gen = self.curr_result_gens.pop(plan_id, None)
+        self.curr_plans.pop(plan_id, None)
+        if result_gen is not None:
+            await result_gen.close()
+        await self._finish_managed_execution(plan_id, "UNKNOWN")
 
     async def get_next_partition(self, plan_id: str) -> RayMaterializedResult | PyExecutionStats | None:
         from daft.runners.ray_runner import (
@@ -738,17 +936,24 @@ class RemoteFlotillaRunner:
             RayMaterializedResult,
         )
 
+        result_gen = self.curr_result_gens[plan_id]
         try:
-            next_partition_ref = await self.curr_result_gens[plan_id].__anext__()
+            next_partition_ref = await result_gen.__anext__()
         except StopAsyncIteration:
             next_partition_ref = None
+        except Exception:
+            await self._finish_managed_execution(plan_id, "UNKNOWN")
+            self.curr_plans.pop(plan_id, None)
+            self.curr_result_gens.pop(plan_id, None)
+            raise
 
         if next_partition_ref is None:
+            await self._finish_managed_execution(plan_id)
             # `finish()` synthesizes any missing OperatorEnd events for
             # nodes that started but never naturally drained, dispatching
             # them on the actor's local `DaftContext` (whose `_dashboard`
             # subscriber forwards them straight to the dashboard server).
-            stats: PyExecutionStats = self.curr_result_gens[plan_id].finish()  # type: ignore[attr-defined]
+            stats: PyExecutionStats = result_gen.finish()  # type: ignore[attr-defined]
             self.curr_plans.pop(plan_id, None)
             self.curr_result_gens.pop(plan_id, None)
             return stats
@@ -837,7 +1042,11 @@ class FlotillaRunner:
         the extension to existing workers.
     """
 
-    def __init__(self, worker_startup_timeout: int = DEFAULT_WORKER_STARTUP_TIMEOUT) -> None:
+    def __init__(
+        self,
+        worker_startup_timeout: int = DEFAULT_WORKER_STARTUP_TIMEOUT,
+        cluster_scheduling: ClusterSchedulingConfig | None = None,
+    ) -> None:
         head_node_id = get_head_node_id()
         dashboard_url = os.environ.get("DAFT_DASHBOARD_URL")
 
@@ -871,6 +1080,9 @@ class FlotillaRunner:
                 else None
             ),
         }
+        if cluster_scheduling is not None:
+            flotilla_options["name"] = f"{get_flotilla_runner_actor_name()}-managed-{uuid.uuid4().hex}"
+            flotilla_options["get_if_exists"] = False
         if runner_env_vars:
             flotilla_options["runtime_env"] = {"env_vars": runner_env_vars}
 
@@ -878,6 +1090,7 @@ class FlotillaRunner:
             dashboard_url=dashboard_url,
             event_log_dir=event_log_dir,
             worker_startup_timeout=worker_startup_timeout,
+            cluster_scheduling=cluster_scheduling,
         )
         self._init_extension_paths: frozenset[str] = frozenset(get_loaded_extension_paths())
 
@@ -898,8 +1111,14 @@ class FlotillaRunner:
         plan_id = plan.idx()
         ray.get(self.runner.run_plan.remote(plan, partition_sets))
 
-        while True:
-            result = ray.get(self.runner.get_next_partition.remote(plan_id))
-            if isinstance(result, PyExecutionStats):
-                return result
-            yield result
+        completed = False
+        try:
+            while True:
+                result = ray.get(self.runner.get_next_partition.remote(plan_id))
+                if isinstance(result, PyExecutionStats):
+                    completed = True
+                    return result
+                yield result
+        finally:
+            if not completed:
+                ray.get(self.runner.cancel_plan.remote(plan_id))

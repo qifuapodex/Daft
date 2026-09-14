@@ -327,11 +327,10 @@ impl<W: Worker<Task = SwordfishTask>> PlanRunner<W> {
         // are deleted.
         drop(materialized_result_stream);
 
-        if (!shuffle_dirs.is_empty() || !shared_shuffle_dirs.is_empty() || !shuffle_ids.is_empty())
-            && let Err(e) = self
-                .worker_manager
-                .cleanup_shuffles(shuffle_dirs, shared_shuffle_dirs, shuffle_ids)
-                .await
+        if let Err(e) = self
+            .worker_manager
+            .finish_query(query_idx, shuffle_dirs, shared_shuffle_dirs, shuffle_ids)
+            .await
         {
             tracing::warn!("Failed to clean up after flight shuffles: {}", e);
         }
