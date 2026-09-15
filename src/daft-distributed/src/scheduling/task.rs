@@ -638,6 +638,10 @@ impl SwordfishTaskBuilder {
     /// The function receives the current plan and returns a new plan.
     /// Automatically adds the node_id from the provided node to pending_node_ids
     /// and folds the node_id into the plan fingerprint.
+    /// This does not hash the transformed plan or the function's captured values.
+    /// If a node varies plan parameters across tasks (e.g., a split count), callers
+    /// must also use [`Self::extend_fingerprint`] to distinguish those plans:
+    /// workers reuse one pipeline for all tasks with the same fingerprint.
     pub fn map_plan<F>(mut self, node: &dyn PipelineNodeImpl, f: F) -> Self
     where
         F: FnOnce(LocalPhysicalPlanRef) -> LocalPhysicalPlanRef,
