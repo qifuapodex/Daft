@@ -84,6 +84,40 @@ def test_read_generator_retries_after_batch_without_duplicates(generator_calls):
     assert sorted(result["x"]) == [0, 1, 2, 3], calls
 
 
+@pytest.mark.parametrize("shuffle_algorithm", ["map_reduce", "flight_shuffle"])
+@pytest.mark.parametrize("source,target", [(2, 3), (8, 9), (8, 12), (8, 15)])
+@pytest.mark.parametrize("fail_extra_split", [False, True])
+def test_into_partitions_split_count_after_retry(
+    generator_calls, tmp_path, shuffle_algorithm, source, target, fail_extra_split
+):
+    # Exercise retries for both split factors: the first input gets an extra
+    # output partition, while the last input uses the base split factor.
+    failing_partition = 0 if fail_extra_split else source - 1
+    schema = RecordBatch.from_pydict({"x": [0]}).schema()
+
+    def generate(partition):
+        attempt = ray.get(generator_calls.record.remote(partition))
+        start = partition * 100
+        yield RecordBatch.from_pydict({"x": list(range(start, start + 50))})
+        if partition == failing_partition and attempt == 1:
+            raise exceptions.SocketError("retry an input with a different split factor")
+        yield RecordBatch.from_pydict({"x": list(range(start + 50, start + 100))})
+
+    with daft.execution_config_ctx(
+        shuffle_algorithm=shuffle_algorithm,
+        flight_shuffle_dirs=[str(tmp_path)],
+        enable_scan_task_split_and_merge=False,
+    ):
+        df = read_generator((partial(generate, i) for i in range(source)), schema).into_partitions(target)
+        parts = list(df.iter_partitions())
+        values = [v for p in ray.get(parts) for v in p.to_pydict()["x"]]
+
+    calls = ray.get(generator_calls.get.remote())
+    assert calls[failing_partition] >= 2, calls
+    assert sorted(values) == list(range(source * 100)), calls
+    assert len(parts) == target, calls
+
+
 def test_read_generator_does_not_retry_permanent_errors(generator_calls):
     batch = RecordBatch.from_pydict({"x": [1]})
 

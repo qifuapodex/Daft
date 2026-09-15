@@ -200,15 +200,18 @@ impl IntoPartitionsNode {
             if input_partition_idx < num_partitions_with_extra_output {
                 num_outputs += 1;
             }
-            let into_partitions_builder = builder.map_plan(self.as_ref(), |plan| {
-                LocalPhysicalPlan::into_partitions(
-                    plan,
-                    num_outputs,
-                    self.shuffle_backend.local_shuffle_backend(),
-                    StatsState::NotMaterialized,
-                    LocalNodeContext::new(Some(self.node_id() as usize)),
-                )
-            });
+            let into_partitions_builder = builder
+                .map_plan(self.as_ref(), |plan| {
+                    LocalPhysicalPlan::into_partitions(
+                        plan,
+                        num_outputs,
+                        self.shuffle_backend.local_shuffle_backend(),
+                        StatsState::NotMaterialized,
+                        LocalNodeContext::new(Some(self.node_id() as usize)),
+                    )
+                })
+                // Uneven splits need distinct pipelines for the two output counts.
+                .extend_fingerprint(num_outputs as u32);
             // Build and submit
             let submittable_task =
                 into_partitions_builder.build(self.context.query_idx, task_id_counter);

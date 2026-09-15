@@ -89,28 +89,24 @@ def flight_shuffle_ctx():
     return _ctx
 
 
-# Covers all three branches of IntoPartitionsNode (coalesce / equal / split) on the
-# flight backend. Coalescing used to panic in the flight read path with
+# Covers all three branches of IntoPartitionsNode (coalesce / equal / split) on both
+# shuffle backends. Coalescing used to panic in the flight read path with
 # "expected flight partition ref": the branch materializes its child's output as
 # plain in-memory refs, which the flight reader cannot address.
-@pytest.mark.parametrize("num_partitions", [1, 3, 7, 8, 9, 16])
-def test_into_partitions_under_flight_shuffle(flight_shuffle_ctx, num_partitions) -> None:
-    with flight_shuffle_ctx():
-        df = daft.range(10_000, partitions=8).into_partitions(num_partitions)
-        parts = list(df.iter_partitions())
+@pytest.mark.parametrize("shuffle_algorithm", ["map_reduce", "flight_shuffle"])
+@pytest.mark.parametrize("source,target", [(2, 3), (8, 9), (8, 12), (8, 15), (8, 16), (8, 1), (8, 3), (8, 7), (8, 8)])
+def test_into_partitions_exact_count(tmp_path, shuffle_algorithm, source, target) -> None:
+    import ray
 
-        import ray
-
-        values = set(v for p in ray.get(parts) for v in p.to_pydict()["id"])
-        assert values == set(range(10_000))
-
-        if num_partitions <= 8:
-            # Coalescing and the equal case land on exactly `num_partitions`.
-            # Splitting does not, on either backend: the per-task split factor is
-            # not part of the plan fingerprint, so same-fingerprint tasks sharing a
-            # worker pipeline all use whichever factor was built first (8 -> 9 has
-            # been observed as both 16 and 8). Only the row set is checked there.
-            assert len(parts) == num_partitions
+    with daft.execution_config_ctx(shuffle_algorithm=shuffle_algorithm, flight_shuffle_dirs=[str(tmp_path)]):
+        # Non-integral splits require two different split factors on the same
+        # worker. Repeat with fresh plans to cover either pipeline arriving first.
+        for repetition in range(3):
+            df = daft.range(10_000, partitions=source).into_partitions(target)
+            parts = list(df.iter_partitions())
+            values = [v for p in ray.get(parts) for v in p.to_pydict()["id"]]
+            assert sorted(values) == list(range(10_000)), repetition
+            assert len(parts) == target, repetition
 
 
 # The coalesce output must be consumable by whatever the parent node stacks on top,
