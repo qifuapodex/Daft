@@ -18,6 +18,7 @@ use std::{
 
 use common_error::{DaftError, DaftResult};
 use common_runtime::get_io_runtime;
+use daft_io::shuffle_file::{EioRetryBudget, RetryWriter};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 use daft_schema::schema::SchemaRef;
@@ -43,7 +44,7 @@ use crate::{
 const FILE_BUF_BYTES: usize = CHUNK_TARGET_BYTES;
 
 struct CountingFile {
-    inner: BufWriter<File>,
+    inner: BufWriter<RetryWriter>,
     bytes_written: u64,
     /// CRC-32 of everything written since the last `crc_reset`. Fed at the
     /// logical level (before buffering), so it tracks exactly the bytes the
@@ -55,7 +56,7 @@ impl CountingFile {
     /// `start_offset` is where the IPC stream begins in the file, so that the
     /// byte counter — and therefore every recorded range — is an absolute file
     /// offset even when an index region precedes the stream.
-    fn new_at(inner: File, start_offset: u64) -> Self {
+    fn new_at(inner: RetryWriter, start_offset: u64) -> Self {
         Self {
             inner: BufWriter::with_capacity(FILE_BUF_BYTES, inner),
             bytes_written: start_offset,
@@ -74,7 +75,9 @@ impl CountingFile {
     fn into_file(self) -> DaftResult<File> {
         self.inner
             .into_inner()
-            .map_err(|e| DaftError::InternalError(format!("IPC writer flush failed: {}", e)))
+            .map_err(|e| DaftError::IoError(e.into_error()))?
+            .finish()
+            .map_err(DaftError::IoError)
     }
 }
 
@@ -135,6 +138,13 @@ pub async fn write_partitions_one_shot(
             let (mut commit, file, base_offset, file_path) =
                 open_target(&target, shuffle_id, input_id, attempt, num_partitions)?;
 
+            let file = RetryWriter::new(
+                file,
+                EioRetryBudget::new(crate::local_io::policy(shuffle_id), &file_path),
+            )
+            .map_err(|e| {
+                DaftError::IoError(e).with_shuffle_io_context("initialize writer", &file_path)
+            })?;
             let arrow_schema = Arc::new(schema.to_arrow()?);
             let write_options = arrow_ipc::writer::IpcWriteOptions::default()
                 .try_with_compression(compression)
@@ -146,7 +156,9 @@ pub async fn write_partitions_one_shot(
                 arrow_schema.as_ref(),
                 write_options,
             )
-            .map_err(|e| DaftError::InternalError(format!("IPC writer init failed: {}", e)))?;
+            .map_err(|e| {
+                DaftError::ArrowRsError(e).with_shuffle_io_context("initialize writer", &file_path)
+            })?;
 
             // Partition boundaries and checksums double as the on-disk index for
             // the shared target: `offsets[p]..offsets[p + 1]` is partition `p`
@@ -165,7 +177,8 @@ pub async fn write_partitions_one_shot(
                     &arrow_schema,
                     &schema,
                     &file_path,
-                )?;
+                )
+                .map_err(|e| e.with_shuffle_io_context("write", &file_path))?;
                 let crc = writer.get_ref().crc_current();
                 crcs.push(crc);
                 // The same checksum the shared index carries, kept in memory so the
@@ -185,16 +198,23 @@ pub async fn write_partitions_one_shot(
             let encode_write_us = started.elapsed().as_micros() as u64;
             let flush_started = Instant::now();
             writer.finish().map_err(|e| {
-                DaftError::InternalError(format!("IPC writer finish failed: {}", e))
+                DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &file_path)
             })?;
             // BufWriter::drop swallows flush errors — surface them explicitly.
-            writer
-                .flush()
-                .map_err(|e| DaftError::InternalError(format!("IPC writer flush failed: {}", e)))?;
+            writer.flush().map_err(|e| {
+                DaftError::ArrowRsError(e).with_shuffle_io_context("flush", &file_path)
+            })?;
 
             let flush_us = flush_started.elapsed().as_micros() as u64;
             let file_bytes = writer.get_ref().bytes_written;
             let commit_started = Instant::now();
+            let file = writer
+                .into_inner()
+                .map_err(|e| {
+                    DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &file_path)
+                })?
+                .into_file()
+                .map_err(|e| e.with_shuffle_io_context("flush or verify", &file_path))?;
             if let Some(commit) = commit.take() {
                 let durability = match &target {
                     OneShotTarget::Shared { durability, .. } => *durability,
@@ -202,13 +222,9 @@ pub async fn write_partitions_one_shot(
                         unreachable!("commit only exists for shared targets")
                     }
                 };
-                let file = writer
-                    .into_inner()
-                    .map_err(|e| {
-                        DaftError::InternalError(format!("IPC writer into_inner failed: {}", e))
-                    })?
-                    .into_file()?;
-                commit.commit(file, &offsets, &crcs, durability)?;
+                commit
+                    .commit(file, &offsets, &crcs, durability)
+                    .map_err(|e| e.with_shuffle_io_context("commit", &file_path))?;
             }
 
             tracing::info!(
@@ -258,18 +274,20 @@ fn open_target(
             // Local files are written under their final name — the attempt token
             // already fences concurrent attempts — so there is no rename to make
             // durable and the directory sync state goes unused.
-            let (file, _dir_sync) = create_file_under(shuffle_id, &shuffle_dir, &file_path)?;
+            let (file, _dir_sync) = create_file_under(shuffle_id, &shuffle_dir, &file_path)
+                .map_err(|e| e.with_shuffle_io_context("create", &file_path))?;
             Ok((None, file, 0, file_path))
         }
         OneShotTarget::Shared { shared_root, .. } => {
+            let file_path = shared_map_file(shared_root, shuffle_id, input_id, attempt);
             let (commit, file, base_offset) = SharedMapFileCommit::begin(
                 shared_root,
                 shuffle_id,
                 input_id,
                 attempt,
                 num_partitions,
-            )?;
-            let file_path = shared_map_file(shared_root, shuffle_id, input_id, attempt);
+            )
+            .map_err(|e| e.with_shuffle_io_context("create", &file_path))?;
             Ok((Some(commit), file, base_offset, file_path))
         }
     }
@@ -355,6 +373,6 @@ fn write_coalesced(
         .map_err(DaftError::ArrowRsError)?;
     writer
         .write(&arrow_batch)
-        .map_err(|e| DaftError::InternalError(format!("IPC write failed: {}", e)))?;
+        .map_err(DaftError::ArrowRsError)?;
     Ok(())
 }

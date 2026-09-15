@@ -127,6 +127,12 @@ impl PyDaftExecutionConfig {
         flight_shuffle_shared_durability=None,
         flight_shuffle_read_source=None,
         flight_shuffle_shared_read_concurrency=None,
+        flight_shuffle_eio_local_max_retries=None,
+        flight_shuffle_eio_max_retries=None,
+        flight_shuffle_eio_local_initial_backoff_ms=None,
+        flight_shuffle_eio_initial_backoff_ms=None,
+        flight_shuffle_eio_local_max_backoff_ms=None,
+        flight_shuffle_eio_max_backoff_ms=None,
         flight_shuffle_recovery_max_attempts=None,
         flight_shuffle_recovery_max_inflight=None,
         flight_shuffle_recovery_max_consumer_failures=None,
@@ -181,6 +187,12 @@ impl PyDaftExecutionConfig {
         flight_shuffle_shared_durability: Option<&str>,
         flight_shuffle_read_source: Option<&str>,
         flight_shuffle_shared_read_concurrency: Option<usize>,
+        flight_shuffle_eio_local_max_retries: Option<u32>,
+        flight_shuffle_eio_max_retries: Option<u32>,
+        flight_shuffle_eio_local_initial_backoff_ms: Option<u64>,
+        flight_shuffle_eio_initial_backoff_ms: Option<u64>,
+        flight_shuffle_eio_local_max_backoff_ms: Option<u64>,
+        flight_shuffle_eio_max_backoff_ms: Option<u64>,
         flight_shuffle_recovery_max_attempts: Option<u32>,
         flight_shuffle_recovery_max_inflight: Option<usize>,
         flight_shuffle_recovery_max_consumer_failures: Option<usize>,
@@ -195,6 +207,36 @@ impl PyDaftExecutionConfig {
         experimental_shuffle_aqe_min_partitions: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
+        if let Some(value) = flight_shuffle_eio_local_max_retries {
+            config.flight_shuffle_eio_local_max_retries = value;
+        }
+        if let Some(value) = flight_shuffle_eio_max_retries {
+            config.flight_shuffle_eio_max_retries = value;
+        }
+        if let Some(value) = flight_shuffle_eio_local_initial_backoff_ms {
+            config.flight_shuffle_eio_local_initial_backoff_ms = value;
+        }
+        if let Some(value) = flight_shuffle_eio_initial_backoff_ms {
+            config.flight_shuffle_eio_initial_backoff_ms = value;
+        }
+        if let Some(value) = flight_shuffle_eio_local_max_backoff_ms {
+            config.flight_shuffle_eio_local_max_backoff_ms = value;
+        }
+        if let Some(value) = flight_shuffle_eio_max_backoff_ms {
+            config.flight_shuffle_eio_max_backoff_ms = value;
+        }
+        if config.flight_shuffle_eio_local_max_backoff_ms
+            < config.flight_shuffle_eio_local_initial_backoff_ms
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "flight_shuffle_eio_local_max_backoff_ms must be >= flight_shuffle_eio_local_initial_backoff_ms",
+            ));
+        }
+        if config.flight_shuffle_eio_max_backoff_ms < config.flight_shuffle_eio_initial_backoff_ms {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "flight_shuffle_eio_max_backoff_ms must be >= flight_shuffle_eio_initial_backoff_ms",
+            ));
+        }
         if let Some(value) = flight_shuffle_recovery_max_attempts {
             config.flight_shuffle_recovery_max_attempts = value;
         }
@@ -687,6 +729,36 @@ impl PyDaftExecutionConfig {
     }
 
     #[getter]
+    fn flight_shuffle_eio_local_max_retries(&self) -> u32 {
+        self.config.flight_shuffle_eio_local_max_retries
+    }
+
+    #[getter]
+    fn flight_shuffle_eio_max_retries(&self) -> u32 {
+        self.config.flight_shuffle_eio_max_retries
+    }
+
+    #[getter]
+    fn flight_shuffle_eio_local_initial_backoff_ms(&self) -> u64 {
+        self.config.flight_shuffle_eio_local_initial_backoff_ms
+    }
+
+    #[getter]
+    fn flight_shuffle_eio_initial_backoff_ms(&self) -> u64 {
+        self.config.flight_shuffle_eio_initial_backoff_ms
+    }
+
+    #[getter]
+    fn flight_shuffle_eio_local_max_backoff_ms(&self) -> u64 {
+        self.config.flight_shuffle_eio_local_max_backoff_ms
+    }
+
+    #[getter]
+    fn flight_shuffle_eio_max_backoff_ms(&self) -> u64 {
+        self.config.flight_shuffle_eio_max_backoff_ms
+    }
+
+    #[getter]
     fn flight_shuffle_recovery_max_attempts(&self) -> PyResult<u32> {
         Ok(self.config.flight_shuffle_recovery_max_attempts)
     }
@@ -734,7 +806,7 @@ impl PyDaftExecutionConfig {
 
 common_py_serde::impl_versioned_bincode_py_state_serialization!(
     PyDaftExecutionConfig,
-    _from_serialized_shuffle_aqe_v1
+    _from_serialized_shuffle_eio_v2
 );
 
 #[derive(Clone, Default, Serialize, Deserialize)]

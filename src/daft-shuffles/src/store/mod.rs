@@ -260,6 +260,7 @@ pub fn forget_created_dirs(shuffle_id: u64) {
 /// held by different halves of the same worker. A worker that only wrote, or only
 /// read, simply has nothing in the other one.
 pub fn forget_shuffle(shuffle_id: u64) {
+    crate::local_io::forget(shuffle_id);
     forget_created_dirs(shuffle_id);
     reader::forget_partition_count(shuffle_id);
 }
@@ -348,14 +349,24 @@ pub(crate) fn create_file_under(
         std::fs::create_dir_all(dir)?;
         known = Some(remember_dir(shuffle_id, dir));
     }
-    match File::create(path) {
+    let mut retry =
+        daft_io::shuffle_file::EioRetryBudget::new(crate::local_io::policy(shuffle_id), path);
+    let create = || {
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    };
+    match retry.run("create", create) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             forget_created_dirs(shuffle_id);
             std::fs::create_dir_all(dir)?;
             // A fresh directory carries fresh sync state: whatever the old one had
             // committed went away with it.
             let dir_sync = remember_dir(shuffle_id, dir);
-            Ok((File::create(path)?, dir_sync))
+            Ok((retry.run("create", create)?, dir_sync))
         }
         other => Ok((other?, known.expect("set above when absent"))),
     }

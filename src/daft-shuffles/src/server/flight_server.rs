@@ -494,11 +494,11 @@ fn open_spec_as_flight_stream(spec: FileReadSpec) -> BoxStream<'static, DaftResu
                 // so the only thing that distinguishes "this stream had few batches"
                 // from "this file was cut short" is the writer's end-of-stream
                 // marker. Requiring it turns a silently short answer into an error.
-                let file = tokio::fs::File::open(&path).await.map_err(|e| failure.open_error(e))?;
+                let file = daft_io::shuffle_file::RetryReader::open(&path, crate::local_io::policy(failure.shuffle_id)).await.map_err(|e| failure.open_error(e).with_shuffle_io_context("open", &path))?;
                 let mut reader = BufReader::new(file);
-                skip_stream_metadata(&mut reader).await?;
+                skip_stream_metadata(&mut reader).await.map_err(|e| e.with_shuffle_io_context("read metadata", &path))?;
                 loop {
-                    match next_flight_data(&mut reader).await? {
+                    match next_flight_data(&mut reader).await.map_err(|e| e.with_shuffle_io_context("read", &path))? {
                         FlightMessage::Data(data) => yield data,
                         FlightMessage::EndOfStream => break,
                         FlightMessage::EndOfInput => Err(DaftError::InternalError(format!(
@@ -509,16 +509,16 @@ fn open_spec_as_flight_stream(spec: FileReadSpec) -> BoxStream<'static, DaftResu
                 }
             }
             FileReadSpec::Ranges { path, ranges, failure } => {
-                let mut file = tokio::fs::File::open(&path).await.map_err(|e| failure.open_error(e))?;
+                let mut file = daft_io::shuffle_file::RetryReader::open(&path, crate::local_io::policy(failure.shuffle_id)).await.map_err(|e| failure.open_error(e).with_shuffle_io_context("open", &path))?;
                 for range in ranges {
-                    file.seek(SeekFrom::Start(range.start)).await.map_err(DaftError::IoError)?;
+                    file.seek(SeekFrom::Start(range.start)).await.map_err(|e| DaftError::IoError(e).with_shuffle_io_context("seek", &path))?;
                     let mut checked = CheckedRange::new(
                         &mut file,
                         range.end - range.start,
                         range.crc32,
                         format!("shuffle file {} range {}..{}", path, range.start, range.end),
                     );
-                    while let Some(data) = checked.next().await? {
+                    while let Some(data) = checked.next().await.map_err(|e| e.with_shuffle_io_context("read", &path))? {
                         yield data;
                     }
                     checked.finish()?;

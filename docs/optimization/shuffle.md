@@ -64,6 +64,90 @@ daft.context.set_execution_config(
 
 This applies to every shuffle in the session.
 
+### Retrying shuffle EIO failures
+
+Flight shuffle handles POSIX file EIO (`errno=5`) in two layers. It first retries
+I/O inside the existing process, preserving the current task's computation. If
+local recovery fails, Flotilla can restart an eligible task. Both policies are
+configurable per query:
+
+```python
+with daft.execution_config_ctx(
+    shuffle_algorithm="flight_shuffle",
+    # In-process file recovery:
+    flight_shuffle_eio_local_max_retries=6,
+    flight_shuffle_eio_local_initial_backoff_ms=1000,
+    flight_shuffle_eio_local_max_backoff_ms=32000,
+    # Fallback task replay:
+    flight_shuffle_eio_max_retries=3,
+    flight_shuffle_eio_initial_backoff_ms=1000,
+    flight_shuffle_eio_max_backoff_ms=30000,
+):
+    result = df.repartition(128, "key").collect()
+```
+
+These are the defaults. The six local retry delays are **1, 2, 4, 8, 16 and 32
+seconds** (63 seconds of waiting in total if all six retries are used, excluding
+time spent doing I/O). Each count excludes the initial operation/execution;
+zero disables that layer. Set both counts to zero to disable both layers. Delays
+double after each retry up to the configured maximum. Each maximum must be at
+least its initial delay; an initial delay of zero allows immediate retries.
+
+Local recovery does not change the IPC files, partition ranges, index, Flight
+tickets or durability mode:
+
+- Reads keep the same open file and producer attempt. An EIO is retried from the
+  last successfully returned byte, below IPC parsing and checksum accounting.
+  Already-delivered batches are not delivered again. This covers shared-mount,
+  same-process and server-side Flight file reads, including errors mid-message.
+  It does not reconnect or resume a broken Flight network stream.
+- Writes retain the current byte slice until the positioned write completes,
+  accounting for short writes. No additional full-partition copy is kept. Because
+  a write EIO can report an earlier writeback failure, recovery also reads,
+  checksums and rewrites the entire written data region before publication,
+  using a 64 KiB buffer. This fault-only pass avoids rerunning upstream operators
+  or IPC encoding; any error or checksum mismatch in that pass fails the task.
+  Reading cached bytes alone would not ensure a later fsync retries failed pages.
+- Successful execution adds no extra data reads/writes or fsyncs. It does add
+  cursor bookkeeping and a write checksum. A recovered write EIO can add one
+  full-file data read/write pass. Index commit, rename and fsync errors continue
+  to use task fallback, because their effects cannot be localized safely.
+
+A local read budget covers open and all reads of that handle, and does not reset
+on successful reads or bucket boundaries. Combined-file creation and its writer
+have separate bounded budgets; a streaming IPC writer shares its create/write
+budget. Different files and different task attempts have independent budgets,
+so local retries can multiply with task retries. Each local retry logs its file path,
+operation, original error/errno, retry count/limit and delay in seconds and
+milliseconds at WARN level under `daft_shuffle_io_retry`. File policies are kept per shuffle and
+removed with its runtime caches. RPC servers use the originating shuffle's policy;
+no new request metadata or on-disk recovery state is needed.
+
+Local I/O recovery does not replay UDFs or other operators. Fallback task replay
+requires retained inputs and restartable operators: pure projections, filters,
+joins, supported aggregations, sorts and shuffle writes are eligible. File scans
+may be repeated while their inputs remain unchanged for the query. UDFs, unknown
+functions, external writes and other unaudited operators are not automatically
+replayed. On fallback, a task starts with fresh pipeline state and new output
+attempt files; its partial results are not committed. Its cumulative failed-task
+attempt count is shared with other dispatcher failure categories, so changing
+failure categories cannot reset the task budget. Ray application retries are not
+enabled by this feature.
+
+Permission errors, read-only mounts, full disks and missing files do not use EIO
+retries. Missing outputs still need shuffle reconstruction where supported.
+Ordinary checksum/corruption errors are not classified as transient EIO; a failed
+integrity check specifically following write EIO reports that original EIO to the
+task fallback. Permanent storage failures cannot be repaired by retries.
+
+The existing `background` durability mode reports later fsync failures in worker
+logs after task completion; choose `flight_shuffle_shared_durability="sync"` when
+fsync failure must fail the writing task. A failed fsync is never retried until
+success and then assumed to have repaired the file. No per-block fsync is added.
+
+Coordinator and workers must use the same Daft build. Execution-config and
+embedded distributed-plan pickle serialization reject older incompatible layouts.
+
 ### `flight_shuffle_dirs`
 
 Local directories where Daft writes shuffle spill files. Defaults to `["/tmp"]`.

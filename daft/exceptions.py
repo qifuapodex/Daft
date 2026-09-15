@@ -6,13 +6,9 @@ from __future__ import annotations
 class DaftCoreException(ValueError):
     """DaftCore Base Exception."""
 
-    pass
-
 
 class DaftTypeError(DaftCoreException):
     """Type Error that occurred in Daft Core."""
-
-    pass
 
 
 class DaftShuffleFetchError(DaftCoreException):
@@ -35,13 +31,25 @@ class DaftShuffleFetchError(DaftCoreException):
         return type(self), (self.shuffle_id, self.input_id, self.attempt, self.partition_idx, self.path, self.message)
 
 
+class DaftShuffleIoError(DaftCoreException):
+    """A shuffle file error, retried using the task's dedicated EIO policy."""
+
+    def __init__(self, operation: str, path: str, errno: int, message: str) -> None:
+        self.operation = operation
+        self.path = path
+        self.errno = errno
+        self.message = message
+        super().__init__(f"Shuffle {operation} failed at {path} (errno {errno}): {message}")
+
+    def __reduce__(self) -> tuple[type[DaftShuffleIoError], tuple[str, str, int, str]]:
+        return type(self), (self.operation, self.path, self.errno, self.message)
+
+
 class DaftTransientError(DaftCoreException):
     """Daft Transient Error.
 
     This is typically raised when there is a network issue such as timeout or throttling. This can usually be retried.
     """
-
-    pass
 
 
 class ConnectTimeoutError(DaftTransientError):
@@ -50,16 +58,12 @@ class ConnectTimeoutError(DaftTransientError):
     Daft client was not able to make a connection to the server in the connect timeout time.
     """
 
-    pass
-
 
 class ReadTimeoutError(DaftTransientError):
     """Daft Read Timeout Error.
 
     Daft client was not able to read bytes from server under the read timeout time.
     """
-
-    pass
 
 
 class ByteStreamError(DaftTransientError):
@@ -68,16 +72,12 @@ class ByteStreamError(DaftTransientError):
     Daft client had an error while reading bytes in a stream from the server.
     """
 
-    pass
-
 
 class SocketError(DaftTransientError):
     """Daft Socket Error.
 
     Daft client had a socket error while reading bytes in a stream from the server.
     """
-
-    pass
 
 
 class ThrottleError(DaftTransientError):
@@ -86,13 +86,9 @@ class ThrottleError(DaftTransientError):
     Daft client had a throttle error while making request to server.
     """
 
-    pass
-
 
 class MiscTransientError(DaftTransientError):
     """Daft Misc Transient Error.
 
     Daft client had a Misc Transient Error while making request to server.
     """
-
-    pass

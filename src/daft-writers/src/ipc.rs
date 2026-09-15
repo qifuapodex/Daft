@@ -6,6 +6,7 @@ use daft_core::{
     prelude::{DataType, Field, Schema},
     series::Series,
 };
+use daft_io::shuffle_file::{EioRetryBudget, EioRetryPolicy, RetryWriter};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 
@@ -16,7 +17,8 @@ pub struct IPCWriter {
     bytes_written: usize,
     file_path: String,
     compression: Option<arrow_ipc::CompressionType>,
-    writer: Option<arrow_ipc::writer::StreamWriter<File>>,
+    retry_policy: EioRetryPolicy,
+    writer: Option<arrow_ipc::writer::StreamWriter<RetryWriter>>,
 }
 
 impl IPCWriter {
@@ -27,15 +29,25 @@ impl IPCWriter {
             file_path: file_path.to_string(),
             compression,
             writer: None,
+            retry_policy: EioRetryPolicy::default(),
         }
     }
 
     fn get_or_create_writer(
         &mut self,
         schema: &Schema,
-    ) -> DaftResult<&mut arrow_ipc::writer::StreamWriter<File>> {
+    ) -> DaftResult<&mut arrow_ipc::writer::StreamWriter<RetryWriter>> {
         if self.writer.is_none() {
-            let file = File::create(self.file_path.as_str())?;
+            let mut budget = EioRetryBudget::new(self.retry_policy, &self.file_path);
+            let file = budget.run("create", || {
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&self.file_path)
+            })?;
+            let file = RetryWriter::new(file, budget)?;
 
             let arrow_schema = schema.to_arrow()?;
             let write_options = arrow_ipc::writer::IpcWriteOptions::default()
@@ -62,14 +74,21 @@ impl AsyncFileWriter for IPCWriter {
 
         let size_bytes = data.size_bytes();
         let rows_written = data.len();
-        let writer = self.get_or_create_writer(&data.schema())?;
-
-        // Write each record batch
-        for table in data.record_batches() {
-            // Convert daft RecordBatch to arrow-rs RecordBatch
-            let arrow_batch: arrow_array::RecordBatch = table.clone().try_into()?;
-            writer.write(&arrow_batch)?;
-        }
+        // Encoding and bounded synchronous I/O retries must not block an async
+        // executor thread. Move the private writer into the blocking operation.
+        let mut state = IPCWriter::new(&self.file_path, self.compression);
+        state.retry_policy = self.retry_policy;
+        state.writer = self.writer.take();
+        self.writer = common_runtime::get_io_runtime(true)
+            .spawn_blocking(move || -> DaftResult<_> {
+                let writer = state.get_or_create_writer(&data.schema())?;
+                for table in data.record_batches() {
+                    let arrow_batch: arrow_array::RecordBatch = table.clone().try_into()?;
+                    writer.write(&arrow_batch)?;
+                }
+                Ok(state.writer)
+            })
+            .await??;
 
         // Track bytes written (approximate, since we can't easily get exact bytes from arrow-ipc)
         self.bytes_written += size_bytes;
@@ -81,7 +100,13 @@ impl AsyncFileWriter for IPCWriter {
 
     async fn close(&mut self) -> DaftResult<Self::Result> {
         if let Some(mut writer) = self.writer.take() {
-            writer.finish()?;
+            common_runtime::get_io_runtime(true)
+                .spawn_blocking(move || -> DaftResult<()> {
+                    writer.finish()?;
+                    writer.into_inner()?.finish()?;
+                    Ok(())
+                })
+                .await??;
         }
         let path_col = Series::from_arrow(
             Arc::new(Field::new(RETURN_PATHS_COLUMN_NAME, DataType::Utf8)),
@@ -103,13 +128,25 @@ impl AsyncFileWriter for IPCWriter {
 }
 
 pub struct IPCWriterFactory {
+    retry_policy: EioRetryPolicy,
     dir: String,
     compression: Option<arrow_ipc::CompressionType>,
 }
 
 impl IPCWriterFactory {
     pub fn new(dir: String, compression: Option<arrow_ipc::CompressionType>) -> Self {
-        Self { dir, compression }
+        Self {
+            dir,
+            compression,
+            retry_policy: EioRetryPolicy::default(),
+        }
+    }
+}
+
+impl IPCWriterFactory {
+    pub fn with_retry_policy(mut self, policy: EioRetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 }
 
@@ -123,7 +160,8 @@ impl WriterFactory for IPCWriterFactory {
         _partition_values: Option<&RecordBatch>,
     ) -> DaftResult<Box<dyn AsyncFileWriter<Input = Self::Input, Result = Self::Result>>> {
         let file_path = format!("{}/{}.arrow", self.dir, file_idx);
-        let writer = IPCWriter::new(&file_path, self.compression);
+        let mut writer = IPCWriter::new(&file_path, self.compression);
+        writer.retry_policy = self.retry_policy;
         Ok(Box::new(writer))
     }
 }

@@ -236,6 +236,15 @@ pub fn make_ipc_writer(
     target_filesize: usize,
     compression: Option<&str>,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>> {
+    make_ipc_writer_with_retry(dir, target_filesize, compression, Default::default())
+}
+
+pub fn make_ipc_writer_with_retry(
+    dir: &str,
+    target_filesize: usize,
+    compression: Option<&str>,
+    policy: daft_io::shuffle_file::EioRetryPolicy,
+) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>> {
     let compression = match compression {
         Some("lz4") => Some(arrow_ipc::CompressionType::LZ4_FRAME),
         Some("zstd") => Some(arrow_ipc::CompressionType::ZSTD),
@@ -247,7 +256,8 @@ pub fn make_ipc_writer(
         }
         None => None,
     };
-    let base_writer_factory = IPCWriterFactory::new(dir.to_string(), compression);
+    let base_writer_factory =
+        IPCWriterFactory::new(dir.to_string(), compression).with_retry_policy(policy);
     let file_size_calculator = TargetInMemorySizeBytesCalculator::new(
         target_filesize,
         if compression.is_some() { 2.0 } else { 1.0 },

@@ -249,6 +249,12 @@ def set_execution_config(
     flight_shuffle_shared_durability: str | None = None,
     flight_shuffle_read_source: str | None = None,
     flight_shuffle_shared_read_concurrency: int | None = None,
+    flight_shuffle_eio_local_max_retries: int | None = None,
+    flight_shuffle_eio_max_retries: int | None = None,
+    flight_shuffle_eio_local_initial_backoff_ms: int | None = None,
+    flight_shuffle_eio_initial_backoff_ms: int | None = None,
+    flight_shuffle_eio_local_max_backoff_ms: int | None = None,
+    flight_shuffle_eio_max_backoff_ms: int | None = None,
     flight_shuffle_recovery_max_attempts: int | None = None,
     flight_shuffle_recovery_max_inflight: int | None = None,
     flight_shuffle_recovery_max_consumer_failures: int | None = None,
@@ -315,6 +321,12 @@ def set_execution_config(
         flight_shuffle_shared_dir: A cluster-shared POSIX directory (Lustre, NFS, FSx, ...) to write flight shuffle data to. Required when `flight_shuffle_placement` is "shared_only", and must be set in the same call. Defaults to None.
         flight_shuffle_placement: Where flight shuffle map output is written. "local_only" (the default) uses the node-local `flight_shuffle_dirs` and serves partitions over gRPC only. "shared_only" writes to `flight_shuffle_shared_dir`, letting any node read a partition directly and letting a query survive losing the worker that wrote it. Only applies to repartition-style shuffles; gather and into_partitions always write node-locally.
         flight_shuffle_shared_durability: How shared-directory writes are fsynced. "background" (the default) publishes the file immediately and fsyncs off the critical path; "none" never fsyncs, so a shared copy can be lost if its writer node dies; "sync" fsyncs before publishing, which is the strongest but can cut write throughput several-fold on filesystems with expensive fsync.
+        flight_shuffle_eio_local_max_retries: In-process shuffle file EIO retries. Defaults to 6; 0 disables local recovery. Budgets cover a read handle (including open), or each create/write phase. Does not re-execute operators.
+        flight_shuffle_eio_local_initial_backoff_ms: Initial local EIO retry delay, doubled with each retry. Defaults to 1000 milliseconds (1 second).
+        flight_shuffle_eio_local_max_backoff_ms: Maximum local EIO retry delay. Defaults to 32000 milliseconds (32 seconds); must be at least the initial delay.
+        flight_shuffle_eio_max_retries: Extra Flotilla task attempts after shuffle file EIO. Defaults to 3; 0 disables retries. Requires restartable tasks without UDFs or external writes. File inputs must remain unchanged during execution.
+        flight_shuffle_eio_initial_backoff_ms: Initial EIO task retry delay in milliseconds. Doubles after each failed attempt. Defaults to 1000; 0 allows immediate retries.
+        flight_shuffle_eio_max_backoff_ms: Maximum EIO retry delay in milliseconds. Must be at least the initial delay. Defaults to 30000.
         flight_shuffle_recovery_max_attempts: Map reconstruction attempts per producer. Defaults to 0 (disabled). Enabling retains replayable producer inputs until query completion; scan-to-shuffle producers are not supported.
         flight_shuffle_recovery_max_inflight: Maximum concurrently executing reconstruction tasks per query. Defaults to 4.
         flight_shuffle_recovery_max_consumer_failures: Maximum fetch recovery rounds per consumer. Defaults to 64.
@@ -382,6 +394,12 @@ def set_execution_config(
             flight_shuffle_shared_durability=flight_shuffle_shared_durability,
             flight_shuffle_read_source=flight_shuffle_read_source,
             flight_shuffle_shared_read_concurrency=flight_shuffle_shared_read_concurrency,
+            flight_shuffle_eio_local_max_retries=flight_shuffle_eio_local_max_retries,
+            flight_shuffle_eio_max_retries=flight_shuffle_eio_max_retries,
+            flight_shuffle_eio_local_initial_backoff_ms=flight_shuffle_eio_local_initial_backoff_ms,
+            flight_shuffle_eio_initial_backoff_ms=flight_shuffle_eio_initial_backoff_ms,
+            flight_shuffle_eio_local_max_backoff_ms=flight_shuffle_eio_local_max_backoff_ms,
+            flight_shuffle_eio_max_backoff_ms=flight_shuffle_eio_max_backoff_ms,
             flight_shuffle_recovery_max_attempts=flight_shuffle_recovery_max_attempts,
             flight_shuffle_recovery_max_inflight=flight_shuffle_recovery_max_inflight,
             flight_shuffle_recovery_max_consumer_failures=flight_shuffle_recovery_max_consumer_failures,

@@ -653,6 +653,36 @@ fn producer_plan_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef) -> boo
 // Consumer retry needs absence of external effects, not producer output
 // equivalence. Order-sensitive operators are safe when their task has not committed.
 fn consumer_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef) -> bool {
+    restartable_plan(plan, false)
+}
+
+/// Ordinary task retry precedes publication, so file scans may be repeated under
+/// the normal query contract that inputs remain unchanged. This does NOT make
+/// those scans eligible for reconstruction of already-published map outputs.
+pub(super) fn task_restartable_after_shuffle_eio(task: &SwordfishTask) -> bool {
+    task.inputs().values().all(|input| match input {
+        Input::InMemory(_) | Input::FlightShuffle(_) => true,
+        Input::ScanTasks(tasks) => tasks.iter().all(|scan| {
+            matches!(
+                scan.source_config.as_ref(),
+                daft_scan::SourceConfig::File(_)
+            ) && pure_pushdowns(&scan.pushdowns, &scan.schema)
+        }),
+        Input::GlobPaths(_) => false,
+    }) && restartable_plan(&task.plan(), true)
+}
+
+fn pure_pushdowns(pushdowns: &daft_scan::Pushdowns, schema: &Schema) -> bool {
+    pushdowns
+        .filters
+        .iter()
+        .chain(pushdowns.partition_filters.iter())
+        .chain(pushdowns.aggregation.iter())
+        .chain(pushdowns.pushed_filters.iter().flatten())
+        .all(|e| pure_expr(e, schema))
+}
+
+fn restartable_plan(plan: &daft_local_plan::LocalPhysicalPlanRef, allow_file_scans: bool) -> bool {
     if !plan.schema().fields().iter().all(|f| scalar_type(&f.dtype)) {
         return false;
     }
@@ -661,6 +691,13 @@ fn consumer_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef) -> bool {
         exprs.iter().all(|e| pure_expr(e.inner(), input.schema()))
     };
     let allowed = match plan.as_ref() {
+        LocalPhysicalPlan::PhysicalScan(scan) => {
+            allow_file_scans
+                && scan.source_config.as_ref().is_none_or(|source| {
+                    matches!(source.as_ref(), daft_scan::SourceConfig::File(_))
+                })
+                && pure_pushdowns(&scan.pushdowns, &scan.schema)
+        }
         LocalPhysicalPlan::InMemoryScan(_)
         | LocalPhysicalPlan::ShuffleRead(_)
         | LocalPhysicalPlan::IntoBatches(_)
@@ -705,7 +742,11 @@ fn consumer_replayable(plan: &daft_local_plan::LocalPhysicalPlanRef) -> bool {
         },
         _ => false,
     };
-    allowed && plan.arc_children().iter().all(consumer_replayable)
+    allowed
+        && plan
+            .arc_children()
+            .iter()
+            .all(|child| restartable_plan(child, allow_file_scans))
 }
 
 #[cfg(test)]
@@ -882,6 +923,41 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn eio_restart_safety_does_not_expand_published_output_recovery_or_external_writes() {
+        let schema = test_schema();
+        let scan = LocalPhysicalPlan::physical_scan(
+            0,
+            None,
+            daft_scan::Pushdowns::default(),
+            schema.clone(),
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        assert!(restartable_plan(&scan, true));
+        assert!(!consumer_replayable(&scan));
+        assert!(!producer_plan_replayable(&scan));
+        let write = LocalPhysicalPlan::physical_write(
+            scan,
+            schema.clone(),
+            schema,
+            daft_logical_plan::OutputFileInfo {
+                root_dir: "/unused/test-output".into(),
+                write_mode: common_file_formats::WriteMode::Append,
+                file_format: common_file_formats::FileFormat::Parquet,
+                format_option: None,
+                partition_cols: None,
+                compression: None,
+                io_config: None,
+                write_success_file: false,
+                single_file: false,
+            },
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        assert!(!restartable_plan(&write, true));
     }
 
     #[tokio::test]

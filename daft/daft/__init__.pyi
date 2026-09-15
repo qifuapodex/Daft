@@ -2671,6 +2671,12 @@ class PyDaftExecutionConfig:
         flight_shuffle_shared_durability: str | None = None,
         flight_shuffle_read_source: str | None = None,
         flight_shuffle_shared_read_concurrency: int | None = None,
+        flight_shuffle_eio_local_max_retries: int | None = None,
+        flight_shuffle_eio_max_retries: int | None = None,
+        flight_shuffle_eio_local_initial_backoff_ms: int | None = None,
+        flight_shuffle_eio_initial_backoff_ms: int | None = None,
+        flight_shuffle_eio_local_max_backoff_ms: int | None = None,
+        flight_shuffle_eio_max_backoff_ms: int | None = None,
         flight_shuffle_recovery_max_attempts: int | None = None,
         flight_shuffle_recovery_max_inflight: int | None = None,
         flight_shuffle_recovery_max_consumer_failures: int | None = None,
@@ -2757,6 +2763,18 @@ class PyDaftExecutionConfig:
     def flight_shuffle_read_source(self) -> str: ...
     @property
     def flight_shuffle_shared_read_concurrency(self) -> int: ...
+    @property
+    def flight_shuffle_eio_local_max_retries(self) -> int: ...
+    @property
+    def flight_shuffle_eio_max_retries(self) -> int: ...
+    @property
+    def flight_shuffle_eio_local_initial_backoff_ms(self) -> int: ...
+    @property
+    def flight_shuffle_eio_initial_backoff_ms(self) -> int: ...
+    @property
+    def flight_shuffle_eio_local_max_backoff_ms(self) -> int: ...
+    @property
+    def flight_shuffle_eio_max_backoff_ms(self) -> int: ...
     @property
     def flight_shuffle_recovery_max_attempts(self) -> int: ...
     @property

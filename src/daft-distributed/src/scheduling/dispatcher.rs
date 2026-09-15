@@ -221,7 +221,22 @@ impl<W: Worker> Dispatcher<W> {
                 // recovery may submit a new physical task ID above this layer.
                 // `attempts` counts failures *before* this one, so the run that just
                 // finished is attempt number `attempts + 1`.
+                let shuffle_io = match &task_result {
+                    Ok(TaskStatus::Failed { error }) => error.shuffle_io_error(),
+                    _ => None,
+                };
+                let eio_policy = shuffle_io
+                    .as_ref()
+                    .filter(|e| e.is_eio())
+                    .and_then(|_| task.shuffle_eio_retry_policy());
                 let disposition = match &task_result {
+                    Ok(TaskStatus::Failed { .. }) if shuffle_io.is_some() => {
+                        if eio_policy.is_some_and(|p| attempts < p.max_retries) {
+                            TaskDisposition::Retry
+                        } else {
+                            TaskDisposition::Terminal
+                        }
+                    }
                     Ok(TaskStatus::Failed { error })
                         if error.is_transient() && attempts < self.max_transient_retries =>
                     {
@@ -256,15 +271,21 @@ impl<W: Worker> Dispatcher<W> {
                         // else goes upstream for recovery or query failure.
                         TaskStatus::Failed { error } => match disposition {
                             TaskDisposition::Retry => {
-                                let backoff = retry_backoff(attempts);
+                                let backoff = eio_policy.map_or_else(
+                                    || retry_backoff(attempts),
+                                    |p| p.backoff(attempts),
+                                );
+                                let max_retries = eio_policy
+                                    .map_or(self.max_transient_retries, |p| p.max_retries);
                                 tracing::warn!(
                                     target: DISPATCHER_LOG_TARGET,
                                     attempt = attempts + 1,
-                                    max_attempts = self.max_transient_retries + 1,
-                                    backoff_secs = backoff.as_secs(),
+                                    max_attempts = u64::from(max_retries) + 1,
+                                    backoff_ms = backoff.as_millis(),
+                                    shuffle_eio = eio_policy.is_some(),
                                     error = %error,
                                     task_context = ?task.task_context(),
-                                    "Task failed with a transient error, retrying"
+                                    "Task failed with a retryable error, retrying"
                                 );
                                 failed_tasks.push(PendingTask::retry(
                                     task,
@@ -276,6 +297,16 @@ impl<W: Worker> Dispatcher<W> {
                                 ));
                             }
                             TaskDisposition::Terminal => {
+                                if let Some(failure) = &shuffle_io {
+                                    tracing::error!(
+                                        target: DISPATCHER_LOG_TARGET,
+                                        attempts = u64::from(attempts) + 1,
+                                        retry_limit = ?eio_policy.map(|p| p.max_retries),
+                                        error = %failure,
+                                        task_context = ?task.task_context(),
+                                        "Shuffle I/O failed: retry budget exhausted, disabled, or task is not restartable"
+                                    );
+                                }
                                 if attempts > 0 {
                                     // Forward the original error rather than wrapping it:
                                     // the underlying cause is what the user needs, and the
@@ -285,7 +316,7 @@ impl<W: Worker> Dispatcher<W> {
                                         attempts = attempts + 1,
                                         error = %error,
                                         task_context = ?task.task_context(),
-                                        "Task still failing after exhausting its transient retry budget"
+                                        "Task still failing after exhausting its retry budget"
                                     );
                                 }
                                 if result_tx.send(Err(error)).is_err() {
@@ -806,6 +837,90 @@ mod tests {
         assert!(!failed_tasks[0].is_ready(Instant::now()));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn shuffle_eio_obeys_its_task_budget_and_preserves_terminal_errors() -> DaftResult<()> {
+        use crate::scheduling::task::ShuffleEioRetryPolicy;
+        for (errno, limit, prior_failures, allowed) in [
+            (5, 3, 0, true),
+            (5, 3, 2, true),
+            (5, 3, 3, false),
+            (5, 0, 0, false),
+            (13, 3, 0, false),
+            (28, 3, 0, false),
+            (30, 3, 0, false),
+        ] {
+            let worker_id: WorkerId = Arc::from("worker1");
+            // A zero generic transient budget must not suppress the dedicated EIO policy.
+            let (mut dispatcher, workers) =
+                setup_dispatcher_test_context_with_retry_limits(&[(worker_id.clone(), 1)], 0, 0);
+            let task = MockTaskBuilder::default()
+                .with_eio_policy(ShuffleEioRetryPolicy {
+                    max_retries: limit,
+                    initial_backoff_ms: 10_000,
+                    max_backoff_ms: 30_000,
+                })
+                .with_failure(MockTaskFailure::ShuffleIo(errno))
+                .build();
+            let (scheduled, submitted) =
+                scheduled_task_with_attempts(task, worker_id, prior_failures);
+            dispatcher.dispatch_tasks(vec![scheduled], &workers)?;
+            let pending = dispatcher.await_completed_tasks(&workers).await?;
+            assert_eq!(!pending.is_empty(), allowed);
+            if allowed {
+                assert_eq!(pending[0].attempts(), prior_failures + 1);
+                assert!(!pending[0].is_ready(Instant::now()));
+            } else {
+                let error = submitted.await.unwrap_err().shuffle_io_error().unwrap();
+                assert_eq!(error.errno, errno);
+                assert_eq!(error.path, "/test/map.arrow");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shuffle_eio_does_not_restart_tasks_without_a_safe_policy() -> DaftResult<()> {
+        let worker_id: WorkerId = Arc::from("worker1");
+        let (mut dispatcher, workers) = setup_dispatcher_test_context(&[(worker_id.clone(), 1)]);
+        let task = MockTaskBuilder::default()
+            .with_failure(MockTaskFailure::ShuffleIo(5))
+            .build();
+        let (scheduled, submitted) = scheduled_task_with_attempts(task, worker_id, 0);
+        dispatcher.dispatch_tasks(vec![scheduled], &workers)?;
+        assert!(dispatcher.await_completed_tasks(&workers).await?.is_empty());
+        assert_eq!(
+            submitted
+                .await
+                .unwrap_err()
+                .shuffle_io_error()
+                .unwrap()
+                .errno,
+            5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shuffle_eio_backoff_doubles_caps_and_can_be_disabled() {
+        use crate::scheduling::task::ShuffleEioRetryPolicy;
+        let policy = ShuffleEioRetryPolicy {
+            max_retries: 3,
+            initial_backoff_ms: 25,
+            max_backoff_ms: 80,
+        };
+        for (n, ms) in [(0, 25), (1, 50), (2, 80), (u32::MAX, 80)] {
+            assert_eq!(policy.backoff(n), Duration::from_millis(ms));
+        }
+        assert_eq!(
+            ShuffleEioRetryPolicy {
+                initial_backoff_ms: 0,
+                ..policy
+            }
+            .backoff(100),
+            Duration::ZERO
+        );
     }
 
     #[tokio::test]

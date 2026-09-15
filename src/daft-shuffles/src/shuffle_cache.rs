@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use common_error::{DaftError, DaftResult};
 use common_runtime::{RuntimeTask, get_io_runtime};
 use daft_io::{SourceType, parse_url};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 use daft_schema::schema::SchemaRef;
-use daft_writers::{AsyncFileWriter, make_ipc_writer};
+use daft_writers::{AsyncFileWriter, make_ipc_writer_with_retry};
 use tokio::sync::Mutex;
 
 fn get_shuffle_dirs(shuffle_dirs: &[String], shuffle_id: u64) -> Vec<String> {
@@ -50,7 +52,7 @@ type WriterTask = RuntimeTask<DaftResult<WriterTaskResult>>;
 struct InProgressShuffleCacheState {
     writer_sender: Option<async_channel::Sender<MicroPartition>>,
     writer_task: Option<WriterTask>,
-    error: Option<String>,
+    error: Option<Arc<DaftError>>,
 }
 
 pub struct InProgressShuffleCache {
@@ -58,6 +60,7 @@ pub struct InProgressShuffleCache {
     writer_sender_weak: async_channel::WeakSender<MicroPartition>,
     partition_ref_id: u64,
     schema: SchemaRef,
+    write_path: String,
 }
 
 impl InProgressShuffleCache {
@@ -86,17 +89,28 @@ impl InProgressShuffleCache {
 
             // If the directory doesn't exist, create it
             if !std::path::Path::new(dir).exists() {
-                std::fs::create_dir_all(dir)?;
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    DaftError::IoError(e).with_shuffle_io_context("create directory", dir)
+                })?;
             }
         }
 
         // Create the partition writer
         let partition_dir = get_partition_dir(&shuffle_dirs, partition_ref_id, attempt);
-        std::fs::create_dir_all(&partition_dir)?;
+        std::fs::create_dir_all(&partition_dir).map_err(|e| {
+            DaftError::IoError(e).with_shuffle_io_context("create directory", &partition_dir)
+        })?;
 
-        let writer = make_ipc_writer(&partition_dir, target_filesize, compression)?;
+        let writer = make_ipc_writer_with_retry(
+            &partition_dir,
+            target_filesize,
+            compression,
+            crate::local_io::policy(shuffle_id),
+        )?;
 
-        Self::try_new_with_writer(writer, partition_ref_id, schema)
+        let mut cache = Self::try_new_with_writer(writer, partition_ref_id, schema)?;
+        cache.write_path = partition_dir;
+        Ok(cache)
     }
 
     fn try_new_with_writer(
@@ -119,6 +133,7 @@ impl InProgressShuffleCache {
             writer_sender_weak,
             partition_ref_id,
             schema,
+            write_path: String::new(),
         })
     }
 
@@ -143,7 +158,7 @@ impl InProgressShuffleCache {
         let mut state = self.state.lock().await;
         // If there was an error from a previous close, return it
         if let Some(error) = &state.error {
-            return Err(DaftError::InternalError(error.clone()));
+            return Err(DaftError::Shared(error.clone()));
         }
 
         let writer_sender = state.writer_sender.take();
@@ -152,8 +167,9 @@ impl InProgressShuffleCache {
         // Close the writer tasks
         let close_result = Self::close_internal(writer_sender, writer_task).await;
         if let Err(err) = close_result {
-            state.error = Some(err.to_string());
-            return Err(err);
+            let err = Arc::new(err.with_shuffle_io_context("write or close", &self.write_path));
+            state.error = Some(err.clone());
+            return Err(DaftError::Shared(err));
         }
 
         // All good, get the schema and results
