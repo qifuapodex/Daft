@@ -55,6 +55,7 @@ except ImportError:
     raise
 
 logger = logging.getLogger(__name__)
+_SHUFFLE_WRITE_DRAIN_RPC_TIMEOUT = 35  # Actor's 30-second drain plus RPC scheduling grace.
 
 
 class SwordfishTaskMetadata(NamedTuple):
@@ -185,6 +186,25 @@ async def await_flight_shuffle_unregistrations(refs: list[ray.ObjectRef]) -> Non
     logger.debug("Dropped %d flight shuffle registration(s) across %d worker(s)", dropped, len(refs))
 
 
+async def await_flight_shuffle_write_drain(refs: list[ray.ObjectRef]) -> None:
+    """Require write completion before standalone cleanup deletes any files."""
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*refs, return_exceptions=True), timeout=_SHUFFLE_WRITE_DRAIN_RPC_TIMEOUT
+        )
+    except TimeoutError as error:
+        raise RuntimeError("Shuffle write drain acknowledgement timed out; preserving shuffle directories") from error
+    failures = [
+        result
+        for result in results
+        if isinstance(result, BaseException) and not isinstance(result, ray.exceptions.ActorDiedError)
+    ]
+    # Confirmed actor death ends its writes too. Unavailability, a timeout or
+    # an application error does not prove that, so preserve the spill trees.
+    if failures:
+        raise RuntimeError(f"Shuffle writes did not drain; preserving shuffle directories: {failures!r}")
+
+
 def _load_extensions_from_env() -> None:
     """Load every extension listed in the `DAFT_EXTENSION_PATHS` env var.
 
@@ -298,6 +318,16 @@ class RaySwordfishActor:
         for directory in dirs:
             if os.path.exists(directory):
                 await asyncio.to_thread(shutil.rmtree, directory)
+
+    async def drain_shuffle_writes(self, shuffle_ids: list[int]) -> None:
+        # Standalone actors can serve concurrent queries. Wait only for this
+        # query's shuffles, including blocking writes surviving async cancellation.
+        deadline = time.monotonic() + 30
+        while self.native_executor.shuffle_active_writes(shuffle_ids):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Shuffle writes have not drained")
+            await asyncio.sleep(0.05)
+        self.native_executor.unregister_shuffles(shuffle_ids)
 
     async def _resolve_inputs(
         self,
@@ -521,6 +551,9 @@ class RaySwordfishActorHandle:
 
     def cleanup_query(self, dirs: list[str], shuffle_ids: list[int]) -> ray.ObjectRef:
         return self.actor_handle.cleanup_query.remote(dirs, shuffle_ids)
+
+    def drain_shuffle_writes(self, shuffle_ids: list[int]) -> ray.ObjectRef:
+        return self.actor_handle.drain_shuffle_writes.remote(shuffle_ids)
 
     def retire(self) -> None:
         ray.kill(self.actor_handle, no_restart=True)

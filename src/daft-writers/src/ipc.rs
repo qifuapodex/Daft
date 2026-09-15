@@ -21,6 +21,7 @@ pub struct IPCWriter {
     file_path: String,
     compression: Option<arrow_ipc::CompressionType>,
     retry_policy: EioRetryPolicy,
+    shuffle_id: Option<u64>,
     writer: Option<arrow_ipc::writer::StreamWriter<RetryWriter>>,
 }
 
@@ -34,6 +35,7 @@ impl IPCWriter {
             compression,
             writer: None,
             retry_policy: EioRetryPolicy::default(),
+            shuffle_id: None,
         }
     }
 
@@ -105,12 +107,13 @@ impl AsyncFileWriter for IPCWriter {
         let rows_written = data.len();
         let cancellation = WriteCancellation::default();
         let _cancel_on_drop = cancellation.guard();
-        let active = ActiveShuffleWrite::track();
+        let active = ActiveShuffleWrite::for_shuffle(self.shuffle_id);
         // Poison before yielding: dropping the future must not leave a reusable
         // writer that truncates the previous file or reports a successful close.
         self.mark_incomplete();
         let mut state = IPCWriter::new(&self.file_path, self.compression);
         state.retry_policy = self.retry_policy;
+        state.shuffle_id = self.shuffle_id;
         state.writer = self.writer.take();
         let result = common_runtime::get_io_runtime(true)
             .spawn_blocking(move || -> DaftResult<_> {
@@ -149,7 +152,7 @@ impl AsyncFileWriter for IPCWriter {
             self.mark_incomplete();
             let cancellation = WriteCancellation::default();
             let _cancel_on_drop = cancellation.guard();
-            let active = ActiveShuffleWrite::track();
+            let active = ActiveShuffleWrite::for_shuffle(self.shuffle_id);
             writer.get_mut().set_cancellation(cancellation.clone());
             let result = common_runtime::get_io_runtime(true)
                 .spawn_blocking(move || -> DaftResult<()> {
@@ -189,6 +192,7 @@ impl AsyncFileWriter for IPCWriter {
 
 pub struct IPCWriterFactory {
     retry_policy: EioRetryPolicy,
+    shuffle_id: Option<u64>,
     dir: String,
     compression: Option<arrow_ipc::CompressionType>,
 }
@@ -199,6 +203,7 @@ impl IPCWriterFactory {
             dir,
             compression,
             retry_policy: EioRetryPolicy::default(),
+            shuffle_id: None,
         }
     }
 }
@@ -206,6 +211,11 @@ impl IPCWriterFactory {
 impl IPCWriterFactory {
     pub fn with_retry_policy(mut self, policy: EioRetryPolicy) -> Self {
         self.retry_policy = policy;
+        self
+    }
+
+    pub fn with_shuffle_id(mut self, shuffle_id: Option<u64>) -> Self {
+        self.shuffle_id = shuffle_id;
         self
     }
 }
@@ -222,6 +232,7 @@ impl WriterFactory for IPCWriterFactory {
         let file_path = format!("{}/{}.arrow", self.dir, file_idx);
         let mut writer = IPCWriter::new(&file_path, self.compression);
         writer.retry_policy = self.retry_policy;
+        writer.shuffle_id = self.shuffle_id;
         Ok(Box::new(writer))
     }
 }
@@ -277,6 +288,8 @@ mod tests {
         std::fs::create_dir_all(root.join("daft_shuffle")).unwrap();
         let path = root.join("daft_shuffle/0.arrow");
         let mut writer = IPCWriter::new(path.to_str().unwrap(), None);
+        let shuffle_id = 0xe10_005;
+        writer.shuffle_id = Some(shuffle_id);
         writer.retry_policy = EioRetryPolicy {
             max_retries: 6,
             initial_backoff_ms: 32_000,
@@ -306,7 +319,7 @@ mod tests {
             error
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while daft_io::shuffle_file::active_shuffle_writes() != 0 {
+            while daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]) != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
@@ -329,6 +342,7 @@ mod tests {
                     let path = std::env::temp_dir()
                         .join(format!("daft-ipc-bench-{}.arrow", uuid::Uuid::new_v4()));
                     let mut writer = IPCWriter::new(path.to_str().unwrap(), None);
+                    writer.shuffle_id = Some(0xe10_006);
                     if mode != "inline" {
                         writer.retry_policy.max_retries = 6;
                     }

@@ -224,6 +224,11 @@ impl PyNativeExecutor {
             + daft_io::shuffle_file::active_shuffle_writes()
     }
 
+    /// Writes owned by these shuffles, including cancelled blocking operations.
+    pub fn shuffle_active_writes(&self, shuffle_ids: Vec<u64>) -> usize {
+        daft_io::shuffle_file::active_shuffle_writes_for(&shuffle_ids)
+    }
+
     /// Forget registrations for a quiescent query during shuffle cleanup.
     ///
     /// Takes the executor lock only to reach the shuffle server; the registry has

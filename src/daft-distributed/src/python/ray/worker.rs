@@ -137,12 +137,11 @@ impl RaySwordfishWorker {
         }
     }
 
-    /// Ask this worker's actor to forget `shuffle_ids`, returning the pending
-    /// call so the caller can await the whole fan-out at once.
-    pub fn unregister_shuffles(&self, py: Python<'_>, shuffle_ids: &[u64]) -> PyResult<Py<PyAny>> {
+    /// Await this query's writes before unregistering outputs or deleting files.
+    pub fn drain_shuffle_writes(&self, py: Python<'_>, shuffle_ids: &[u64]) -> PyResult<Py<PyAny>> {
         self.ray_worker_handle.call_method1(
             py,
-            pyo3::intern!(py, "unregister_shuffles"),
+            pyo3::intern!(py, "drain_shuffle_writes"),
             (shuffle_ids.to_vec(),),
         )
     }

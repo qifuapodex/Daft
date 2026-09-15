@@ -100,6 +100,8 @@ tickets or the durability policy for writes without EIO:
   last successfully returned byte, below IPC parsing and checksum accounting.
   Already-delivered batches are not delivered again. This covers shared-mount,
   same-process and server-side Flight file reads, including errors mid-message.
+  If a pending read is cancelled before a seek, the reader drains the underlying
+  operation and restores the last delivered offset before applying the seek.
   It does not reconnect or resume a broken Flight network stream.
 - Writes retain the current byte slice until the positioned write completes,
   accounting for short writes. No additional full-partition copy is kept. Because
@@ -114,14 +116,15 @@ tickets or the durability policy for writes without EIO:
   the task immediately; retrying sync alone cannot repair a failed writeback.
   This fault-only sync confirms writeback under the filesystem's contract; it
   does not replace the shared index commit or the `sync` mode's directory sync.
-- Execution without EIO adds no extra data reads/writes or fsyncs. It does add
+- Uninterrupted execution without EIO adds no extra data reads/writes or fsyncs. It does add
   cursor bookkeeping and CRC32 CPU/memory-bandwidth cost over every written byte.
   Combined files already have a partition checksum, so their data is hashed twice
   on the write path; the partition index reuses the first checksum. A recovered
   write EIO adds a full-file data read/write pass and a data sync. Further EIOs in
   that pass can repeat it within the same remaining budget. Index commit, rename
-  and fsync errors continue to use task fallback, because their effects cannot
-  be localized safely.
+  and sync errors returned to the writing task continue to use task fallback,
+  because their effects cannot be localized safely. A later background fsync
+  failure only logs a warning; it cannot retry an already completed task.
 
 A local read budget covers open and all reads of that handle, and does not reset
 on successful reads or bucket boundaries. Combined-file creation and its writer
@@ -136,9 +139,18 @@ runtime caches cannot change an already resolved request. Missing policies log a
 DEBUG level. Write errors identify the actual temporary file; DEBUG diagnostics
 also associate it with its final output path. No request-format changes are needed.
 
-Write backoff waits are cancelled when their async operation is dropped. Cleanup
-tracks blocking writes until they actually exit, including a syscall that cannot
-be interrupted. Writers preserve failed/cancelled state and reject subsequent
+Write backoff waits are cancelled when their async operation is dropped. Both
+standalone and managed Ray cleanup wait for outstanding writes before deleting
+shuffle files, including a syscall that cannot be interrupted. Standalone cleanup
+counts writes by shuffle ID so another query on the same actor does not delay it;
+managed cleanup additionally waits for Flight response streams and background
+fsyncs on its exclusive actor. If a write has not drained within the 30-second
+cleanup deadline, or worker acknowledgement fails or exceeds its 35-second RPC
+deadline, standalone cleanup preserves
+the spill directories and reports the failure. Confirmed actor death also ends
+its writes and permits sweeping files left on its node; unavailability alone does
+not. These barriers run after the scheduler has stopped dispatch for the query.
+Writers preserve failed/cancelled state and reject subsequent
 writes or closes instead of reporting an incomplete file as successful. `EINTR`
 retries immediately without consuming the EIO budget. Long backoff still occupies
 blocking-pool threads while a task remains live. There is no separate process-wide

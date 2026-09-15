@@ -9,7 +9,19 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("case", ["unavailable", "cancel", "wrap", "refresh", "submit", "standalone_cleanup"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unavailable",
+        "cancel",
+        "wrap",
+        "refresh",
+        "submit",
+        "standalone_cleanup",
+        "standalone_cleanup_error",
+        "standalone_cleanup_dead_actor",
+    ],
+)
 def test_scheduler_lifecycle_regressions(case):
     result = subprocess.run(
         [sys.executable, __file__, case],
@@ -37,9 +49,12 @@ def _run(case):
     from daft.runners import flotilla
 
     cleanup_calls = []
+    drain_events = []
     discovery_done = threading.Event()
 
     async def cleanup(*args):
+        if case.startswith("standalone_cleanup"):
+            assert drain_events == ["started", "finished"]
         cleanup_calls.append(args)
 
     flotilla.clear_flight_shuffle_dirs_on_all_nodes = cleanup
@@ -79,6 +94,22 @@ def _run(case):
         def unregister_shuffles(self, *args):
             raise ValueError("dead actor; its node's disk must still be cleaned")
 
+        def drain_shuffle_writes(self, shuffle_ids):
+            assert shuffle_ids
+
+            async def drain():
+                drain_events.append("started")
+                await asyncio.sleep(0.02)
+                if case == "standalone_cleanup_error":
+                    raise TimeoutError("writer is still in a syscall")
+                drain_events.append("finished")
+                if case == "standalone_cleanup_dead_actor":
+                    from ray.exceptions import ActorDiedError
+
+                    raise ActorDiedError()
+
+            return drain()
+
     handle = Handle()
 
     class Session:
@@ -102,7 +133,7 @@ def _run(case):
         runner = DistributedPhysicalPlanRunner(cluster_session=session if case == "refresh" else None)
         cfg = daft.context.get_context().daft_execution_config
         df = daft.read_csv(path).select(daft.col("a") + 1)
-        if case == "standalone_cleanup":
+        if case.startswith("standalone_cleanup"):
             daft.context.set_execution_config(
                 shuffle_algorithm="flight_shuffle", flight_shuffle_dirs=[str(Path(path).parent)]
             )
@@ -144,8 +175,12 @@ def _run(case):
         assert all(
             w["active_tasks"] == 0 and w["unknown"] is None and not w["local_data_queries"] for w in snapshot["workers"]
         )
-        if case == "standalone_cleanup":
-            assert any(args[0] for args in cleanup_calls)
+        if case.startswith("standalone_cleanup"):
+            if case == "standalone_cleanup_error":
+                assert drain_events == ["started"]
+                assert cleanup_calls == [], "unacknowledged writes must prevent deletion"
+            else:
+                assert any(args[0] for args in cleanup_calls)
             return
         if case == "wrap":
             for _ in range(65536):

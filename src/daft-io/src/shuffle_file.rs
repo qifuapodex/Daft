@@ -2,12 +2,13 @@
 //! No file-format changes or reopen/resume of published streams. Recovered writes
 //! require a same-descriptor data sync before returning an output for publication.
 use std::{
+    collections::HashMap,
     fs::File,
     future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, ready},
@@ -85,28 +86,52 @@ impl WriteCancellation {
 }
 
 static ACTIVE_WRITES: AtomicUsize = AtomicUsize::new(0);
+static SHUFFLE_WRITES: LazyLock<Mutex<HashMap<u64, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Move this guard into the blocking closure, so cancellation of its async
 /// caller cannot make cleanup mistake an outstanding write for a drained one.
 pub struct ActiveShuffleWrite {
-    _private: (),
+    shuffle_id: Option<u64>,
 }
 
 impl ActiveShuffleWrite {
     pub fn track() -> Self {
+        Self::for_shuffle(None)
+    }
+
+    pub fn for_shuffle(shuffle_id: Option<u64>) -> Self {
+        if let Some(id) = shuffle_id {
+            *SHUFFLE_WRITES.lock().unwrap().entry(id).or_default() += 1;
+        }
         ACTIVE_WRITES.fetch_add(1, Ordering::AcqRel);
-        Self { _private: () }
+        Self { shuffle_id }
     }
 }
 
 impl Drop for ActiveShuffleWrite {
     fn drop(&mut self) {
         ACTIVE_WRITES.fetch_sub(1, Ordering::AcqRel);
+        if let Some(id) = self.shuffle_id {
+            let mut writes = SHUFFLE_WRITES.lock().unwrap();
+            let count = writes.get_mut(&id).expect("tracked shuffle write");
+            *count -= 1;
+            if *count == 0 {
+                writes.remove(&id);
+            }
+        }
     }
 }
 
 pub fn active_shuffle_writes() -> usize {
     ACTIVE_WRITES.load(Ordering::Acquire)
+}
+
+/// Query-scoped cleanup must not wait for another query sharing the actor.
+/// Entries live until the final guard drops, independently of policy caches.
+pub fn active_shuffle_writes_for(shuffle_ids: &[u64]) -> usize {
+    let writes = SHUFFLE_WRITES.lock().unwrap();
+    shuffle_ids.iter().filter_map(|id| writes.get(id)).sum()
 }
 
 /// The budget is cumulative for a file handle, not reset on every successful I/O.
@@ -183,6 +208,8 @@ impl EioRetryBudget {
 
 enum ReadState {
     Ready,
+    ReadPending,
+    RestoringRead,
     Backoff(Pin<Box<tokio::time::Sleep>>),
     Seeking,
     ExternalSeeking,
@@ -230,7 +257,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRead for RetryReader<R> {
         }
         loop {
             match &mut this.state {
-                ReadState::ExternalSeeking => {
+                ReadState::ExternalSeeking | ReadState::RestoringRead => {
                     ready!(Pin::new(&mut *this).poll_complete(cx))?;
                 }
                 ReadState::Backoff(delay) => {
@@ -248,10 +275,13 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRead for RetryReader<R> {
                     }
                     this.state = ReadState::Ready;
                 }
-                ReadState::Ready => {
+                ReadState::Ready | ReadState::ReadPending => {
                     // Reuse the caller's allocation, but publish progress only on success.
                     let mut scratch = ReadBuf::new(buf.initialize_unfilled());
-                    match ready!(Pin::new(&mut this.inner).poll_read(cx, &mut scratch)) {
+                    this.state = ReadState::ReadPending;
+                    let result = ready!(Pin::new(&mut this.inner).poll_read(cx, &mut scratch));
+                    this.state = ReadState::Ready;
+                    match result {
                         Ok(()) => {
                             let n = scratch.filled().len();
                             this.offset += n as u64;
@@ -290,14 +320,28 @@ impl<R: AsyncSeek + Unpin> AsyncSeek for RetryReader<R> {
         let this = self.get_mut();
         match this.state {
             ReadState::Ready => return Poll::Ready(Ok(this.offset)),
+            ReadState::ReadPending => {
+                // A cancelled read may still occupy Tokio's blocking pool.
+                // Drain it before seeking, but do not adopt its reported cursor:
+                // Tokio's seek position can lag reads, and a failed read can
+                // leave the OS cursor uncertain. Restore our delivered offset.
+                ready!(Pin::new(&mut this.inner).poll_complete(cx))?;
+                Pin::new(&mut this.inner).start_seek(SeekFrom::Start(this.offset))?;
+                this.state = ReadState::RestoringRead;
+            }
             ReadState::Backoff(_) | ReadState::Seeking => {
                 return Poll::Ready(Err(io::Error::other(
                     "Seek during an unfinished shuffle read retry",
                 )));
             }
-            ReadState::ExternalSeeking => {}
+            ReadState::ExternalSeeking | ReadState::RestoringRead => {}
         }
         let offset = ready!(Pin::new(&mut this.inner).poll_complete(cx))?;
+        if matches!(this.state, ReadState::RestoringRead) && offset != this.offset {
+            return Poll::Ready(Err(io::Error::other(
+                "Cancelled shuffle read restore changed position",
+            )));
+        }
         this.offset = offset;
         this.state = ReadState::Ready;
         Poll::Ready(Ok(offset))
@@ -713,6 +757,89 @@ mod tests {
         let mut tail = Vec::new();
         reader.read_to_end(&mut tail).await.unwrap();
         assert_eq!(tail, (3..32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn write_tracking_is_scoped_and_survives_until_the_last_guard() {
+        let first_id = 0xe10_003;
+        let second_id = 0xe10_004;
+        let first = ActiveShuffleWrite::for_shuffle(Some(first_id));
+        let pending = ActiveShuffleWrite::for_shuffle(Some(first_id));
+        let other_query = ActiveShuffleWrite::for_shuffle(Some(second_id));
+        assert_eq!(active_shuffle_writes_for(&[first_id]), 2);
+        drop(first);
+        assert_eq!(active_shuffle_writes_for(&[first_id]), 1);
+        drop(pending);
+        assert_eq!(active_shuffle_writes_for(&[first_id]), 0);
+        assert_eq!(active_shuffle_writes_for(&[second_id]), 1);
+        drop(other_query);
+        assert_eq!(active_shuffle_writes_for(&[first_id, second_id]), 0);
+    }
+
+    #[test]
+    fn cancelled_pending_file_read_can_seek_or_resume_at_the_delivered_offset() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for seek in [Some(SeekFrom::Start(10)), Some(SeekFrom::Current(2)), None] {
+                let mut file = tempfile::tempfile().unwrap();
+                file.write_all(&(0..32).collect::<Vec<u8>>()).unwrap();
+                file.rewind().unwrap();
+                let mut reader = RetryReader {
+                    inner: tokio::fs::File::from_std(file),
+                    offset: 0,
+                    budget: EioRetryBudget::new(Default::default(), "test"),
+                    state: ReadState::Ready,
+                };
+                reader.read_exact(&mut [0; 3]).await.unwrap();
+                assert_eq!(reader.offset, 3);
+
+                // Occupy the only blocking thread so the next file read must
+                // remain pending even on a fast page-cache hit.
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let mut storage = [0; 8];
+                let mut buf = ReadBuf::new(&mut storage);
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                let pending = Pin::new(&mut reader)
+                    .poll_read(&mut cx, &mut buf)
+                    .is_pending();
+                release_tx.send(()).unwrap();
+                assert!(pending);
+                assert!(buf.filled().is_empty());
+
+                let expected = if let Some(seek) = seek {
+                    reader.seek(seek).await.unwrap()
+                } else {
+                    // Draining without a new seek must not adopt Tokio's stale
+                    // seek position or discard unread data from our stream.
+                    std::future::poll_fn(|cx| Pin::new(&mut reader).poll_complete(cx))
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(
+                    expected,
+                    match seek {
+                        Some(SeekFrom::Start(_)) => 10,
+                        Some(SeekFrom::Current(_)) => 5,
+                        None => 3,
+                        _ => unreachable!(),
+                    }
+                );
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data).await.unwrap();
+                assert_eq!(data, (expected as u8..32).collect::<Vec<_>>());
+                blocker.await.unwrap();
+            }
+        });
     }
 
     #[test]

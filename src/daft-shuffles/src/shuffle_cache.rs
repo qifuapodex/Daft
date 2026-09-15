@@ -74,6 +74,7 @@ impl InProgressShuffleCache {
         compression: Option<&str>,
     ) -> DaftResult<Self> {
         // Create the directories
+        let active = daft_io::shuffle_file::ActiveShuffleWrite::for_shuffle(Some(shuffle_id));
         // TODO: Add checks here, as well as periodic checks to ensure that the dirs are not too full. If so, we switch to directories with more space.
         // And raise an error if we can't find any directories with space.
         let shuffle_dirs = get_shuffle_dirs(dirs, shuffle_id);
@@ -106,21 +107,38 @@ impl InProgressShuffleCache {
             target_filesize,
             compression,
             crate::local_io::policy(shuffle_id),
+            Some(shuffle_id),
         )?;
 
-        let mut cache = Self::try_new_with_writer(writer, partition_ref_id, schema)?;
+        let mut cache =
+            Self::try_new_with_writer_tracked(writer, partition_ref_id, schema, Some(active))?;
         cache.write_path = partition_dir;
         Ok(cache)
     }
 
+    #[cfg(test)]
     fn try_new_with_writer(
         writer: Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>,
         partition_ref_id: u64,
         schema: SchemaRef,
     ) -> DaftResult<Self> {
+        Self::try_new_with_writer_tracked(writer, partition_ref_id, schema, None)
+    }
+
+    fn try_new_with_writer_tracked(
+        writer: Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>,
+        partition_ref_id: u64,
+        schema: SchemaRef,
+        active: Option<daft_io::shuffle_file::ActiveShuffleWrite>,
+    ) -> DaftResult<Self> {
         let num_cpus = std::thread::available_parallelism().unwrap().get();
         let (tx, rx) = async_channel::bounded(num_cpus * 2);
-        let task = get_io_runtime(true).spawn(async move { writer_task(rx, writer).await });
+        let task = get_io_runtime(true).spawn(async move {
+            // Cover queued batches and directory creation as well as file I/O.
+            // Per-operation guards retain blocking writes after async abort.
+            let _active = active;
+            writer_task(rx, writer).await
+        });
 
         let writer_sender_weak = tx.downgrade();
 
@@ -290,6 +308,49 @@ mod tests {
     fn dummy_schema() -> SchemaRef {
         // Matches the schema produced by `make_dummy_mp` in daft-writers tests.
         Arc::new(Schema::new(vec![Field::new("ints", DataType::UInt8)]))
+    }
+
+    #[tokio::test]
+    async fn streaming_write_tracking_covers_idle_queues_and_cancellation() -> DaftResult<()> {
+        for close in [true, false] {
+            let shuffle_id = rand::random::<u64>();
+            let root = std::env::temp_dir().join(format!("daft-cache-write-drain-{shuffle_id}"));
+            let cache = InProgressShuffleCache::try_new(
+                0,
+                1,
+                dummy_schema(),
+                &[root.to_string_lossy().into_owned()],
+                shuffle_id,
+                1024,
+                None,
+            )?;
+            // The writer is still waiting for input, with no blocking operation
+            // yet. Cleanup must not mistake this queue for a completed writer.
+            assert_eq!(
+                daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]),
+                1
+            );
+            crate::store::forget_shuffle(shuffle_id);
+            assert_eq!(
+                daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]),
+                1
+            );
+            cache.push_partition_data(make_dummy_mp(10)).await?;
+            if close {
+                assert_eq!(cache.close().await?.num_rows, 10);
+            }
+            drop(cache);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]) != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::remove_dir_all(root)?;
+            crate::store::forget_shuffle(shuffle_id);
+        }
+        Ok(())
     }
 
     #[tokio::test]

@@ -131,7 +131,7 @@ pub async fn write_partitions_one_shot(
     let policy = crate::local_io::policy(shuffle_id);
     let cancellation = WriteCancellation::default();
     let _cancel_on_drop = cancellation.guard();
-    let active = ActiveShuffleWrite::track();
+    let active = ActiveShuffleWrite::for_shuffle(Some(shuffle_id));
 
     // IPC encode + disk write all run on a single spawn_blocking thread.
     // Previously we fanned out per-partition `tokio::spawn` calls, but at
@@ -435,11 +435,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(daft_io::shuffle_file::active_shuffle_writes() > 0);
+        assert!(daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]) > 0);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while daft_io::shuffle_file::active_shuffle_writes() != 0 {
+            while daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]) != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
