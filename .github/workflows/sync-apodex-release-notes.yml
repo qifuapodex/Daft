@@ -41,6 +41,9 @@ jobs:
         - tag: apodex-0.7.24.6
           title: 0.7.24+apodex.6
           notes: .github/release-notes/apodex-0.7.24.6.md
+        - tag: apodex-0.7.24.7
+          title: 0.7.24+apodex.7
+          notes: .github/release-notes/apodex-0.7.24.7.md
     steps:
     - uses: actions/checkout@v7
     - name: Update GitHub Release title and notes
