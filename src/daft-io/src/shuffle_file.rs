@@ -11,6 +11,10 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
+// Amortize recovery I/O calls on shared filesystems while bounding temporary
+// memory per recovering writer. This does not affect the on-disk layout.
+const WRITE_RECOVERY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EioRetryPolicy {
     pub max_retries: u32,
@@ -223,7 +227,7 @@ impl RetryWriter {
             self.file.seek(SeekFrom::Start(self.start))?;
             let mut remaining = self.offset - self.start;
             let mut hasher = crc32fast::Hasher::new();
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = vec![0u8; remaining.min(WRITE_RECOVERY_BUFFER_BYTES as u64) as usize];
             while remaining > 0 {
                 let size = remaining.min(buf.len() as u64) as usize;
                 let n = match self.file.read(&mut buf[..size]) {

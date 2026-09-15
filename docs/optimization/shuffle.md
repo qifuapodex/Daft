@@ -105,7 +105,8 @@ tickets or durability mode:
   accounting for short writes. No additional full-partition copy is kept. Because
   a write EIO can report an earlier writeback failure, recovery also reads,
   checksums and rewrites the entire written data region before publication,
-  using a 64 KiB buffer. This fault-only pass avoids rerunning upstream operators
+  using a buffer capped at 4 MiB per recovering writer (smaller for smaller data
+  regions). This fault-only pass avoids rerunning upstream operators
   or IPC encoding; any error or checksum mismatch in that pass fails the task.
   Reading cached bytes alone would not ensure a later fsync retries failed pages.
 - Successful execution adds no extra data reads/writes or fsyncs. It does add
