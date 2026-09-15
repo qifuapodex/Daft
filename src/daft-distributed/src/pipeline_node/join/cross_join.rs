@@ -5,6 +5,7 @@ use common_metrics::{
     Meter,
     ops::{NodeCategory, NodeType},
 };
+use common_treenode::TreeNode;
 use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan};
 use daft_logical_plan::stats::StatsState;
 use daft_schema::schema::SchemaRef;
@@ -12,8 +13,9 @@ use futures::{StreamExt, stream::select};
 
 use crate::{
     pipeline_node::{
-        ClusteringStrategy, DistributedPipelineNode, NodeID, PipelineNodeConfig,
-        PipelineNodeContext, PipelineNodeImpl, TaskBuilderStream, clustering::BoundClusteringSpec,
+        ClusteringStrategy, DistributedPipelineNode, MaterializedOutput, NodeID,
+        PipelineNodeConfig, PipelineNodeContext, PipelineNodeImpl, TaskBuilderStream,
+        clustering::BoundClusteringSpec,
     },
     plan::{PlanConfig, PlanExecutionContext},
     scheduling::task::SwordfishTaskBuilder,
@@ -30,6 +32,45 @@ pub(crate) struct CrossJoinNode {
 
 impl CrossJoinNode {
     const NODE_NAME: &'static str = "CrossJoin";
+
+    fn prepare_input(
+        input_node: DistributedPipelineNode,
+        plan_context: &mut PlanExecutionContext,
+    ) -> TaskBuilderStream {
+        let input = input_node.clone().produce_tasks(plan_context);
+        if !input_node.exists(|node| matches!(node.context().node_type, NodeType::Limit)) {
+            return input;
+        }
+
+        // Cross join reuses each input builder for every partition on the other
+        // side. A distributed limit must run before that fan-out: copying its
+        // plan would make the copies compete for the same counter's budget.
+        // Materialize branches containing a limit (including one below a UDF
+        // or projection), then reuse only their completed output partitions.
+        let mut outputs = input.materialize(
+            plan_context.scheduler_handle(),
+            input_node.context().query_idx,
+            plan_context.task_id_counter(),
+        );
+        let (result_tx, result_rx) = create_channel(1);
+        plan_context.spawn(async move {
+            while let Some(output) = outputs.next().await {
+                let node_id = input_node.node_id();
+                let (scan, psets) = MaterializedOutput::into_in_memory_scan_with_psets(
+                    vec![output?],
+                    input_node.config().schema.clone(),
+                    node_id,
+                );
+                let builder = SwordfishTaskBuilder::new(scan, input_node.op.as_ref(), node_id)
+                    .with_psets(node_id, psets);
+                if result_tx.send(builder).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        TaskBuilderStream::from(result_rx)
+    }
 
     pub fn new(
         node_id: NodeID,
@@ -152,8 +193,8 @@ impl PipelineNodeImpl for CrossJoinNode {
         self: Arc<Self>,
         plan_context: &mut PlanExecutionContext,
     ) -> TaskBuilderStream {
-        let left_input = self.left_node.clone().produce_tasks(plan_context);
-        let right_input = self.right_node.clone().produce_tasks(plan_context);
+        let left_input = Self::prepare_input(self.left_node.clone(), plan_context);
+        let right_input = Self::prepare_input(self.right_node.clone(), plan_context);
 
         let (result_tx, result_rx) = create_channel(1);
         let execution_loop = self.execution_loop(left_input, right_input, result_tx);

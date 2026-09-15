@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections import Counter
+from itertools import product
 
 import pytest
 
@@ -279,20 +280,12 @@ def test_refund_between_set_and_resume_does_not_release_waiter():
 
 @pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
 def test_limit_under_cross_join_keeps_the_other_side_whole():
-    """Satisfying a `LIMIT` must not stop the *other* side of a fused join.
+    """Satisfying a `LIMIT` must not stop the *other* side of a cross join.
 
-    This is the strongest form of the invariant: `CrossJoinNode` is the one
-    place that puts two *scan* sources into a single task with a
-    `distributed_limit` over only one of them. `test_limit_under_broadcast_join_
-    emits_every_limited_row` covers the same invariant on a path that works
-    today, but its build side is an in-memory source.
-
-    `CrossJoinNode` builds each task with `SwordfishTaskBuilder::combine_with`,
-    which merges two plans — and their sources — into a single task. With a
-    `limit` on one side, that task contains a `distributed_limit` plus a
-    `ScanTaskSource` the limit does not own. If early-stop were signalled per
-    `input_id` alone it would stop that scan too, and the join would silently
-    lose rows. The signal is scoped to the limit's own subtree instead.
+    Previously the limited scan was fused with the other scan, so cancellation
+    had to be scoped to the limit's subtree. The limited input is now
+    materialized before joining; its early stop must still leave the other
+    input whole.
 
     Asserted on shape rather than on *which* rows survive: a distributed limit
     claims rows first-come-first-served across tasks, so the surviving set is
@@ -505,17 +498,10 @@ def test_limit_under_into_partitions_offset_and_overshoot():
 def test_limit_under_cross_join_does_not_hang(limit_on_left):
     """A `LIMIT` on either side of a cross join must not deadlock the query.
 
-    `CrossJoinNode` builds its tasks with `SwordfishTaskBuilder::combine_with`,
-    fusing a builder from each side into one task and keeping both sides'
-    builders as templates to cross with whatever arrives later. So a builder
-    `LimitNode` forwarded turns into *n* tasks, none of which is the builder
-    that was handed to the join.
-
-    `combine_with` used to drop the notify token and the cancel token when it
-    merged, which stranded `LimitNode`: the tasks that actually ran reported to
-    nobody, `contributors.is_subset(completed_ids)` was never satisfied, and the
-    query hung forever with no error and no timeout. Tokens now carry into every
-    derived task, so the limit loop sees each one finish.
+    `combine_with` originally lost completion/cancellation tokens when fusing
+    limited builders into cross-join tasks, stranding `LimitNode`. Preserving
+    those tokens fixed the hang but left duplicated LIMIT claims. Materializing
+    the limited input before fan-out must preserve both liveness and row counts.
 
     Asserted on shape rather than on which rows survive: a distributed limit
     claims rows first-come-first-served across tasks, so the surviving set is
@@ -528,7 +514,7 @@ def test_limit_under_cross_join_does_not_hang(limit_on_left):
     @func(return_dtype=DataType.int64())
     def identity(v: int) -> int:
         # Blocks limit pushdown into the scan, so the limit is a real
-        # `distributed_limit` inside the fused cross-join task.
+        # `distributed_limit` below the cross join.
         return v
 
     limited = daft.range(0, 400, partitions=4).select(identity(col("id")).alias("lid")).limit(limit)
@@ -551,10 +537,9 @@ def test_limit_under_cross_join_natural_drain():
 
     With `limit > total rows` the counter actor never reports completion, so the
     limit loop can only end by draining: input exhausted *and* nothing derived
-    from a forwarded builder still running. Cross join's templates keep deriving
-    tasks after the input is exhausted, so "nothing running right now" is not
-    enough — tearing the counter actor down there kills an actor that in-flight
-    tasks still talk to, and they retry against it forever.
+    from a forwarded builder still running. Cross join's templates used to
+    derive more limited tasks after input exhaustion, risking premature actor
+    teardown. Materialization must also drain this path without hanging.
     """
     limited = daft.range(0, 20, partitions=4).limit(1000)
     whole = daft.range(0, 3, partitions=1).select(col("id").alias("rid"))
@@ -563,30 +548,118 @@ def test_limit_under_cross_join_natural_drain():
     assert len(result["id"]) == 20 * 3
 
 
-@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known defect, independent of the deadlock this file's other cross-join tests cover: "
-    "CrossJoinNode fuses the limited side into one task per builder on the other side, and every "
-    "one of those copies claims from the same counter actor. The budget is meant to be shared "
-    "across distinct input partitions, not across duplicates of the same partition, so each row "
-    "the limit lets through survives in only one of the tasks it should appear in. The native "
-    "runner returns the full cross product for this query.",
-)
-def test_limit_under_cross_join_pairs_with_every_partition_of_the_other_side():
+def _assert_unique_cross_product(result, left_rows, right_rows):
+    # An unordered distributed LIMIT may select any rows. Check cardinality and
+    # every pair's multiplicity without prescribing which rows win the limit.
+    left, right = set(result["lid"]), set(result["rid"])
+    assert len(left) == (left_rows if right_rows else 0)
+    assert len(right) == (right_rows if left_rows else 0)
+    assert Counter(zip(result["lid"], result["rid"])) == Counter(product(left, right))
+
+
+@pytest.mark.parametrize("limit_on_left", [True, False])
+@pytest.mark.parametrize("other_partitions", [1, 2, 5])
+@pytest.mark.parametrize("limit", [0, 100, 500])
+@pytest.mark.parametrize("with_udf", [False, True])
+def test_limit_under_cross_join_pairs_with_every_partition_of_the_other_side(
+    limit_on_left, other_partitions, limit, with_udf
+):
     """Every row a `LIMIT` lets through must pair with the *whole* other side.
 
-    The other side has more than one partition here, so `CrossJoinNode` fans
-    each limited builder out into several tasks — the case where the shared
-    counter actor silently drops rows. With a single-partition other side (the
-    other cross-join tests here) each builder becomes exactly one task and the
-    count comes out right, which is why this needs its own case.
+    With multiple partitions on the other side, fusing a limited builder into
+    each pair of partitions used to make those copies compete for one counter
+    budget. The selected rows must instead be reused for every pairing.
     """
-    limit = 100
-    other_rows, other_partitions = 50, 2
+    other_rows = 50
 
-    limited = daft.range(0, 400, partitions=4).limit(limit)
+    @func(return_dtype=DataType.int64())
+    def identity(v: int) -> int:
+        return v
+
+    limited = daft.range(0, 400, partitions=4)
+    if with_udf:
+        limited = limited.select(identity(col("id")).alias("id"))
+    limited = limited.limit(limit).select(col("id").alias("lid"))
     whole = daft.range(0, other_rows, partitions=other_partitions).select(col("id").alias("rid"))
 
-    result = _materialize_with_deadline(limited.join(whole, how="cross"))
-    assert len(result["rid"]) == limit * other_rows
+    joined = limited.join(whole, how="cross") if limit_on_left else whole.join(limited, how="cross")
+    result = _materialize_with_deadline(joined)
+    _assert_unique_cross_product(result, min(limit, 400), other_rows)
+
+
+@pytest.mark.parametrize("right_partitions", [1, 2, 5])
+@pytest.mark.parametrize("limits", [(20, 10), (500, 100), (0, 10), (20, 0)])
+def test_limits_on_both_cross_join_inputs(right_partitions, limits):
+    @func(return_dtype=DataType.int64())
+    def identity(v: int) -> int:
+        return v
+
+    left_limit, right_limit = limits
+    left = daft.range(0, 40, partitions=4).select(identity(col("id")).alias("lid")).limit(left_limit)
+    right = daft.range(0, 25, partitions=right_partitions).select(identity(col("id")).alias("rid")).limit(right_limit)
+
+    result = _materialize_with_deadline(left.join(right, how="cross"))
+    _assert_unique_cross_product(result, min(left_limit, 40), min(right_limit, 25))
+
+
+def test_cross_join_limits_preserve_duplicate_multiplicity():
+    left = daft.range(0, 40, partitions=4).select((col("id") // 2).alias("lid")).limit(100)
+    right = daft.range(0, 20, partitions=5).select((col("id") // 2).alias("rid")).limit(100)
+
+    result = _materialize_with_deadline(left.join(right, how="cross"))
+    assert Counter(zip(result["lid"], result["rid"])) == dict.fromkeys(product(range(20), range(10)), 4)
+
+
+def test_cross_join_limit_with_offset_below_projection():
+    @func(return_dtype=DataType.int64())
+    def identity(v: int) -> int:
+        return v
+
+    left = (
+        daft.range(0, 40, partitions=4)
+        .select(identity(col("id")))
+        .offset(10)
+        .limit(20)
+        .select((col("id") + 100).alias("lid"))
+    )
+    right = daft.range(0, 25, partitions=5).select(col("id").alias("rid"))
+    result = _materialize_with_deadline(left.join(right, how="cross"))
+    _assert_unique_cross_product(result, 20, 25)
+    assert all(100 <= value < 140 for value in result["lid"])
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
+@pytest.mark.parametrize("failure_stage", ["input", "join"])
+def test_cross_join_limits_survive_worker_retry(tmp_path, failure_stage):
+    import os
+
+    marker = str(tmp_path / "crashed_once")
+
+    @func(return_dtype=DataType.int64())
+    def identity(v: int) -> int:
+        return v
+
+    @func(return_dtype=DataType.int64())
+    def crash_once(v: int) -> int:
+        # Exclusively create the marker so concurrent tasks kill just one worker.
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return v
+        os.close(fd)
+        os._exit(1)
+
+    left = daft.range(0, 40, partitions=4).select(identity(col("id")).alias("lid")).limit(20)
+    right = daft.range(0, 25, partitions=5).select(identity(col("id")).alias("rid")).limit(10)
+    if failure_stage == "input":
+        # Crash after a LIMIT claim, before its output is materialized.
+        left = left.select(crash_once(col("lid")).alias("lid"))
+    joined = left.join(right, how="cross")
+    if failure_stage == "join":
+        # A retried join must read the same fixed input without claiming again.
+        # Depend on both sides so this UDF cannot be pushed below the join.
+        joined = joined.select(col("lid"), col("rid"), crash_once(col("lid") + col("rid")).alias("value"))
+
+    result = _materialize_with_deadline(joined)
+    assert os.path.exists(marker), "worker retry was not exercised"
+    _assert_unique_cross_product(result, 20, 10)
