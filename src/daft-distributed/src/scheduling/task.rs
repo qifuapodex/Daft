@@ -122,7 +122,12 @@ impl From<(&PipelineNodeContext, TaskID)> for TaskContext {
 
 pub(crate) trait TaskPriority: PartialOrd + PartialEq + Ord + Eq + Copy + Clone {}
 
+pub(crate) use daft_io::shuffle_file::EioRetryPolicy as ShuffleEioRetryPolicy;
+
 pub(crate) trait Task: Send + Sync + Clone + Debug + 'static {
+    fn shuffle_eio_retry_policy(&self) -> Option<ShuffleEioRetryPolicy> {
+        None
+    }
     fn submit(
         task: SubmittableTask<Self>,
         scheduler: &SchedulerHandle<Self>,
@@ -444,6 +449,15 @@ impl SwordfishTask {
 }
 
 impl Task for SwordfishTask {
+    fn shuffle_eio_retry_policy(&self) -> Option<ShuffleEioRetryPolicy> {
+        super::shuffle_recovery::task_restartable_after_shuffle_eio(self).then_some(
+            ShuffleEioRetryPolicy {
+                max_retries: self.config.flight_shuffle_eio_max_retries,
+                initial_backoff_ms: self.config.flight_shuffle_eio_initial_backoff_ms,
+                max_backoff_ms: self.config.flight_shuffle_eio_max_backoff_ms,
+            },
+        )
+    }
     fn submit(
         task: SubmittableTask<Self>,
         scheduler: &SchedulerHandle<Self>,
@@ -931,12 +945,14 @@ pub(super) mod tests {
         cancel_notifier: Arc<Mutex<Option<OneshotSender<()>>>>,
         sleep_duration: Option<std::time::Duration>,
         failure: Option<MockTaskFailure>,
+        eio_policy: Option<ShuffleEioRetryPolicy>,
     }
 
     #[derive(Debug, Clone)]
     pub enum MockTaskFailure {
         Error(String),
         TransientError(String),
+        ShuffleIo(i32),
         Panic(String),
         WorkerDied,
         WorkerUnavailable,
@@ -953,6 +969,7 @@ pub(super) mod tests {
         cancel_notifier: Arc<Mutex<Option<OneshotSender<()>>>>,
         sleep_duration: Option<Duration>,
         failure: Option<MockTaskFailure>,
+        eio_policy: Option<ShuffleEioRetryPolicy>,
     }
 
     impl Default for MockTaskBuilder {
@@ -981,6 +998,7 @@ pub(super) mod tests {
                 cancel_notifier: Arc::new(Mutex::new(None)),
                 sleep_duration: None,
                 failure: None,
+                eio_policy: None,
             }
         }
 
@@ -1017,6 +1035,11 @@ pub(super) mod tests {
             self
         }
 
+        pub fn with_eio_policy(mut self, policy: ShuffleEioRetryPolicy) -> Self {
+            self.eio_policy = Some(policy);
+            self
+        }
+
         pub fn with_failure(mut self, failure: MockTaskFailure) -> Self {
             self.failure = Some(failure);
             self
@@ -1034,11 +1057,16 @@ pub(super) mod tests {
                 cancel_notifier: self.cancel_notifier,
                 sleep_duration: self.sleep_duration,
                 failure: self.failure,
+                eio_policy: self.eio_policy,
             }
         }
     }
 
     impl Task for MockTask {
+        fn shuffle_eio_retry_policy(&self) -> Option<ShuffleEioRetryPolicy> {
+            self.eio_policy
+        }
+
         fn task_context(&self) -> TaskContext {
             self.task_context.clone()
         }
@@ -1093,6 +1121,12 @@ pub(super) mod tests {
                         MockTaskFailure::TransientError(error_message) => {
                             return TaskStatus::Failed {
                                 error: DaftError::SocketError(error_message.into()),
+                            };
+                        }
+                        MockTaskFailure::ShuffleIo(errno) => {
+                            return TaskStatus::Failed {
+                                error: DaftError::IoError(std::io::Error::from_raw_os_error(errno))
+                                    .with_shuffle_io_context("read", "/test/map.arrow"),
                             };
                         }
                         MockTaskFailure::Panic(error_message) => {

@@ -1,9 +1,10 @@
 //! Preserve shuffle recovery identity through both local and remote Flight streams.
 use arrow_flight::error::FlightError;
-use common_error::{DaftError, ShuffleFetchFailure};
+use common_error::{DaftError, ShuffleFetchFailure, ShuffleIoError};
 use tonic::{Code, Status};
 
 const FAILURE_METADATA: &str = "daft-shuffle-failure";
+const IO_METADATA: &str = "daft-shuffle-io-v1";
 
 pub(crate) fn to_status(error: DaftError) -> Status {
     if let Some(failure) = error.shuffle_fetch_failure()
@@ -13,6 +14,14 @@ pub(crate) fn to_status(error: DaftError) -> Status {
         status
             .metadata_mut()
             .insert(FAILURE_METADATA, "1".parse().unwrap());
+        status
+    } else if let Some(failure) = error.shuffle_io_error()
+        && let Ok(details) = serde_json::to_vec(&failure)
+    {
+        let mut status = Status::with_details(Code::Internal, error.to_string(), details.into());
+        status
+            .metadata_mut()
+            .insert(IO_METADATA, "1".parse().unwrap());
         status
     } else {
         Status::internal(error.to_string())
@@ -26,7 +35,12 @@ pub(crate) fn from_flight(error: FlightError) -> DaftError {
             Err(error) => DaftError::External(error),
         },
         FlightError::Tonic(status) => {
-            if status.code() == Code::NotFound
+            if status.code() == Code::Internal
+                && status.metadata().get(IO_METADATA).is_some_and(|v| v == "1")
+                && let Ok(failure) = serde_json::from_slice::<ShuffleIoError>(status.details())
+            {
+                DaftError::ShuffleIo(Box::new(failure))
+            } else if status.code() == Code::NotFound
                 && status
                     .metadata()
                     .get(FAILURE_METADATA)
@@ -50,6 +64,34 @@ pub(crate) fn from_flight(error: FlightError) -> DaftError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shuffle_io_survives_local_and_flight_status_roundtrips() {
+        for errno in [5, 13, 28, 30] {
+            let original = DaftError::IoError(std::io::Error::from_raw_os_error(errno))
+                .with_shuffle_io_context("read", "/shuffle/map.arrow");
+            let expected = original.shuffle_io_error();
+            let local = from_flight(FlightError::ExternalError(Box::new(original)));
+            assert_eq!(local.shuffle_io_error(), expected);
+            let status = to_status(local);
+            let received = Status::from_header_map(status.into_http::<()>().headers()).unwrap();
+            let remote = from_flight(FlightError::Tonic(Box::new(received)));
+            assert_eq!(remote.shuffle_io_error(), expected);
+            assert!(remote.shuffle_fetch_failure().is_none());
+        }
+        let plain = from_flight(FlightError::Tonic(Box::new(Status::internal("os error 5"))));
+        assert!(plain.shuffle_io_error().is_none());
+        let mut malformed =
+            Status::with_details(Code::Internal, "bad payload", b"not json".to_vec().into());
+        malformed
+            .metadata_mut()
+            .insert(IO_METADATA, "1".parse().unwrap());
+        assert!(
+            from_flight(FlightError::Tonic(Box::new(malformed)))
+                .shuffle_io_error()
+                .is_none()
+        );
+    }
 
     fn failure() -> ShuffleFetchFailure {
         ShuffleFetchFailure {

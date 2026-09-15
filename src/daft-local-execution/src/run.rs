@@ -221,6 +221,12 @@ impl PyNativeExecutor {
             .as_ref()
             .map_or(0, |server| server.active_reads())
             + daft_shuffles::store::writer::background_fsyncs_in_flight()
+            + daft_io::shuffle_file::active_shuffle_writes()
+    }
+
+    /// Writes owned by these shuffles, including cancelled blocking operations.
+    pub fn shuffle_active_writes(&self, shuffle_ids: Vec<u64>) -> usize {
+        daft_io::shuffle_file::active_shuffle_writes_for(&shuffle_ids)
     }
 
     /// Forget registrations for a quiescent query during shuffle cleanup.

@@ -1599,7 +1599,7 @@ fn physical_plan_to_pipeline(
             backend,
         }) => {
             let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
-            let backend = LocalShuffleBackend::from_plan(backend, ctx.shuffle_server());
+            let backend = LocalShuffleBackend::from_plan(backend, ctx.shuffle_server(), cfg);
             BlockingSinkNode::new(
                 Arc::new(IntoPartitionsSink::new(
                     *num_partitions,
@@ -1623,7 +1623,7 @@ fn physical_plan_to_pipeline(
             context,
         }) => {
             let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
-            let backend = LocalShuffleBackend::from_plan(backend, ctx.shuffle_server());
+            let backend = LocalShuffleBackend::from_plan(backend, ctx.shuffle_server(), cfg);
             let repartition_sink = RepartitionSink::new(
                 schema.clone(),
                 repartition_spec.clone(),
@@ -1651,7 +1651,7 @@ fn physical_plan_to_pipeline(
             context,
         }) => {
             let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
-            let backend = LocalShuffleBackend::from_plan(backend, ctx.shuffle_server());
+            let backend = LocalShuffleBackend::from_plan(backend, ctx.shuffle_server(), cfg);
             BlockingSinkNode::new(
                 Arc::new(GatherSink::new(schema.clone(), backend)),
                 child_node,

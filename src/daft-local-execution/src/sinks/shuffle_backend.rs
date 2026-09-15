@@ -55,6 +55,7 @@ impl LocalShuffleBackend {
     pub(crate) fn from_plan(
         backend: &daft_local_plan::ShuffleBackend,
         shuffle_server: Option<(Arc<ShuffleFlightServer>, String)>,
+        cfg: &common_daft_config::DaftExecutionConfig,
     ) -> Self {
         match backend {
             daft_local_plan::ShuffleBackend::Ray => Self::Ray,
@@ -66,6 +67,10 @@ impl LocalShuffleBackend {
             } => {
                 let (local_server, shuffle_address) = shuffle_server.expect(
                     "Flight shuffle server must be initialized for Flight shuffle plans when using flight_shuffle algorithm",
+                );
+                daft_shuffles::local_io::configure(
+                    *shuffle_id,
+                    daft_shuffles::local_io::from_config(cfg),
                 );
                 Self::Flight(Arc::new(FlightShuffleContext {
                     shuffle_id: *shuffle_id,

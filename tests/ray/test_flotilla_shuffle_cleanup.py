@@ -2,8 +2,84 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
+
+import pytest
 
 from daft.runners import flotilla
+
+
+def test_standalone_drain_waits_for_only_the_requested_shuffles(monkeypatch):
+    actor_type = flotilla.RaySwordfishActor.__ray_metadata__.modified_class
+    counts = iter([2, 1, 0])
+    events = []
+
+    class Native:
+        def shuffle_active_writes(self, shuffle_ids):
+            assert shuffle_ids == [7, 9]
+            count = next(counts)
+            events.append(("writes", count))
+            return count
+
+        def shuffle_active_operations(self):
+            raise AssertionError("another query's I/O must not block this cleanup")
+
+        def unregister_shuffles(self, shuffle_ids):
+            events.append(("unregister", shuffle_ids))
+
+    async def tick(_delay):
+        events.append(("wait", None))
+
+    monkeypatch.setattr(flotilla.asyncio, "sleep", tick)
+    actor = SimpleNamespace(native_executor=Native())
+    asyncio.run(actor_type.drain_shuffle_writes(actor, [7, 9]))
+    assert events == [
+        ("writes", 2),
+        ("wait", None),
+        ("writes", 1),
+        ("wait", None),
+        ("writes", 0),
+        ("unregister", [7, 9]),
+    ]
+
+
+def test_standalone_drain_timeout_does_not_unregister(monkeypatch):
+    actor_type = flotilla.RaySwordfishActor.__ray_metadata__.modified_class
+
+    class Native:
+        def shuffle_active_writes(self, _ids):
+            return 1
+
+        def unregister_shuffles(self, _ids):
+            raise AssertionError("write completion has not been acknowledged")
+
+    times = iter([0.0, 31.0])
+    monkeypatch.setattr(flotilla, "time", SimpleNamespace(monotonic=lambda: next(times)))
+    with pytest.raises(RuntimeError, match="have not drained"):
+        asyncio.run(actor_type.drain_shuffle_writes(SimpleNamespace(native_executor=Native()), [7]))
+
+
+def test_write_drain_requires_acknowledgement_except_for_confirmed_actor_death():
+    async def fail(error):
+        raise error
+
+    async def run():
+        await flotilla.await_flight_shuffle_write_drain([fail(flotilla.ray.exceptions.ActorDiedError())])
+        for error in [TimeoutError("unknown worker state"), RuntimeError("write did not finish")]:
+            with pytest.raises(RuntimeError, match="preserving shuffle directories"):
+                await flotilla.await_flight_shuffle_write_drain([fail(error)])
+
+    asyncio.run(run())
+
+
+def test_missing_write_drain_acknowledgement_times_out(monkeypatch):
+    monkeypatch.setattr(flotilla, "_SHUFFLE_WRITE_DRAIN_RPC_TIMEOUT", 0.01)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="acknowledgement timed out; preserving"):
+            await flotilla.await_flight_shuffle_write_drain([asyncio.get_running_loop().create_future()])
+
+    asyncio.run(run())
 
 
 class _FakeActor:

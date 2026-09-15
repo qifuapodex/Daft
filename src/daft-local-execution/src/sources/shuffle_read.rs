@@ -46,6 +46,7 @@ pub struct ShuffleReadSource {
     /// reader's own link to its peers and to the shared mount.
     read_route: ReadRoute,
     shared_read_concurrency: usize,
+    retry_policy: daft_io::shuffle_file::EioRetryPolicy,
 }
 
 impl ShuffleReadSource {
@@ -71,6 +72,7 @@ impl ShuffleReadSource {
             num_parallel_tasks,
             read_route: ReadRoute::parse(Some(&cfg.flight_shuffle_read_source))?,
             shared_read_concurrency: cfg.flight_shuffle_shared_read_concurrency,
+            retry_policy: daft_shuffles::local_io::from_config(cfg),
         })
     }
 
@@ -224,6 +226,7 @@ impl ShuffleReadSource {
         let schema = self.schema;
         let read_route = self.read_route;
         let shared_read_concurrency = self.shared_read_concurrency;
+        let retry_policy = self.retry_policy;
 
         let io_runtime = get_io_runtime(true);
         io_runtime.spawn(async move {
@@ -232,12 +235,18 @@ impl ShuffleReadSource {
             let mut pending_tasks: VecDeque<(InputId, Vec<FlightShuffleReadInput>)> = VecDeque::new();
             let mut input_id_pending_counts: HashMap<InputId, usize> = HashMap::new();
             let mut receiver_exhausted = false;
+            let mut configured_shuffles = std::collections::HashSet::new();
 
             while !receiver_exhausted || !pending_tasks.is_empty() || !task_set.is_empty() {
                 while task_set.len() < num_parallel_tasks
                     && let Some((input_id, inputs)) = pending_tasks.pop_front()
                 {
                     let shuffle_ids = inputs.iter().map(|input| input.shuffle_id).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                    for input in &inputs {
+                        if configured_shuffles.insert(input.shuffle_id) {
+                            daft_shuffles::local_io::configure(input.shuffle_id, retry_policy);
+                        }
+                    }
                     let stream = Self::get_partition_stream(client_manager.clone(), local_server.clone(), &local_address, inputs, schema.clone(), read_route, shared_read_concurrency).await?;
                     task_set.spawn(forward_partition_stream(stream, schema.clone(), output_sender.clone(), input_id, shuffle_ids));
                 }

@@ -4,6 +4,7 @@ use crate::{DaftError, format::format_error_for_user};
 
 import_exception!(daft.exceptions, DaftCoreException);
 import_exception!(daft.exceptions, DaftShuffleFetchError);
+import_exception!(daft.exceptions, DaftShuffleIoError);
 import_exception!(daft.exceptions, DaftTypeError);
 import_exception!(daft.exceptions, DaftTransientError);
 import_exception!(daft.exceptions, ConnectTimeoutError);
@@ -21,6 +22,12 @@ impl std::convert::From<DaftError> for pyo3::PyErr {
 
 fn to_pyerr(err: &DaftError) -> pyo3::PyErr {
     match err {
+        DaftError::ShuffleIo(error) => DaftShuffleIoError::new_err((
+            error.operation.clone(),
+            error.path.clone(),
+            error.errno,
+            error.message.clone(),
+        )),
         DaftError::Shared(error) => to_pyerr(error),
         DaftError::ShuffleFetchFailure(failure) => DaftShuffleFetchError::new_err((
             failure.shuffle_id,

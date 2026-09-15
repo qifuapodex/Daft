@@ -14,6 +14,7 @@ mod opendal_source;
 mod range_expansion;
 mod retry;
 pub mod s3_like;
+pub mod shuffle_file;
 mod stats;
 mod stream_utils;
 #[cfg(feature = "python")]

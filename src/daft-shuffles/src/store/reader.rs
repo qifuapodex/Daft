@@ -26,10 +26,9 @@ use common_error::{DaftError, DaftResult, ShuffleFetchFailure};
 use daft_core::prelude::SchemaRef;
 use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, stream::BoxStream};
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, BufReader},
-};
+#[cfg(test)]
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 
 use super::{
     index,
@@ -170,7 +169,7 @@ impl IndexCache {
 /// file's own header, and a hint that undershoots simply costs the second read
 /// that an uncovered probe would have cost anyway.
 pub(super) async fn read_index_region(
-    file: &mut File,
+    file: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin),
     path: &str,
     expected: Option<usize>,
 ) -> DaftResult<(Vec<u8>, usize)> {
@@ -222,6 +221,7 @@ fn read_one_map_file(
     path: String,
     partition_indices: PartitionIndices,
     stats: Arc<ReadStats>,
+    policy: daft_io::shuffle_file::EioRetryPolicy,
 ) -> BoxStream<'static, DaftResult<FlightData>> {
     Box::pin(async_stream::try_stream! {
         // Held for the whole file — open, index, and data — because the file
@@ -239,7 +239,7 @@ fn read_one_map_file(
         let first_idx = partition_indices.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
         let started = stats.enabled.then(Instant::now);
         stats.add(&stats.opens, 1);
-        let opened = File::open(&path).await;
+        let opened = daft_io::shuffle_file::RetryReader::open(&path, policy).await;
         stats.add(&stats.open_us, elapsed_us(started));
         let mut file = opened.map_err(|e| ShuffleFetchFailure {
             shuffle_id,
@@ -248,7 +248,7 @@ fn read_one_map_file(
             partition_idx: *first_idx,
             path: path.clone(),
             message: String::new(),
-        }.open_error(e))?;
+        }.open_error(e).with_shuffle_io_context("open", &path))?;
         let cached = INDEX_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -260,7 +260,8 @@ fn read_one_map_file(
                 stats.add(&stats.index_misses, 1);
                 let expected = remembered_partition_count(shuffle_id);
                 let (region, num_partitions) =
-                    read_index_region(&mut file, &path, expected).await?;
+                    read_index_region(&mut file, &path, expected).await
+                        .map_err(|e| e.with_shuffle_io_context("read index", &path))?;
                 if expected != Some(num_partitions) {
                     lock_partition_counts().insert(shuffle_id, num_partitions);
                 }
@@ -286,7 +287,7 @@ fn read_one_map_file(
             return;
         }
         let first = entries.first().ok_or_else(|| DaftError::InternalError("Empty map range request".into()))?;
-        file.seek(SeekFrom::Start(first.start)).await.map_err(DaftError::IoError)?;
+        file.seek(SeekFrom::Start(first.start)).await.map_err(|e| DaftError::IoError(e).with_shuffle_io_context("seek", &path))?;
         // Only AQE multi-bucket reads prefetch across bucket boundaries. The
         // bounded outer buffer is reused; each inner CheckedRange still hashes
         // and verifies exactly its original partition's bytes.
@@ -305,7 +306,7 @@ fn read_one_map_file(
             stats.add(&stats.ranges_under_64k, u64::from(entry.len() < 64 * 1024));
             stats.add(&stats.ranges_under_1m, u64::from(entry.len() < 1024 * 1024));
             if position != entry.start {
-                file.seek(SeekFrom::Start(entry.start)).await.map_err(DaftError::IoError)?;
+                file.seek(SeekFrom::Start(entry.start)).await.map_err(|e| DaftError::IoError(e).with_shuffle_io_context("seek", &path))?;
             }
             let mut range = CheckedRange::new(
                 &mut file,
@@ -317,7 +318,7 @@ fn read_one_map_file(
                 let started = stats.enabled.then(Instant::now);
                 let message = range.next().await;
                 stats.add(&stats.read_poll_us, elapsed_us(started));
-                let Some(message) = message? else { break; };
+                let Some(message) = message.map_err(|e| e.with_shuffle_io_context("read", &path))? else { break; };
                 stats.add(&stats.messages, 1);
                 yield message;
             }
@@ -400,6 +401,8 @@ fn read_ranges_stream(
     schema: SchemaRef,
     concurrency: usize,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+    // Retain the policy even if shuffle cleanup unregisters a lazy stream.
+    let policy = crate::local_io::policy(shuffle_id);
     let paths = inputs
         .into_iter()
         .map(|(input, indices)| {
@@ -427,7 +430,7 @@ fn read_ranges_stream(
 
     let data = futures::stream::iter(paths)
         .flat_map_unordered(Some(concurrency.max(1)), move |(input, path, indices)| {
-            read_one_map_file(shuffle_id, input, path, indices, stats.clone())
+            read_one_map_file(shuffle_id, input, path, indices, stats.clone(), policy)
         })
         .map(|item| item.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e))));
 
@@ -554,6 +557,7 @@ pub(super) mod tests {
             path,
             PartitionIndices::Single(0),
             stats.clone(),
+            Default::default(),
         )
         .try_collect()
         .await?;
@@ -598,6 +602,7 @@ pub(super) mod tests {
                 path.clone(),
                 PartitionIndices::Multiple(vec![0, 1, 2]),
                 stats.clone(),
+                Default::default(),
             )
             .try_collect()
             .await?;

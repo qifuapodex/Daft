@@ -19,6 +19,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use common_error::{DaftError, DaftResult, ShuffleFetchFailure};
 use common_runtime::RuntimeTask;
 use daft_core::prelude::SchemaRef;
+use daft_io::shuffle_file::EioRetryPolicy;
 use daft_recordbatch::RecordBatch;
 use futures::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use tokio::io::{AsyncSeekExt, BufReader};
@@ -118,12 +119,14 @@ enum FileReadSpec {
     Whole {
         path: String,
         failure: ShuffleFetchFailure,
+        policy: EioRetryPolicy,
     },
     /// Read one or more ranges from a single file (combined-file shuffle).
     Ranges {
         path: String,
         ranges: Vec<RangeSpec>,
         failure: ShuffleFetchFailure,
+        policy: EioRetryPolicy,
     },
 }
 
@@ -242,6 +245,9 @@ impl ShuffleFlightServer {
     /// to shared storage or fail loudly.
     fn get_shuffle_file_specs(&self, shuffle_id: u64, refs: &[(u64, u64)]) -> ShuffleFileSpecs {
         let partitions = self.lock_partitions();
+        // Snapshot while registrations are locked: unregister cannot remove the
+        // policy between resolving output identity and constructing its reads.
+        let policy = crate::local_io::policy(shuffle_id);
 
         let mut missing = Vec::new();
         let mut schema: Option<SchemaRef> = None;
@@ -303,6 +309,7 @@ impl ShuffleFlightServer {
                         specs.push(FileReadSpec::Whole {
                             path: path.clone(),
                             failure: identity(path),
+                            policy,
                         });
                     }
                 }
@@ -319,6 +326,7 @@ impl ShuffleFlightServer {
                 path,
                 ranges,
                 failure,
+                policy,
             });
         }
 
@@ -489,16 +497,16 @@ impl FlightService for ShuffleFlightServer {
 fn open_spec_as_flight_stream(spec: FileReadSpec) -> BoxStream<'static, DaftResult<FlightData>> {
     Box::pin(async_stream::try_stream! {
         match spec {
-            FileReadSpec::Whole { path, failure } => {
+            FileReadSpec::Whole { path, failure, policy } => {
                 // The per-partition layout records neither a length nor a checksum,
                 // so the only thing that distinguishes "this stream had few batches"
                 // from "this file was cut short" is the writer's end-of-stream
                 // marker. Requiring it turns a silently short answer into an error.
-                let file = tokio::fs::File::open(&path).await.map_err(|e| failure.open_error(e))?;
+                let file = daft_io::shuffle_file::RetryReader::open(&path, policy).await.map_err(|e| failure.open_error(e).with_shuffle_io_context("open", &path))?;
                 let mut reader = BufReader::new(file);
-                skip_stream_metadata(&mut reader).await?;
+                skip_stream_metadata(&mut reader).await.map_err(|e| e.with_shuffle_io_context("read metadata", &path))?;
                 loop {
-                    match next_flight_data(&mut reader).await? {
+                    match next_flight_data(&mut reader).await.map_err(|e| e.with_shuffle_io_context("read", &path))? {
                         FlightMessage::Data(data) => yield data,
                         FlightMessage::EndOfStream => break,
                         FlightMessage::EndOfInput => Err(DaftError::InternalError(format!(
@@ -508,17 +516,17 @@ fn open_spec_as_flight_stream(spec: FileReadSpec) -> BoxStream<'static, DaftResu
                     }
                 }
             }
-            FileReadSpec::Ranges { path, ranges, failure } => {
-                let mut file = tokio::fs::File::open(&path).await.map_err(|e| failure.open_error(e))?;
+            FileReadSpec::Ranges { path, ranges, failure, policy } => {
+                let mut file = daft_io::shuffle_file::RetryReader::open(&path, policy).await.map_err(|e| failure.open_error(e).with_shuffle_io_context("open", &path))?;
                 for range in ranges {
-                    file.seek(SeekFrom::Start(range.start)).await.map_err(DaftError::IoError)?;
+                    file.seek(SeekFrom::Start(range.start)).await.map_err(|e| DaftError::IoError(e).with_shuffle_io_context("seek", &path))?;
                     let mut checked = CheckedRange::new(
                         &mut file,
                         range.end - range.start,
                         range.crc32,
                         format!("shuffle file {} range {}..{}", path, range.start, range.end),
                     );
-                    while let Some(data) = checked.next().await? {
+                    while let Some(data) = checked.next().await.map_err(|e| e.with_shuffle_io_context("read", &path))? {
                         yield data;
                     }
                     checked.finish()?;
@@ -711,6 +719,38 @@ mod tests {
         assert_eq!(server.active_reads(), 1);
         drop(second);
         assert_eq!(server.active_reads(), 0);
+    }
+
+    #[test]
+    fn resolved_file_specs_keep_the_policy_after_unregister() {
+        let shuffle_id = 0xe10_001;
+        let server = ShuffleFlightServer::new();
+        let policy = EioRetryPolicy {
+            max_retries: 6,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 32000,
+        };
+        crate::local_io::configure(shuffle_id, policy);
+        let mut whole = cache(11);
+        whole.byte_ranges = None;
+        server
+            .register_shuffle_partitions(shuffle_id, 1, vec![cache(10), whole])
+            .unwrap();
+        let (specs, _) = server
+            .get_shuffle_file_specs(shuffle_id, &[(1, 10), (1, 11)])
+            .unwrap();
+        server.unregister_shuffles(&[shuffle_id]);
+        assert_eq!(
+            crate::local_io::policy(shuffle_id),
+            EioRetryPolicy::default()
+        );
+        assert_eq!(specs.len(), 2);
+        for spec in specs {
+            let snapshot = match spec {
+                FileReadSpec::Whole { policy, .. } | FileReadSpec::Ranges { policy, .. } => policy,
+            };
+            assert_eq!(snapshot, policy);
+        }
     }
 
     #[test]

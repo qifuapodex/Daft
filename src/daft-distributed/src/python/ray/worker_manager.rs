@@ -637,12 +637,11 @@ impl WorkerManager for RayWorkerManager {
         shared_dirs: Vec<String>,
         shuffle_ids: Vec<u64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DaftResult<()>> + Send + '_>> {
-        // Issue the registry drops against the worker set as it stands now, before
-        // awaiting anything: the workers that hold these registrations are the ones
-        // alive at the end of the query, and a later refresh could retire them.
-        // A worker that fails to take the call has lost its registry with itself.
-        let unregister_refs = if shuffle_ids.is_empty() {
-            Vec::new()
+        // Snapshot every surviving actor before awaiting anything. All must
+        // drain this query's writes before node-local or shared deletion begins.
+        // Do not silently skip submission failures: they can hide live writers.
+        let drain_refs = if shuffle_ids.is_empty() {
+            Ok(Vec::new())
         } else {
             let state = self
                 .state
@@ -652,18 +651,15 @@ impl WorkerManager for RayWorkerManager {
                 state
                     .ray_workers
                     .values()
-                    .filter_map(|worker| worker.unregister_shuffles(py, &shuffle_ids).ok())
-                    .collect::<Vec<_>>()
+                    .map(|worker| worker.drain_shuffle_writes(py, &shuffle_ids))
+                    .collect::<PyResult<Vec<_>>>()
             })
         };
 
         Box::pin(async move {
-            let dirs_result = super::clear_shuffle_dirs_on_all_nodes(dirs, shared_dirs).await;
-            // The registrations point at the files just deleted, so drop them even
-            // if the delete partly failed — leaving them would only make stale refs
-            // look answerable.
-            super::await_shuffle_unregistrations(unregister_refs).await?;
-            dirs_result
+            super::await_shuffle_write_drain(drain_refs?).await?;
+            // Keep sweeping all nodes, including disks of actors confirmed dead.
+            super::clear_shuffle_dirs_on_all_nodes(dirs, shared_dirs).await
         })
     }
 

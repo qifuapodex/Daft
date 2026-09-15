@@ -6,6 +6,7 @@ arrow-ipc = {workspace = true}
 async-channel = "2.5.0"
 async-stream = {workspace = true}
 common-error = {path = "../common/error", default-features = false}
+common-daft-config = {path = "../common/daft-config", default-features = false}
 common-runtime = {path = "../common/runtime", default-features = false}
 crc32fast = {workspace = true}
 daft-core = {path = "../daft-core", default-features = false}

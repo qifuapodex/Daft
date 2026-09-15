@@ -163,7 +163,14 @@ pub struct DaftExecutionConfig {
     pub flight_shuffle_read_source: String,
     /// Map files a reduce task reads from the shared mount at once.
     pub flight_shuffle_shared_read_concurrency: usize,
-    // Recovery is opt-in. Bounds apply per query; timeout covers coordination waits only.
+    /// Task retries for shuffle EIO; zero disables them. Excludes external side effects.
+    pub flight_shuffle_eio_local_max_retries: u32,
+    pub flight_shuffle_eio_local_initial_backoff_ms: u64,
+    pub flight_shuffle_eio_local_max_backoff_ms: u64,
+    pub flight_shuffle_eio_max_retries: u32,
+    pub flight_shuffle_eio_initial_backoff_ms: u64,
+    pub flight_shuffle_eio_max_backoff_ms: u64,
+    // Recovery is opt-in. Bounds apply per query.
     pub flight_shuffle_recovery_max_attempts: u32,
     pub flight_shuffle_recovery_max_inflight: usize,
     pub flight_shuffle_recovery_max_consumer_failures: usize,
@@ -240,6 +247,12 @@ impl Default for DaftExecutionConfig {
             flight_shuffle_placement: "local_only".to_string(),
             flight_shuffle_shared_durability: "background".to_string(),
             flight_shuffle_read_source: "auto".to_string(),
+            flight_shuffle_eio_local_max_retries: 6,
+            flight_shuffle_eio_local_initial_backoff_ms: 1000,
+            flight_shuffle_eio_local_max_backoff_ms: 32000,
+            flight_shuffle_eio_max_retries: 3,
+            flight_shuffle_eio_initial_backoff_ms: 1000,
+            flight_shuffle_eio_max_backoff_ms: 30000,
             flight_shuffle_recovery_max_attempts: 0,
             flight_shuffle_recovery_max_inflight: 4,
             flight_shuffle_recovery_max_consumer_failures: 64,

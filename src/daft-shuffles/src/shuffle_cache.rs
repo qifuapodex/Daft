@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use common_error::{DaftError, DaftResult};
 use common_runtime::{RuntimeTask, get_io_runtime};
 use daft_io::{SourceType, parse_url};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 use daft_schema::schema::SchemaRef;
-use daft_writers::{AsyncFileWriter, make_ipc_writer};
+use daft_writers::{AsyncFileWriter, make_ipc_writer_with_retry};
 use tokio::sync::Mutex;
 
 fn get_shuffle_dirs(shuffle_dirs: &[String], shuffle_id: u64) -> Vec<String> {
@@ -50,7 +52,7 @@ type WriterTask = RuntimeTask<DaftResult<WriterTaskResult>>;
 struct InProgressShuffleCacheState {
     writer_sender: Option<async_channel::Sender<MicroPartition>>,
     writer_task: Option<WriterTask>,
-    error: Option<String>,
+    error: Option<Arc<DaftError>>,
 }
 
 pub struct InProgressShuffleCache {
@@ -58,6 +60,7 @@ pub struct InProgressShuffleCache {
     writer_sender_weak: async_channel::WeakSender<MicroPartition>,
     partition_ref_id: u64,
     schema: SchemaRef,
+    write_path: String,
 }
 
 impl InProgressShuffleCache {
@@ -71,6 +74,7 @@ impl InProgressShuffleCache {
         compression: Option<&str>,
     ) -> DaftResult<Self> {
         // Create the directories
+        let active = daft_io::shuffle_file::ActiveShuffleWrite::for_shuffle(Some(shuffle_id));
         // TODO: Add checks here, as well as periodic checks to ensure that the dirs are not too full. If so, we switch to directories with more space.
         // And raise an error if we can't find any directories with space.
         let shuffle_dirs = get_shuffle_dirs(dirs, shuffle_id);
@@ -86,27 +90,55 @@ impl InProgressShuffleCache {
 
             // If the directory doesn't exist, create it
             if !std::path::Path::new(dir).exists() {
-                std::fs::create_dir_all(dir)?;
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    DaftError::IoError(e).with_shuffle_io_context("create directory", dir)
+                })?;
             }
         }
 
         // Create the partition writer
         let partition_dir = get_partition_dir(&shuffle_dirs, partition_ref_id, attempt);
-        std::fs::create_dir_all(&partition_dir)?;
+        std::fs::create_dir_all(&partition_dir).map_err(|e| {
+            DaftError::IoError(e).with_shuffle_io_context("create directory", &partition_dir)
+        })?;
 
-        let writer = make_ipc_writer(&partition_dir, target_filesize, compression)?;
+        let writer = make_ipc_writer_with_retry(
+            &partition_dir,
+            target_filesize,
+            compression,
+            crate::local_io::policy(shuffle_id),
+            Some(shuffle_id),
+        )?;
 
-        Self::try_new_with_writer(writer, partition_ref_id, schema)
+        let mut cache =
+            Self::try_new_with_writer_tracked(writer, partition_ref_id, schema, Some(active))?;
+        cache.write_path = partition_dir;
+        Ok(cache)
     }
 
+    #[cfg(test)]
     fn try_new_with_writer(
         writer: Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>,
         partition_ref_id: u64,
         schema: SchemaRef,
     ) -> DaftResult<Self> {
+        Self::try_new_with_writer_tracked(writer, partition_ref_id, schema, None)
+    }
+
+    fn try_new_with_writer_tracked(
+        writer: Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>,
+        partition_ref_id: u64,
+        schema: SchemaRef,
+        active: Option<daft_io::shuffle_file::ActiveShuffleWrite>,
+    ) -> DaftResult<Self> {
         let num_cpus = std::thread::available_parallelism().unwrap().get();
         let (tx, rx) = async_channel::bounded(num_cpus * 2);
-        let task = get_io_runtime(true).spawn(async move { writer_task(rx, writer).await });
+        let task = get_io_runtime(true).spawn(async move {
+            // Cover queued batches and directory creation as well as file I/O.
+            // Per-operation guards retain blocking writes after async abort.
+            let _active = active;
+            writer_task(rx, writer).await
+        });
 
         let writer_sender_weak = tx.downgrade();
 
@@ -119,6 +151,7 @@ impl InProgressShuffleCache {
             writer_sender_weak,
             partition_ref_id,
             schema,
+            write_path: String::new(),
         })
     }
 
@@ -143,7 +176,7 @@ impl InProgressShuffleCache {
         let mut state = self.state.lock().await;
         // If there was an error from a previous close, return it
         if let Some(error) = &state.error {
-            return Err(DaftError::InternalError(error.clone()));
+            return Err(DaftError::Shared(error.clone()));
         }
 
         let writer_sender = state.writer_sender.take();
@@ -152,8 +185,9 @@ impl InProgressShuffleCache {
         // Close the writer tasks
         let close_result = Self::close_internal(writer_sender, writer_task).await;
         if let Err(err) = close_result {
-            state.error = Some(err.to_string());
-            return Err(err);
+            let err = Arc::new(err.with_shuffle_io_context("write or close", &self.write_path));
+            state.error = Some(err.clone());
+            return Err(DaftError::Shared(err));
         }
 
         // All good, get the schema and results
@@ -274,6 +308,49 @@ mod tests {
     fn dummy_schema() -> SchemaRef {
         // Matches the schema produced by `make_dummy_mp` in daft-writers tests.
         Arc::new(Schema::new(vec![Field::new("ints", DataType::UInt8)]))
+    }
+
+    #[tokio::test]
+    async fn streaming_write_tracking_covers_idle_queues_and_cancellation() -> DaftResult<()> {
+        for close in [true, false] {
+            let shuffle_id = rand::random::<u64>();
+            let root = std::env::temp_dir().join(format!("daft-cache-write-drain-{shuffle_id}"));
+            let cache = InProgressShuffleCache::try_new(
+                0,
+                1,
+                dummy_schema(),
+                &[root.to_string_lossy().into_owned()],
+                shuffle_id,
+                1024,
+                None,
+            )?;
+            // The writer is still waiting for input, with no blocking operation
+            // yet. Cleanup must not mistake this queue for a completed writer.
+            assert_eq!(
+                daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]),
+                1
+            );
+            crate::store::forget_shuffle(shuffle_id);
+            assert_eq!(
+                daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]),
+                1
+            );
+            cache.push_partition_data(make_dummy_mp(10)).await?;
+            if close {
+                assert_eq!(cache.close().await?.num_rows, 10);
+            }
+            drop(cache);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]) != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::remove_dir_all(root)?;
+            crate::store::forget_shuffle(shuffle_id);
+        }
+        Ok(())
     }
 
     #[tokio::test]
