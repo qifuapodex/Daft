@@ -18,7 +18,9 @@ use std::{
 
 use common_error::{DaftError, DaftResult};
 use common_runtime::get_io_runtime;
-use daft_io::shuffle_file::{EioRetryBudget, RetryWriter};
+use daft_io::shuffle_file::{
+    ActiveShuffleWrite, EioRetryBudget, EioRetryPolicy, RetryWriter, WriteCancellation,
+};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 use daft_schema::schema::SchemaRef;
@@ -126,6 +128,10 @@ pub async fn write_partitions_one_shot(
 ) -> DaftResult<Vec<PartitionCache>> {
     let num_partitions = partitions.len();
     let queued = Instant::now();
+    let policy = crate::local_io::policy(shuffle_id);
+    let cancellation = WriteCancellation::default();
+    let _cancel_on_drop = cancellation.guard();
+    let active = ActiveShuffleWrite::track();
 
     // IPC encode + disk write all run on a single spawn_blocking thread.
     // Previously we fanned out per-partition `tokio::spawn` calls, but at
@@ -133,17 +139,21 @@ pub async fn write_partitions_one_shot(
     // scheduling overhead exceeded the actual work.
     get_io_runtime(true)
         .spawn_blocking(move || -> DaftResult<Vec<PartitionCache>> {
+            let _active = active;
+            cancellation.check()?;
             let queue_us = queued.elapsed().as_micros() as u64;
             let started = Instant::now();
             let (mut commit, file, base_offset, file_path) =
-                open_target(&target, shuffle_id, input_id, attempt, num_partitions)?;
+                open_target(&target, shuffle_id, input_id, attempt, num_partitions, policy, &cancellation)?;
+            let write_path = commit.as_ref().map_or(file_path.as_str(), |c| c.write_path()).to_owned();
+            tracing::debug!(target: "daft_shuffle_io_retry", path = %write_path, output_path = %file_path, "Opened shuffle write attempt");
 
             let file = RetryWriter::new(
                 file,
-                EioRetryBudget::new(crate::local_io::policy(shuffle_id), &file_path),
+                EioRetryBudget::new(policy, &write_path).with_cancellation(cancellation.clone()),
             )
             .map_err(|e| {
-                DaftError::IoError(e).with_shuffle_io_context("initialize writer", &file_path)
+                DaftError::IoError(e).with_shuffle_io_context("initialize writer", &write_path)
             })?;
             let arrow_schema = Arc::new(schema.to_arrow()?);
             let write_options = arrow_ipc::writer::IpcWriteOptions::default()
@@ -157,7 +167,7 @@ pub async fn write_partitions_one_shot(
                 write_options,
             )
             .map_err(|e| {
-                DaftError::ArrowRsError(e).with_shuffle_io_context("initialize writer", &file_path)
+                DaftError::ArrowRsError(e).with_shuffle_io_context("initialize writer", &write_path)
             })?;
 
             // Partition boundaries and checksums double as the on-disk index for
@@ -168,6 +178,7 @@ pub async fn write_partitions_one_shot(
             let mut crcs: Vec<u32> = Vec::with_capacity(num_partitions);
             let mut caches: Vec<PartitionCache> = Vec::with_capacity(num_partitions);
             for (idx, partition) in partitions.into_iter().enumerate() {
+                cancellation.check()?;
                 offsets.push(writer.get_ref().bytes_written);
                 writer.get_mut().crc_reset();
                 let mut cache = write_one_partition(
@@ -178,7 +189,7 @@ pub async fn write_partitions_one_shot(
                     &schema,
                     &file_path,
                 )
-                .map_err(|e| e.with_shuffle_io_context("write", &file_path))?;
+                .map_err(|e| e.with_shuffle_io_context("write", &write_path))?;
                 let crc = writer.get_ref().crc_current();
                 crcs.push(crc);
                 // The same checksum the shared index carries, kept in memory so the
@@ -198,11 +209,11 @@ pub async fn write_partitions_one_shot(
             let encode_write_us = started.elapsed().as_micros() as u64;
             let flush_started = Instant::now();
             writer.finish().map_err(|e| {
-                DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &file_path)
+                DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &write_path)
             })?;
             // BufWriter::drop swallows flush errors — surface them explicitly.
             writer.flush().map_err(|e| {
-                DaftError::ArrowRsError(e).with_shuffle_io_context("flush", &file_path)
+                DaftError::ArrowRsError(e).with_shuffle_io_context("flush", &write_path)
             })?;
 
             let flush_us = flush_started.elapsed().as_micros() as u64;
@@ -211,10 +222,11 @@ pub async fn write_partitions_one_shot(
             let file = writer
                 .into_inner()
                 .map_err(|e| {
-                    DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &file_path)
+                    DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &write_path)
                 })?
                 .into_file()
-                .map_err(|e| e.with_shuffle_io_context("flush or verify", &file_path))?;
+                .map_err(|e| e.with_shuffle_io_context("flush or verify", &write_path))?;
+            cancellation.check()?;
             if let Some(commit) = commit.take() {
                 let durability = match &target {
                     OneShotTarget::Shared { durability, .. } => *durability,
@@ -223,7 +235,7 @@ pub async fn write_partitions_one_shot(
                     }
                 };
                 commit
-                    .commit(file, &offsets, &crcs, durability)
+                    .commit_cancellable(file, &offsets, &crcs, durability, &cancellation)
                     .map_err(|e| e.with_shuffle_io_context("commit", &file_path))?;
             }
 
@@ -265,6 +277,8 @@ fn open_target(
     input_id: u32,
     attempt: u64,
     num_partitions: usize,
+    policy: EioRetryPolicy,
+    cancellation: &WriteCancellation,
 ) -> DaftResult<(Option<SharedMapFileCommit>, File, u64, String)> {
     match target {
         OneShotTarget::Local { shuffle_dirs } => {
@@ -274,18 +288,21 @@ fn open_target(
             // Local files are written under their final name — the attempt token
             // already fences concurrent attempts — so there is no rename to make
             // durable and the directory sync state goes unused.
-            let (file, _dir_sync) = create_file_under(shuffle_id, &shuffle_dir, &file_path)
-                .map_err(|e| e.with_shuffle_io_context("create", &file_path))?;
+            let (file, _dir_sync) =
+                create_file_under(shuffle_id, &shuffle_dir, &file_path, policy, cancellation)
+                    .map_err(|e| e.with_shuffle_io_context("create", &file_path))?;
             Ok((None, file, 0, file_path))
         }
         OneShotTarget::Shared { shared_root, .. } => {
             let file_path = shared_map_file(shared_root, shuffle_id, input_id, attempt);
-            let (commit, file, base_offset) = SharedMapFileCommit::begin(
+            let (commit, file, base_offset) = SharedMapFileCommit::begin_with_policy(
                 shared_root,
                 shuffle_id,
                 input_id,
                 attempt,
                 num_partitions,
+                policy,
+                cancellation,
             )
             .map_err(|e| e.with_shuffle_io_context("create", &file_path))?;
             Ok((Some(commit), file, base_offset, file_path))
@@ -375,4 +392,64 @@ fn write_coalesced(
         .write(&arrow_batch)
         .map_err(DaftError::ArrowRsError)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run with the Linux injector from tests/ray/shuffle_eio_injection.c,
+    /// operation=write and failures=100. Fault markers let us cancel precisely
+    /// after the first failed syscall, without a production fault hook.
+    #[tokio::test]
+    #[ignore = "requires LD_PRELOAD shuffle EIO injector"]
+    async fn cancelled_oneshot_write_drains_before_cleanup() {
+        let root = std::env::var("DAFT_TEST_SHUFFLE_IO_ROOT").unwrap();
+        let root = std::path::PathBuf::from(root);
+        assert!(!root.join("fault-0").exists());
+        let shuffle_id = 0xe10_002;
+        crate::local_io::configure(
+            shuffle_id,
+            EioRetryPolicy {
+                max_retries: 6,
+                initial_backoff_ms: 32_000,
+                max_backoff_ms: 32_000,
+            },
+        );
+        let partition = daft_writers::test::make_dummy_mp(1024);
+        let task = tokio::spawn(write_partitions_one_shot(
+            0,
+            shuffle_id,
+            1,
+            OneShotTarget::Local {
+                shuffle_dirs: vec![root.to_string_lossy().into_owned()],
+            },
+            partition.schema(),
+            None,
+            vec![partition],
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !root.join("fault-0").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(daft_io::shuffle_file::active_shuffle_writes() > 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while daft_io::shuffle_file::active_shuffle_writes() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !root.join("fault-1").exists(),
+            "cancelled writer issued another syscall"
+        );
+        std::fs::remove_dir_all(root.join("daft_shuffle")).unwrap();
+        crate::store::forget_shuffle(shuffle_id);
+    }
 }

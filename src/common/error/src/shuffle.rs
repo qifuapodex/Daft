@@ -48,6 +48,21 @@ mod io_tests {
             .with_shuffle_io_context("read", "/shuffle/map.arrow");
         assert!(text.shuffle_io_error().is_none());
     }
+
+    #[test]
+    fn explicit_transient_causes_keep_their_classification_except_for_eio() {
+        for errno in [13, 28, 110] {
+            let error =
+                DaftError::MiscTransient(Box::new(std::io::Error::from_raw_os_error(errno)))
+                    .with_shuffle_io_context("read", "/shuffle/map.arrow");
+            assert!(error.is_transient());
+            assert!(error.shuffle_io_error().is_none());
+        }
+        let error = DaftError::MiscTransient(Box::new(std::io::Error::from_raw_os_error(5)))
+            .with_shuffle_io_context("read", "/shuffle/map.arrow");
+        assert!(error.shuffle_io_error().unwrap().is_eio());
+        assert!(!error.is_transient());
+    }
 }
 
 /// Identity of an unavailable physical map output. This is a recovery request,
@@ -91,6 +106,11 @@ impl DaftError {
                 .downcast_ref::<std::io::Error>()
                 .and_then(std::io::Error::raw_os_error)
             {
+                // Preserve an explicit transport/transient classification for
+                // non-EIO causes instead of replacing it with an errno-only type.
+                if errno != 5 && self.is_transient() {
+                    return self;
+                }
                 return Self::ShuffleIo(Box::new(ShuffleIoError {
                     operation: operation.into(),
                     path: path.into(),

@@ -692,6 +692,9 @@ fn restartable_plan(plan: &daft_local_plan::LocalPhysicalPlanRef, allow_file_sca
     };
     let allowed = match plan.as_ref() {
         LocalPhysicalPlan::PhysicalScan(scan) => {
+            // Distributed empty scans have no source config. Nonempty inputs
+            // are checked using each actual ScanTask's required source_config
+            // in task_restartable_after_shuffle_eio, before inspecting the plan.
             allow_file_scans
                 && scan.source_config.as_ref().is_none_or(|source| {
                     matches!(source.as_ref(), daft_scan::SourceConfig::File(_))
@@ -937,6 +940,13 @@ mod tests {
             LocalNodeContext::default(),
         );
         assert!(restartable_plan(&scan, true));
+        let empty_scan_task = SwordfishTask::for_recovery_test(
+            scan.clone(),
+            HashMap::from([(0, Input::ScanTasks(vec![]))]),
+            Arc::new(DaftExecutionConfig::default()),
+            0,
+        );
+        assert!(task_restartable_after_shuffle_eio(&empty_scan_task));
         assert!(!consumer_replayable(&scan));
         assert!(!producer_plan_replayable(&scan));
         let write = LocalPhysicalPlan::physical_write(

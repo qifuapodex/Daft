@@ -94,7 +94,7 @@ double after each retry up to the configured maximum. Each maximum must be at
 least its initial delay; an initial delay of zero allows immediate retries.
 
 Local recovery does not change the IPC files, partition ranges, index, Flight
-tickets or durability mode:
+tickets or the durability policy for writes without EIO:
 
 - Reads keep the same open file and producer attempt. An EIO is retried from the
   last successfully returned byte, below IPC parsing and checksum accounting.
@@ -106,13 +106,22 @@ tickets or durability mode:
   a write EIO can report an earlier writeback failure, recovery also reads,
   checksums and rewrites the entire written data region before publication,
   using a buffer capped at 4 MiB per recovering writer (smaller for smaller data
-  regions). This fault-only pass avoids rerunning upstream operators
-  or IPC encoding; any error or checksum mismatch in that pass fails the task.
-  Reading cached bytes alone would not ensure a later fsync retries failed pages.
-- Successful execution adds no extra data reads/writes or fsyncs. It does add
-  cursor bookkeeping and a write checksum. A recovered write EIO can add one
-  full-file data read/write pass. Index commit, rename and fsync errors continue
-  to use task fallback, because their effects cannot be localized safely.
+  regions). Recovery I/O EIOs restart the entire pass within the remaining
+  writer budget, without rerunning upstream operators or IPC encoding. A checksum
+  mismatch or a non-EIO error fails the task. After validation and rewrite,
+  `sync_data()` on the **same file descriptor** must succeed before publication,
+  including local files and `none`/`background` shared placement. A sync EIO fails
+  the task immediately; retrying sync alone cannot repair a failed writeback.
+  This fault-only sync confirms writeback under the filesystem's contract; it
+  does not replace the shared index commit or the `sync` mode's directory sync.
+- Execution without EIO adds no extra data reads/writes or fsyncs. It does add
+  cursor bookkeeping and CRC32 CPU/memory-bandwidth cost over every written byte.
+  Combined files already have a partition checksum, so their data is hashed twice
+  on the write path; the partition index reuses the first checksum. A recovered
+  write EIO adds a full-file data read/write pass and a data sync. Further EIOs in
+  that pass can repeat it within the same remaining budget. Index commit, rename
+  and fsync errors continue to use task fallback, because their effects cannot
+  be localized safely.
 
 A local read budget covers open and all reads of that handle, and does not reset
 on successful reads or bucket boundaries. Combined-file creation and its writer
@@ -121,8 +130,20 @@ budget. Different files and different task attempts have independent budgets,
 so local retries can multiply with task retries. Each local retry logs its file path,
 operation, original error/errno, retry count/limit and delay in seconds and
 milliseconds at WARN level under `daft_shuffle_io_retry`. File policies are kept per shuffle and
-removed with its runtime caches. RPC servers use the originating shuffle's policy;
-no new request metadata or on-disk recovery state is needed.
+removed with its runtime caches. RPC servers use the originating shuffle's policy.
+Read requests snapshot that policy before their files are opened, so unregistering
+runtime caches cannot change an already resolved request. Missing policies log at
+DEBUG level. Write errors identify the actual temporary file; DEBUG diagnostics
+also associate it with its final output path. No request-format changes are needed.
+
+Write backoff waits are cancelled when their async operation is dropped. Cleanup
+tracks blocking writes until they actually exit, including a syscall that cannot
+be interrupted. Writers preserve failed/cancelled state and reject subsequent
+writes or closes instead of reporting an incomplete file as successful. `EINTR`
+retries immediately without consuming the EIO budget. Long backoff still occupies
+blocking-pool threads while a task remains live. There is no separate process-wide
+limit on recovering handles; tune the retry policy for your storage and measure
+concurrent recovery load.
 
 Local I/O recovery does not replay UDFs or other operators. Fallback task replay
 requires retained inputs and restartable operators: pure projections, filters,
@@ -133,7 +154,9 @@ replayed. On fallback, a task starts with fresh pipeline state and new output
 attempt files; its partial results are not committed. Its cumulative failed-task
 attempt count is shared with other dispatcher failure categories, so changing
 failure categories cannot reset the task budget. Ray application retries are not
-enabled by this feature.
+enabled by this feature. For example, with an EIO task limit of 3, two earlier
+transient failures leave at most one additional task retry after an EIO. The
+backoff exponent also follows the cumulative failed-task count.
 
 Permission errors, read-only mounts, full disks and missing files do not use EIO
 retries. Missing outputs still need shuffle reconstruction where supported.
@@ -143,11 +166,30 @@ task fallback. Permanent storage failures cannot be repaired by retries.
 
 The existing `background` durability mode reports later fsync failures in worker
 logs after task completion; choose `flight_shuffle_shared_durability="sync"` when
-fsync failure must fail the writing task. A failed fsync is never retried until
-success and then assumed to have repaired the file. No per-block fsync is added.
+fsync failure must fail even a writing task that never reported EIO. Recovered
+writes always perform their required data sync before returning output. A failed
+fsync is never retried until success and then assumed to have repaired the file.
+No per-block fsync is added.
 
 Coordinator and workers must use the same Daft build. Execution-config and
 embedded distributed-plan pickle serialization reject older incompatible layouts.
+
+The streaming writer moves IPC encoding and synchronous I/O to the I/O runtime's
+blocking pool for each micropartition. This keeps retry waits off async executor
+threads, but adds scheduling overhead, especially for small batches. To isolate
+that overhead from the additional write checksum, run the manual benchmark in an
+optimized build:
+
+```bash
+DAFT_DASHBOARD_SKIP_BUILD=1 cargo test --profile dev-bench -p daft-writers --lib \
+  bench_streaming_ipc_write_overheads -- --ignored --nocapture
+```
+
+It compares inline encoding without the recovery checksum, inline encoding with
+the checksum, and offloaded encoding with the checksum for 4 KiB and 4 MiB
+micropartitions. Each case validates the decoded row count. Debug-build timings
+are diagnostic only; use an optimized build and representative gather and
+`into_partitions` workloads to evaluate throughput and contention with other I/O.
 
 ### `flight_shuffle_dirs`
 
@@ -211,6 +253,10 @@ Distributed shuffles are correct only if every row is read exactly once, and the
 What is *not* covered: a map attempt that dies before its file is published has left no copy anywhere, so the query fails; recomputing it from lineage is future work.
 
 ### `flight_shuffle_shared_durability`
+
+The modes below describe writes without EIO. A recovered write always requires
+a successful data sync on its original descriptor before publication, even in
+`none` or `background` mode. This does not add a directory sync to those modes.
 
 How hard the map side works to make a shared write survive losing its writer. One of `"background"` (the default), `"none"`, or `"sync"`.
 

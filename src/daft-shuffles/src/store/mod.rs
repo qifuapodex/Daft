@@ -72,6 +72,10 @@ impl ShufflePlacement {
 
 /// How hard the map side works to make a shared-disk write survive losing its writer.
 ///
+/// These modes describe publication after writes without EIO. A recovered write
+/// requires a successful data sync on its original descriptor before reaching
+/// this commit policy, including in `None` and `Background` modes.
+///
 /// This knob exists because `fsync` costs vary by more than two orders of
 /// magnitude across the filesystems a shuffle can land on, so no single answer is
 /// right everywhere. Measured, for a 64 MiB file:
@@ -99,12 +103,12 @@ impl ShufflePlacement {
 /// whether readers can see the data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ShuffleDurability {
-    /// Never `fsync`. Fastest; a shared copy may be lost if its writer node dies.
+    /// Skip commit-time `fsync`. Fastest; a shared copy may be lost if its writer node dies.
     None,
     /// Return as soon as the file is visible, then `fsync` in the background.
     ///
     /// The default because it is the only level whose cost does not depend on how
-    /// expensive the mount's `fsync` is — the map task never waits for one. That
+    /// expensive the mount's `fsync` is — without EIO, the map task never waits for one. That
     /// matters more than picking the level that happens to be cheap on the mounts
     /// measured so far: `Sync` is within 3-11% of `None` on Lustre and JuiceFS,
     /// but is 14-36x on local ext4, and an NFS export backed by such a disk is a
@@ -341,7 +345,10 @@ pub(crate) fn create_file_under(
     shuffle_id: u64,
     dir: &str,
     path: &str,
+    policy: daft_io::shuffle_file::EioRetryPolicy,
+    cancellation: &daft_io::shuffle_file::WriteCancellation,
 ) -> DaftResult<(File, Arc<DirSync>)> {
+    cancellation.check()?;
     let mut known = lock_created_dirs()
         .get(&shuffle_id)
         .and_then(|dirs| dirs.get(dir).cloned());
@@ -349,8 +356,8 @@ pub(crate) fn create_file_under(
         std::fs::create_dir_all(dir)?;
         known = Some(remember_dir(shuffle_id, dir));
     }
-    let mut retry =
-        daft_io::shuffle_file::EioRetryBudget::new(crate::local_io::policy(shuffle_id), path);
+    let mut retry = daft_io::shuffle_file::EioRetryBudget::new(policy, path)
+        .with_cancellation(cancellation.clone());
     let create = || {
         File::options()
             .read(true)
@@ -361,6 +368,7 @@ pub(crate) fn create_file_under(
     };
     match retry.run("create", create) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            cancellation.check()?;
             forget_created_dirs(shuffle_id);
             std::fs::create_dir_all(dir)?;
             // A fresh directory carries fresh sync state: whatever the old one had
@@ -471,9 +479,23 @@ mod tests {
 
         // First call builds the tree; the second is served from the memo and gets
         // the same directory's sync state.
-        let (_, sync_a) = create_file_under(1234, &dir_str, &first).unwrap();
+        let (_, sync_a) = create_file_under(
+            1234,
+            &dir_str,
+            &first,
+            Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(known(&dir_str));
-        let (mut f, sync_b) = create_file_under(1234, &dir_str, &second).unwrap();
+        let (mut f, sync_b) = create_file_under(
+            1234,
+            &dir_str,
+            &second,
+            Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&sync_a, &sync_b));
         f.write_all(b"ok").unwrap();
         drop(f);
@@ -483,7 +505,14 @@ mod tests {
         // and the rebuilt directory must not inherit the old one's sync bookkeeping.
         std::fs::remove_dir_all(&base).unwrap();
         assert!(known(&dir_str));
-        let (_, sync_c) = create_file_under(1234, &dir_str, &first).unwrap();
+        let (_, sync_c) = create_file_under(
+            1234,
+            &dir_str,
+            &first,
+            Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(std::path::Path::new(&first).exists());
         assert!(!Arc::ptr_eq(&sync_a, &sync_c));
 

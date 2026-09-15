@@ -134,7 +134,7 @@ try:
         flight_shuffle_eio_initial_backoff_ms=10, flight_shuffle_eio_max_backoff_ms=20)
     if placement == "shared_only":
         cfg.update(flight_shuffle_placement=placement, flight_shuffle_shared_dir=str(root),
-            flight_shuffle_shared_durability="sync", flight_shuffle_read_source=read_source)
+            flight_shuffle_shared_durability=os.environ.get("DAFT_TEST_DURABILITY", "sync"), flight_shuffle_read_source=read_source)
     # Large uncompressed IPC messages make the read failure happen after earlier
     # batches have entered the consumer. Distinct rows detect duplication and loss.
     n = 8192
@@ -146,6 +146,15 @@ try:
         path = root / "input.parquet"
         pq.write_table(pa.table(data), path)
         source = daft.read_parquet(str(path))
+    elif os.environ.get("DAFT_TEST_SOURCE") == "generator":
+        from daft.recordbatch.recordbatch import RecordBatch
+        from daft.io._generator import read_generator
+        batch = RecordBatch.from_pydict(data)
+        def generate():
+            with (root / "generator-calls").open("a") as f:
+                f.write("called\n")
+            yield batch
+        source = read_generator(iter([generate]), batch.schema())
     else:
         source = daft.from_pydict(data)
     with daft.execution_config_ctx(**cfg):
@@ -204,6 +213,8 @@ def test_real_shuffle_io_failure(
     source,
     local_retries=0,
     short_write=False,
+    extra_env=None,
+    expected_faults=None,
 ):
     env = dict(os.environ)
     env.update(
@@ -220,6 +231,8 @@ def test_real_shuffle_io_failure(
         DAFT_PROGRESS_BAR="0",
         RAY_ADDRESS="local",
     )
+    if extra_env:
+        env.update(extra_env)
     if short_write:
         env["DAFT_TEST_SHUFFLE_IO_SHORT_WRITE"] = "1"
     result = subprocess.run(
@@ -229,7 +242,9 @@ def test_real_shuffle_io_failure(
     faults = list(tmp_path.glob("fault-*"))
     if source == "streaming":
         assert all("partition_ref_" in p.read_text() for p in faults)
-    if failures == 1:
+    if expected_faults is not None:
+        assert len(faults) == expected_faults
+    elif failures == 1:
         assert len(faults) == 1
     else:
         # One map task fails on every attempt, and no consumer can start.
@@ -309,3 +324,86 @@ def test_local_retry_exhaustion_falls_back_to_task_retry(tmp_path, shuffle_io_in
         "memory",
         local_retries=2,
     )
+
+
+@pytest.mark.parametrize("source", ["memory", "streaming"])
+@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Requires local Ray task execution")
+def test_interrupted_write_does_not_spin_with_eio_retries_disabled(tmp_path, shuffle_io_injector, source):
+    test_real_shuffle_io_failure(tmp_path, shuffle_io_injector, "write", "local_only", "auto", 0, 1, 4, "", 0, source)
+
+
+@pytest.mark.parametrize(
+    "placement,source,durability",
+    [
+        ("local_only", "memory", "none"),
+        ("local_only", "streaming", "none"),
+        ("shared_only", "memory", "none"),
+        ("shared_only", "memory", "background"),
+        ("shared_only", "memory", "sync"),
+    ],
+)
+@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Requires local Ray task execution")
+def test_recovered_write_syncs_original_fd_before_returning(
+    tmp_path, shuffle_io_injector, placement, source, durability
+):
+    test_real_shuffle_io_failure(
+        tmp_path,
+        shuffle_io_injector,
+        "write",
+        placement,
+        "auto",
+        0,
+        1,
+        5,
+        "",
+        0,
+        source,
+        local_retries=3,
+        extra_env={
+            "DAFT_TEST_SHUFFLE_IO_TRACE_SYNC": "1",
+            "DAFT_TEST_SHUFFLE_IO_PARTIAL_EFFECT": "1",
+            "DAFT_TEST_DURABILITY": durability,
+        },
+    )
+    writes = list(tmp_path.glob("write-error-fd-*"))
+    assert len(writes) == 1
+    sync = tmp_path / writes[0].name.replace("write-error-fd-", "recovery-sync-fd-")
+    assert sync.read_text() == writes[0].read_text()
+
+
+@pytest.mark.parametrize(
+    "sequence,retries,expected_errno",
+    [
+        ("write,read,write", 0, ""),
+        ("write,fdatasync", 0, "5"),
+        ("write,fdatasync", 1, ""),
+    ],
+)
+@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Requires local Ray task execution")
+def test_recovery_pass_retries_io_but_never_swallows_sync_failure(
+    tmp_path, shuffle_io_injector, sequence, retries, expected_errno
+):
+    test_real_shuffle_io_failure(
+        tmp_path,
+        shuffle_io_injector,
+        "write",
+        "local_only",
+        "auto",
+        retries,
+        1,
+        5,
+        expected_errno,
+        0,
+        "memory",
+        local_retries=3,
+        extra_env={"DAFT_TEST_SHUFFLE_IO_SEQUENCE": sequence},
+        expected_faults=len(sequence.split(",")),
+    )
+
+
+@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Requires local Ray task execution")
+def test_eio_task_retry_does_not_reexecute_python_scan(tmp_path, shuffle_io_injector):
+    test_real_shuffle_io_failure(
+        tmp_path, shuffle_io_injector, "write", "local_only", "auto", 3, 1, 5, "5", 0, "generator"
+    )
+    assert (tmp_path / "generator-calls").read_text().splitlines() == ["called"]

@@ -221,6 +221,7 @@ impl PyNativeExecutor {
             .as_ref()
             .map_or(0, |server| server.active_reads())
             + daft_shuffles::store::writer::background_fsyncs_in_flight()
+            + daft_io::shuffle_file::active_shuffle_writes()
     }
 
     /// Forget registrations for a quiescent query during shuffle cleanup.

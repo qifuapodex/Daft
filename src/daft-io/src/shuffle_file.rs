@@ -1,10 +1,15 @@
 //! Opt-in, in-process EIO recovery for immutable shuffle reads and private writes.
-//! No file-format changes, reopen/resume of published streams, or durability changes.
+//! No file-format changes or reopen/resume of published streams. Recovered writes
+//! require a same-descriptor data sync before returning an output for publication.
 use std::{
     fs::File,
     future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
     pin::Pin,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -15,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 // memory per recovering writer. This does not affect the on-disk layout.
 const WRITE_RECOVERY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EioRetryPolicy {
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
@@ -32,11 +37,84 @@ impl EioRetryPolicy {
     }
 }
 
+#[derive(Debug, Default)]
+struct WriteCancellationState {
+    cancelled: AtomicBool,
+    lock: Mutex<()>,
+    wake: Condvar,
+}
+
+/// Cancellation for synchronous file operations. A syscall already in progress
+/// cannot be interrupted here; its owner must remain tracked until it returns.
+#[derive(Clone, Debug, Default)]
+pub struct WriteCancellation(Arc<WriteCancellationState>);
+
+pub struct CancelWriteOnDrop(WriteCancellation);
+
+impl Drop for CancelWriteOnDrop {
+    fn drop(&mut self) {
+        let _lock = self.0.0.lock.lock().unwrap();
+        self.0.0.cancelled.store(true, Ordering::Release);
+        self.0.0.wake.notify_all();
+    }
+}
+
+impl WriteCancellation {
+    pub fn guard(&self) -> CancelWriteOnDrop {
+        CancelWriteOnDrop(self.clone())
+    }
+
+    pub fn check(&self) -> io::Result<()> {
+        if self.0.cancelled.load(Ordering::Acquire) {
+            // Interrupted would make Write::write_all retry cancellation forever.
+            Err(io::Error::other("Shuffle write cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait(&self, delay: Duration) -> io::Result<()> {
+        let lock = self.0.lock.lock().unwrap();
+        let _wait = self
+            .0
+            .wake
+            .wait_timeout_while(lock, delay, |_| !self.0.cancelled.load(Ordering::Acquire))
+            .unwrap();
+        self.check()
+    }
+}
+
+static ACTIVE_WRITES: AtomicUsize = AtomicUsize::new(0);
+
+/// Move this guard into the blocking closure, so cancellation of its async
+/// caller cannot make cleanup mistake an outstanding write for a drained one.
+pub struct ActiveShuffleWrite {
+    _private: (),
+}
+
+impl ActiveShuffleWrite {
+    pub fn track() -> Self {
+        ACTIVE_WRITES.fetch_add(1, Ordering::AcqRel);
+        Self { _private: () }
+    }
+}
+
+impl Drop for ActiveShuffleWrite {
+    fn drop(&mut self) {
+        ACTIVE_WRITES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub fn active_shuffle_writes() -> usize {
+    ACTIVE_WRITES.load(Ordering::Acquire)
+}
+
 /// The budget is cumulative for a file handle, not reset on every successful I/O.
 pub struct EioRetryBudget {
     policy: EioRetryPolicy,
     used: u32,
     path: String,
+    cancellation: Option<WriteCancellation>,
 }
 
 impl EioRetryBudget {
@@ -45,6 +123,31 @@ impl EioRetryBudget {
             policy,
             used: 0,
             path: path.into(),
+            cancellation: None,
+        }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: WriteCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        self.cancellation
+            .as_ref()
+            .map_or(Ok(()), WriteCancellation::check)
+    }
+
+    fn retry(&mut self, error: io::Error, operation: &str) -> io::Result<()> {
+        match self.delay(&error, operation) {
+            Some(delay) => match &self.cancellation {
+                Some(cancellation) => cancellation.wait(delay),
+                None => {
+                    std::thread::sleep(delay);
+                    Ok(())
+                }
+            },
+            None => Err(error),
         }
     }
 
@@ -68,12 +171,11 @@ impl EioRetryBudget {
         mut f: impl FnMut() -> io::Result<T>,
     ) -> io::Result<T> {
         loop {
+            self.check_cancelled()?;
             match f() {
                 Ok(value) => return Ok(value),
-                Err(error) => match self.delay(&error, operation) {
-                    Some(delay) => std::thread::sleep(delay),
-                    None => return Err(error),
-                },
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => self.retry(error, operation)?,
             }
         }
     }
@@ -83,6 +185,7 @@ enum ReadState {
     Ready,
     Backoff(Pin<Box<tokio::time::Sleep>>),
     Seeking,
+    ExternalSeeking,
 }
 
 /// Retries below the IPC parser and checksum reader. Only successfully returned
@@ -127,6 +230,9 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRead for RetryReader<R> {
         }
         loop {
             match &mut this.state {
+                ReadState::ExternalSeeking => {
+                    ready!(Pin::new(&mut *this).poll_complete(cx))?;
+                }
                 ReadState::Backoff(delay) => {
                     ready!(delay.as_mut().poll(cx));
                     // Keep the same FD/attempt; never reopen or switch producer output.
@@ -175,13 +281,25 @@ impl<R: AsyncSeek + Unpin> AsyncSeek for RetryReader<R> {
                 "Seek during an unfinished shuffle read retry",
             ));
         }
-        Pin::new(&mut this.inner).start_seek(pos)
+        Pin::new(&mut this.inner).start_seek(pos)?;
+        this.state = ReadState::ExternalSeeking;
+        Ok(())
     }
 
     fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         let this = self.get_mut();
+        match this.state {
+            ReadState::Ready => return Poll::Ready(Ok(this.offset)),
+            ReadState::Backoff(_) | ReadState::Seeking => {
+                return Poll::Ready(Err(io::Error::other(
+                    "Seek during an unfinished shuffle read retry",
+                )));
+            }
+            ReadState::ExternalSeeking => {}
+        }
         let offset = ready!(Pin::new(&mut this.inner).poll_complete(cx))?;
         this.offset = offset;
+        this.state = ReadState::Ready;
         Poll::Ready(Ok(offset))
     }
 }
@@ -190,6 +308,9 @@ impl<R: AsyncSeek + Unpin> AsyncSeek for RetryReader<R> {
 /// writes make short writes and an EIO's unspecified file offset unambiguous.
 /// The caller's bytes remain borrowed until the write succeeds or exhausts its
 /// budget; no whole-partition copy or extra steady-state disk pass is needed.
+/// Owns the file's tail from its initial position through EOF. Existing prefixes
+/// are allowed; retaining an existing tail or pre-extending past the final write
+/// is not. Recovery validates that the final file length matches this region.
 pub struct RetryWriter {
     file: File,
     start: u64,
@@ -214,67 +335,113 @@ impl RetryWriter {
         })
     }
 
-    /// If a write reported EIO, check the entire region, including bytes written
-    /// before that syscall: EIO can report an earlier writeback failure. Reissue
-    /// those bytes too: a read from page cache alone cannot prove a failed dirty
-    /// page will be retried by a later fsync. No errors in this recovery pass are
-    /// swallowed. The caller still applies its original durability policy.
+    /// Replace the cancellation scope when a streaming writer moves to a new
+    /// async write/close operation. Only the current operation owns this writer.
+    pub fn set_cancellation(&mut self, cancellation: WriteCancellation) {
+        self.budget.cancellation = Some(cancellation);
+    }
+
+    /// A write EIO may report earlier failed writeback. Re-read and validate the
+    /// whole owned region, re-dirty it, then sync it on the original descriptor.
+    /// A failed recovery I/O restarts the pass within the remaining file budget;
+    /// checksum mismatches and sync failures are terminal, never synced away.
     pub fn finish(mut self) -> io::Result<File> {
         if let Some(error) = self.terminal_error.take() {
             return Err(error);
         }
+        self.budget.check_cancelled()?;
         if self.recovered_write {
-            self.file.seek(SeekFrom::Start(self.start))?;
-            let mut remaining = self.offset - self.start;
-            let mut hasher = crc32fast::Hasher::new();
-            let mut buf = vec![0u8; remaining.min(WRITE_RECOVERY_BUFFER_BYTES as u64) as usize];
-            while remaining > 0 {
-                let size = remaining.min(buf.len() as u64) as usize;
-                let n = match self.file.read(&mut buf[..size]) {
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    result => result?,
-                };
-                if n == 0 {
-                    return Err(io::Error::from_raw_os_error(5));
-                }
-                hasher.update(&buf[..n]);
-                let offset = self.offset - remaining;
-                let mut written = 0;
-                while written < n {
-                    #[cfg(unix)]
-                    let result = std::os::unix::fs::FileExt::write_at(
-                        &self.file,
-                        &buf[written..n],
-                        offset + written as u64,
-                    );
-                    #[cfg(not(unix))]
-                    let result = {
-                        self.file.seek(SeekFrom::Start(offset + written as u64))?;
-                        self.file.write(&buf[written..n])
-                    };
-                    let count = match result {
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        result => result?,
-                    };
-                    if count == 0 {
-                        return Err(io::ErrorKind::WriteZero.into());
+            let mut buf = vec![
+                0u8;
+                (self.offset - self.start).min(WRITE_RECOVERY_BUFFER_BYTES as u64)
+                    as usize
+            ];
+            let hasher = loop {
+                match self.rewrite_region(&mut buf) {
+                    Ok(hasher) => break hasher,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                        // Integrity loss after a write EIO still needs task
+                        // replay, rather than retrying an incomplete file.
+                        return Err(io::Error::from_raw_os_error(5));
                     }
-                    written += count;
+                    Err(error) => self.budget.retry(error, "recover read/write")?,
                 }
-                #[cfg(not(unix))]
-                self.file.seek(SeekFrom::Start(offset + n as u64))?;
-                remaining -= n as u64;
-            }
+            };
             if hasher.finalize() != self.hasher.clone().finalize()
                 || self.file.metadata()?.len() != self.offset
             {
                 return Err(io::Error::from_raw_os_error(5));
             }
+            self.budget.check_cancelled()?;
+            // A fresh FD may miss an earlier writeback error. Do not retry an
+            // EIO from sync: a later successful sync alone cannot repair data.
+            loop {
+                self.budget.check_cancelled()?;
+                match self.file.sync_data() {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => {
+                        result?;
+                        break;
+                    }
+                }
+            }
+            self.budget.check_cancelled()?;
             tracing::info!(target: "daft_shuffle_io_retry", path = %self.budget.path,
-                verified_bytes = self.offset - self.start, "Verified and rewrote shuffle file after write EIO recovery");
+                verified_bytes = self.offset - self.start,
+                "Verified, rewrote and synced shuffle data after write EIO recovery");
         }
         self.file.seek(SeekFrom::Start(self.offset))?;
         Ok(self.file)
+    }
+
+    fn rewrite_region(&mut self, buf: &mut [u8]) -> io::Result<crc32fast::Hasher> {
+        self.budget.check_cancelled()?;
+        self.file.seek(SeekFrom::Start(self.start))?;
+        let mut remaining = self.offset - self.start;
+        let mut hasher = crc32fast::Hasher::new();
+        while remaining > 0 {
+            self.budget.check_cancelled()?;
+            let size = remaining.min(buf.len() as u64) as usize;
+            let n = match self.file.read(&mut buf[..size]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Shuffle recovery read ended before the written data",
+                ));
+            }
+            hasher.update(&buf[..n]);
+            let offset = self.offset - remaining;
+            let mut written = 0;
+            while written < n {
+                self.budget.check_cancelled()?;
+                #[cfg(unix)]
+                let result = std::os::unix::fs::FileExt::write_at(
+                    &self.file,
+                    &buf[written..n],
+                    offset + written as u64,
+                );
+                #[cfg(not(unix))]
+                let result = {
+                    self.file.seek(SeekFrom::Start(offset + written as u64))?;
+                    self.file.write(&buf[written..n])
+                };
+                let count = match result {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if count == 0 {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+                written += count;
+            }
+            #[cfg(not(unix))]
+            self.file.seek(SeekFrom::Start(offset + n as u64))?;
+            remaining -= n as u64;
+        }
+        Ok(hasher)
     }
 }
 
@@ -463,6 +630,89 @@ mod tests {
         ] {
             assert_eq!(policy.backoff(attempt), Duration::from_secs(expected));
         }
+    }
+
+    #[test]
+    fn interrupted_syscalls_do_not_poison_or_consume_the_eio_budget() {
+        let mut budget = EioRetryBudget::new(EioRetryPolicy::default(), "test");
+        let mut calls = 0;
+        let result = budget
+            .run("write", || {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(7)
+                }
+            })
+            .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(calls, 2);
+        assert_eq!(budget.used, 0);
+    }
+
+    #[test]
+    fn cancellation_wakes_a_long_backoff_without_another_syscall() {
+        let cancellation = WriteCancellation::default();
+        let guard = cancellation.guard();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut budget = EioRetryBudget::new(
+                EioRetryPolicy {
+                    max_retries: 6,
+                    initial_backoff_ms: 32_000,
+                    max_backoff_ms: 32_000,
+                },
+                "test",
+            )
+            .with_cancellation(cancellation);
+            let mut calls = 0;
+            let result: io::Result<()> = budget.run("write", || {
+                calls += 1;
+                started_tx.send(()).unwrap();
+                Err(io::Error::from_raw_os_error(5))
+            });
+            done_tx.send((calls, result.unwrap_err().kind())).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(guard);
+        let (calls, kind) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(calls, 1);
+        assert_ne!(kind, io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn pending_external_seek_is_completed_before_read_recovery() {
+        let mut reader = reader(5, 1);
+        reader.inner.fail_calls = vec![1];
+        Pin::new(&mut reader)
+            .start_seek(SeekFrom::Start(10))
+            .unwrap();
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, (10..32).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn rejected_seek_does_not_change_a_cancelled_reads_recovery_offset() {
+        let mut reader = reader(5, 1);
+        reader.inner.fail_calls = vec![2];
+        reader.budget.policy.initial_backoff_ms = 30;
+        reader.budget.policy.max_backoff_ms = 30;
+        let mut prefix = [0; 3];
+        reader.read_exact(&mut prefix).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), reader.read_exact(&mut [0; 3]))
+                .await
+                .is_err()
+        );
+        assert!(reader.seek(SeekFrom::Start(0)).await.is_err());
+        assert_eq!(reader.offset, 3);
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, (3..32).collect::<Vec<_>>());
     }
 
     #[test]

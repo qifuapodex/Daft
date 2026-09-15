@@ -18,6 +18,7 @@ use std::{
 };
 
 use common_error::{DaftError, DaftResult};
+use daft_io::shuffle_file::{EioRetryPolicy, WriteCancellation};
 
 use super::{
     DirSync, ShuffleDurability, create_file_under, index, shared_map_file, shared_shard_dir,
@@ -145,6 +146,30 @@ impl SharedMapFileCommit {
         attempt: u64,
         num_partitions: usize,
     ) -> DaftResult<(Self, File, u64)> {
+        Self::begin_with_policy(
+            shared_root,
+            shuffle_id,
+            input_id,
+            attempt,
+            num_partitions,
+            crate::local_io::policy(shuffle_id),
+            &WriteCancellation::default(),
+        )
+    }
+
+    pub(crate) fn write_path(&self) -> &str {
+        &self.temp_path
+    }
+
+    pub(crate) fn begin_with_policy(
+        shared_root: &str,
+        shuffle_id: u64,
+        input_id: u32,
+        attempt: u64,
+        num_partitions: usize,
+        policy: EioRetryPolicy,
+        cancellation: &WriteCancellation,
+    ) -> DaftResult<(Self, File, u64)> {
         let shard_dir = shared_shard_dir(shared_root, shuffle_id, input_id);
 
         let final_path = shared_map_file(shared_root, shuffle_id, input_id, attempt);
@@ -156,8 +181,13 @@ impl SharedMapFileCommit {
         );
 
         let region_bytes = index::index_region_bytes(num_partitions);
-        let (mut file, dir_sync) = create_file_under(shuffle_id, &shard_dir, &temp_path)?;
-        file.seek(SeekFrom::Start(region_bytes as u64))?;
+        let (mut file, dir_sync) =
+            create_file_under(shuffle_id, &shard_dir, &temp_path, policy, cancellation)
+                .map_err(|e| e.with_shuffle_io_context("create", &temp_path))?;
+        file.seek(SeekFrom::Start(region_bytes as u64))
+            .map_err(|e| {
+                DaftError::IoError(e).with_shuffle_io_context("reserve index", &temp_path)
+            })?;
 
         Ok((
             Self {
@@ -190,21 +220,41 @@ impl SharedMapFileCommit {
     /// true — and the second one is usually free, since map tasks sharing a shard
     /// share its directory commit.
     pub fn commit(
+        self,
+        file: File,
+        offsets: &[u64],
+        crcs: &[u32],
+        durability: ShuffleDurability,
+    ) -> DaftResult<()> {
+        self.commit_cancellable(
+            file,
+            offsets,
+            crcs,
+            durability,
+            &WriteCancellation::default(),
+        )
+    }
+
+    pub(crate) fn commit_cancellable(
         mut self,
         mut file: File,
         offsets: &[u64],
         crcs: &[u32],
         durability: ShuffleDurability,
+        cancellation: &WriteCancellation,
     ) -> DaftResult<()> {
+        cancellation.check()?;
         let index_bytes = index::encode(offsets, crcs)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&index_bytes)?;
         file.flush()?;
 
         if durability == ShuffleDurability::Sync {
+            cancellation.check()?;
             file.sync_all()?;
         }
         drop(file);
+        cancellation.check()?;
         std::fs::rename(&self.temp_path, &self.final_path)?;
         self.committed = true;
 

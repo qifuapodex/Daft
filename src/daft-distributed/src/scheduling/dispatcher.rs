@@ -230,7 +230,9 @@ impl<W: Worker> Dispatcher<W> {
                     .filter(|e| e.is_eio())
                     .and_then(|_| task.shuffle_eio_retry_policy());
                 let disposition = match &task_result {
-                    Ok(TaskStatus::Failed { .. }) if shuffle_io.is_some() => {
+                    Ok(TaskStatus::Failed { .. })
+                        if shuffle_io.as_ref().is_some_and(|e| e.is_eio()) =>
+                    {
                         if eio_policy.is_some_and(|p| attempts < p.max_retries) {
                             TaskDisposition::Retry
                         } else {

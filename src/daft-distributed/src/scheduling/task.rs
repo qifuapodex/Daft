@@ -122,23 +122,7 @@ impl From<(&PipelineNodeContext, TaskID)> for TaskContext {
 
 pub(crate) trait TaskPriority: PartialOrd + PartialEq + Ord + Eq + Copy + Clone {}
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ShuffleEioRetryPolicy {
-    pub max_retries: u32,
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
-}
-
-impl ShuffleEioRetryPolicy {
-    pub fn backoff(self, failures: u32) -> std::time::Duration {
-        let factor = 1u64.checked_shl(failures).unwrap_or(u64::MAX);
-        std::time::Duration::from_millis(
-            self.initial_backoff_ms
-                .saturating_mul(factor)
-                .min(self.max_backoff_ms),
-        )
-    }
-}
+pub(crate) use daft_io::shuffle_file::EioRetryPolicy as ShuffleEioRetryPolicy;
 
 pub(crate) trait Task: Send + Sync + Clone + Debug + 'static {
     fn shuffle_eio_retry_policy(&self) -> Option<ShuffleEioRetryPolicy> {
