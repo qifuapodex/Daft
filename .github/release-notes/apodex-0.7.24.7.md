@@ -5,6 +5,7 @@
 - **相对版本：** [`0.7.24+apodex.6`](https://github.com/qifuapodex/Daft/releases/tag/apodex-0.7.24.6)
 - **分支：** [`release_apodex_0724`](https://github.com/qifuapodex/Daft/tree/release_apodex_0724)
 - **构建 tag：** `apodex-0.7.24.7`
+- **本次构建提交：** [`7dd772761`](https://github.com/qifuapodex/Daft/commit/7dd7727613067db28982817d8f8ff131f8e5aea4)
 - **安装版本：** `daft==0.7.24+apodex.7`
 - **发布渠道：** 只挂在本 GitHub Release 的 Assets 上，**不会上传 pypi.org**
 
