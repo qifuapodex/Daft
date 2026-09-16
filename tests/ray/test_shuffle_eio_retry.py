@@ -65,7 +65,7 @@ def test_shuffle_eio_plan_pickle_roundtrip():
             df._builder.optimize(config)._builder, "eio-pickle-test", config
         )
         factory, (payload,) = plan.__reduce__()
-        assert factory.__name__ == "_from_serialized_shuffle_eio_v2"
+        assert factory.__name__ == "_from_serialized_local_write_buffer_v3"
         restored = pickle.loads(pickle.dumps(plan))
         assert restored.idx() == plan.idx()
         assert restored.__reduce__()[1] == (payload,)

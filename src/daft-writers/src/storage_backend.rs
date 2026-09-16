@@ -24,11 +24,16 @@ pub(crate) trait StorageBackend: Send + Sync + 'static {
     async fn finalize(&mut self) -> DaftResult<()>;
 }
 
-pub(crate) struct FileStorageBackend {}
+pub(crate) struct FileStorageBackend {
+    write_buffer_size_bytes: NonZeroUsize,
+}
 
 impl FileStorageBackend {
-    // Buffer potentially small writes for highly compressed columns.
-    const DEFAULT_WRITE_BUFFER_SIZE: usize = 4 * 1024;
+    pub(crate) fn new(write_buffer_size_bytes: NonZeroUsize) -> Self {
+        Self {
+            write_buffer_size_bytes,
+        }
+    }
 }
 
 #[async_trait]
@@ -42,7 +47,7 @@ impl StorageBackend for FileStorageBackend {
         }
         let file = std::fs::File::create(filename)?;
         Ok(BufWriter::with_capacity(
-            Self::DEFAULT_WRITE_BUFFER_SIZE,
+            self.write_buffer_size_bytes.get(),
             file,
         ))
     }

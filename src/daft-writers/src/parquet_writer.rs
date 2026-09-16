@@ -188,6 +188,7 @@ pub(crate) fn create_native_parquet_writer(
     compression_level: Option<i32>,
     single_file: bool,
     overwrite_single_file_target: bool,
+    local_write_buffer_size_bytes: std::num::NonZeroUsize,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Option<RecordBatch>>>> {
     // Parse the root directory and add partition values if present.
     let (source_type, root_dir) = parse_url(root_dir)?;
@@ -222,7 +223,7 @@ pub(crate) fn create_native_parquet_writer(
 
     match source_type {
         SourceType::File => {
-            let storage_backend = FileStorageBackend {};
+            let storage_backend = FileStorageBackend::new(local_write_buffer_size_bytes);
             Ok(Box::new(ParquetWriter::new(
                 filename,
                 Arc::new(writer_properties),

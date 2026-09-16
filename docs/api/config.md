@@ -46,6 +46,26 @@ Configure Daft in various ways during execution.
     options:
         heading_level: 3
 
+## Local file write buffers
+
+Native Parquet, CSV, and JSON writers use a 4 MiB buffer per open file when
+writing to local paths, including mounted filesystems such as JuiceFS. Larger
+buffers combine small writes before they reach the filesystem. Buffer memory
+scales with the number of concurrently open files.
+
+Set a positive byte count before executing the write:
+
+```python
+with daft.execution_config_ctx(local_write_buffer_size_bytes=1024 * 1024):
+    df.write_parquet("/mnt/juicefs/output")
+```
+
+Use `daft.set_execution_config(local_write_buffer_size_bytes=...)` to set the
+value globally for subsequent executions. Omitting the option, or passing
+`None`, preserves the current setting. Setting `4096` restores the previous
+4 KiB capacity. The setting does not change row group or target file sizes,
+object storage multipart uploads, PyArrow fallback writers, or shuffle files.
+
 ## I/O Configurations
 
 Configure behavior when Daft interacts with storage (e.g. credentials, retry policies and various other knobs to control performance/resource usage)

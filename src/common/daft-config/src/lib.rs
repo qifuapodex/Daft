@@ -190,6 +190,9 @@ pub struct DaftExecutionConfig {
     /// None uses the cluster CPU snapshot; Some overrides the task floor.
     #[serde(default)]
     pub experimental_shuffle_aqe_min_partitions: Option<usize>,
+    /// Buffer capacity per native file writer, including mounted filesystems.
+    #[serde(default = "default_local_write_buffer_size_bytes")]
+    pub local_write_buffer_size_bytes: NonZeroUsize,
 }
 
 #[cfg(not(debug_assertions))]
@@ -201,6 +204,10 @@ impl std::fmt::Debug for DaftExecutionConfig {
 
 fn default_shuffle_aqe_target_bytes() -> usize {
     256 * 1024 * 1024
+}
+
+fn default_local_write_buffer_size_bytes() -> NonZeroUsize {
+    NonZeroUsize::new(4 * 1024 * 1024).unwrap()
 }
 
 impl Default for DaftExecutionConfig {
@@ -267,6 +274,7 @@ impl Default for DaftExecutionConfig {
             // floor.
             flight_shuffle_shared_read_concurrency: 16,
             enable_multi_glob_path_tasks: false,
+            local_write_buffer_size_bytes: default_local_write_buffer_size_bytes(),
         }
     }
 }

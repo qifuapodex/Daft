@@ -266,6 +266,7 @@ def set_execution_config(
     experimental_shuffle_aqe: bool | None = None,
     experimental_shuffle_aqe_target_bytes: int | None = None,
     experimental_shuffle_aqe_min_partitions: int | None = None,
+    local_write_buffer_size_bytes: int | None = None,
 ) -> DaftContext:
     """Globally sets various configuration parameters which control various aspects of Daft execution.
 
@@ -337,6 +338,7 @@ def set_execution_config(
         flight_shuffle_read_source: How this worker fetches shuffle partitions. "auto" (the default) reads the shared directory directly when the data is there and otherwise uses gRPC; "rpc" always tries gRPC first; "shared" reads the shared directory for remote output and for this worker's own AQE-eligible output and requires `flight_shuffle_placement="shared_only"` (gather and into_partitions are always node-local and are read over gRPC regardless). "auto" and "rpc" both fall back to the shared directory if the gRPC fetch fails before returning data.
         flight_shuffle_shared_read_concurrency: How many map files a reduce task reads from the shared directory at once. Defaults to 16, above `scantask_max_parallel` because shared-mount reads are dominated by per-file round trips rather than bytes.
         enable_multi_glob_path_tasks: Whether to create multiple glob path tasks in Ray Runner to achieve parallel glob. Defaults to False.
+        local_write_buffer_size_bytes: Buffer capacity in bytes per open native Parquet, CSV, or JSON file writer, including files on mounted filesystems. Defaults to 4 MiB (4194304); must be positive. Applies to writers created by subsequent executions. Does not affect object storage uploads, PyArrow writers, or shuffle files. Memory usage grows with the number of concurrently open writers.
     """
     # Replace values in the DaftExecutionConfig with user-specified overrides
     if min_cpu_per_task is not None:
@@ -408,6 +410,7 @@ def set_execution_config(
             flight_shuffle_recovery_max_retained_maps=flight_shuffle_recovery_max_retained_maps,
             flight_shuffle_recovery_max_retained_bytes=flight_shuffle_recovery_max_retained_bytes,
             enable_multi_glob_path_tasks=enable_multi_glob_path_tasks,
+            local_write_buffer_size_bytes=local_write_buffer_size_bytes,
         )
 
         ctx._ctx._daft_execution_config = new_daft_execution_config

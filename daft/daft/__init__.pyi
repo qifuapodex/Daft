@@ -2690,7 +2690,10 @@ class PyDaftExecutionConfig:
         experimental_shuffle_aqe: bool | None = None,
         experimental_shuffle_aqe_target_bytes: int | None = None,
         experimental_shuffle_aqe_min_partitions: int | None = None,
+        local_write_buffer_size_bytes: int | None = None,
     ) -> PyDaftExecutionConfig: ...
+    @property
+    def local_write_buffer_size_bytes(self) -> int: ...
     @property
     def enable_scan_task_split_and_merge(self) -> bool: ...
     @property

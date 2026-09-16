@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{collections::HashSet, num::NonZeroUsize, path::Path, sync::Arc};
 
 use common_error::{DaftError, DaftResult};
 use common_file_formats::{FileFormat, WriteMode};
@@ -42,6 +42,7 @@ pub(crate) struct CommitWriteSink {
     data_schema: SchemaRef,
     file_schema: SchemaRef,
     file_info: OutputFileInfo<BoundExpr>,
+    local_write_buffer_size_bytes: NonZeroUsize,
 }
 
 impl CommitWriteSink {
@@ -49,11 +50,13 @@ impl CommitWriteSink {
         data_schema: SchemaRef,
         file_schema: SchemaRef,
         file_info: OutputFileInfo<BoundExpr>,
+        local_write_buffer_size_bytes: NonZeroUsize,
     ) -> Self {
         Self {
             data_schema,
             file_schema,
             file_info,
+            local_write_buffer_size_bytes,
         }
     }
 }
@@ -82,6 +85,7 @@ impl BlockingSink for CommitWriteSink {
         let data_schema = self.data_schema.clone();
         let file_schema = self.file_schema.clone();
         let file_info = self.file_info.clone();
+        let local_write_buffer_size_bytes = self.local_write_buffer_size_bytes;
         spawner
             .spawn(
                 async move {
@@ -103,6 +107,7 @@ impl BlockingSink for CommitWriteSink {
                                         file_info.clone(),
                                         data_schema.clone(),
                                         true,
+                                        local_write_buffer_size_bytes,
                                     )?;
                                 let mut writer = writer_factory.create_writer(0, None)?;
                                 let empty_rb = RecordBatch::empty(Some(data_schema.clone()));

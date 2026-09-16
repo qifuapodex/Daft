@@ -254,8 +254,11 @@ impl PyDistributedPhysicalPlan {
 }
 common_py_serde::impl_versioned_bincode_py_state_serialization!(
     PyDistributedPhysicalPlan,
-    _from_serialized_shuffle_eio_v2,
-    incompatible = [_from_serialized_shuffle_aqe_v1]
+    _from_serialized_local_write_buffer_v3,
+    incompatible = [
+        _from_serialized_shuffle_aqe_v1,
+        _from_serialized_shuffle_eio_v2
+    ]
 );
 
 #[pyclass(module = "daft.daft", name = "DistributedPhysicalPlanRunner", frozen)]
