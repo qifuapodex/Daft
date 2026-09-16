@@ -8,11 +8,13 @@
 - **安装版本：** `daft==0.7.24+apodex.7`
 - **发布渠道：** 只挂在本 GitHub Release 的 Assets 上，**不会上传 pypi.org**
 
-本版包含上一版之后合入 Apodex fork 的 **#7–#10 共 4 个 PR**；此前版本的修改继续保留，这里仅列出增量。
+本版包含相对 apodex.6 的 **#7–#16 共 10 个 PR**，包括 **2026-09-16 同版本重发**纳入的 #11–#16 回归修复。版本号和下载地址继续使用 apodex.7，Assets 已替换为本次构建。
 
 ## 升级注意
 
-本版为新增 EIO 配置更新了 execution config 和嵌入该配置的 distributed plan 的 pickle 版本。**Ray head / driver 和所有 worker 必须安装同一版本并重启相关进程**；旧的相关持久化 config / plan 需要用本版重新创建，不支持旧 pickle 自动迁移或混合版本运行。
+相对 apodex.6，新增 EIO 配置改变了 execution config 和嵌入该配置的 distributed plan 的 pickle 版本，相关旧 config / plan 需要重新创建。本次重发保持原 apodex.7 的 pickle 格式兼容，改善了加载 apodex.6 pickle 时的错误提示。
+
+**已安装原 apodex.7 的 Ray head / driver 和所有 worker 也需重新安装本次 wheel，并重启相关进程**，避免相同版本号下混用不同构建。请使用下方带 `--no-cache-dir --force-reinstall` 的命令；仅检查 `daft.__version__` 无法区分重发前后的构建。
 
 Shuffle EIO 本地恢复与受限任务重试**默认启用**。Managed 共享集群调度需要显式配置外部 runtime adapter；已有实验性 AQE 和共享 shuffle 重建仍默认关闭。
 
@@ -64,18 +66,36 @@ daft.context.set_execution_config(
 
 Shuffle 文件布局和 Flight request 格式保持不变。没有 EIO 时不增加额外数据读写或 fsync，但增加游标记录和 CRC32 计算；恢复写入需要完整数据区域读写及同步，活跃的同步重试仍占用 blocking-pool 线程。尚未进行优化构建下的生产吞吐和并发故障负载验证。预算范围、日志与运维限制见 [Shuffle EIO 文档](https://github.com/qifuapodex/Daft/blob/apodex-0.7.24.7/docs/optimization/shuffle.md#retrying-shuffle-eio-failures)。
 
+### [#13](https://github.com/qifuapodex/Daft/pull/13) — 取消查询时及时终止 EIO 退避中的写入
+
+- 修复 shuffle 写入正在等待 32 秒 EIO 退避时，取消查询仍留下 native pipeline，导致清理等待 drain 超时、取消返回后仍可能继续写入的问题。
+- 将 native input 的生命周期与结果接收端绑定；取消只释放对应输入和执行代次，最后一个 consumer 退出时终止 pipeline 并唤醒写入退避。共享 pipeline 中其他输入及替代 pipeline 不会被误取消，既有清理确认和超时规则保持不变。
+
+### [#16](https://github.com/qifuapodex/Daft/pull/16) — 隔离重试任务，避免共享失败连锁耗尽预算
+
+- 修复多个 generator 在部分输出后失败时，其他任务反复收到共享 pipeline 的失败、尚未真正执行足够次数就耗尽重试预算的问题。
+- 首次尝试继续共享 pipeline；重试按输入和 attempt 使用独立 pipeline，保留原有错误分类、累计重试上限和退避规则。首次共享失败仍计入未完成输入的预算，不会补充或重置预算；持续失败仍按上限停止。
+- 重试会增加独立 pipeline 的初始化成本；取消与收尾按准确的执行 key / generation 处理，避免影响其他输入或重试。
+
+### 其他修复与优化
+
+- 可靠触发 unordered LIMIT 后的 worker 故障回归测试 — [#11](https://github.com/qifuapodex/Daft/pull/11)
+- 限制分布式 LIMIT 工作量回归测试的并发并校准计数 — [#12](https://github.com/qifuapodex/Daft/pull/12)
+- 明确不兼容 shuffle pickle 的错误提示 — [#14](https://github.com/qifuapodex/Daft/pull/14)
+- 避免反复清零有界 shuffle 读取缓冲区 — [#15](https://github.com/qifuapodex/Daft/pull/15)
+
 ## 安装
 
 让 pip 从本 Release 的 Assets 中选择当前平台对应的 wheel：
 
 ```bash
-pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.7" "daft==0.7.24+apodex.7"
+pip install --no-cache-dir --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.7" "daft==0.7.24+apodex.7"
 ```
 
 Ray 集群（head / driver 和每个 worker 都要安装同一版本）：
 
 ```bash
-pip install --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.7" "daft[ray]==0.7.24+apodex.7"
+pip install --no-cache-dir --force-reinstall --find-links "https://github.com/qifuapodex/Daft/releases/expanded_assets/apodex-0.7.24.7" "daft[ray]==0.7.24+apodex.7"
 ```
 
 发布资产覆盖 Linux x86_64 / aarch64、macOS x86_64 / arm64、Windows x86_64，并提供源码包。

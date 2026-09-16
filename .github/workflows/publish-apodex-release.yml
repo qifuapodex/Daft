@@ -66,8 +66,8 @@ jobs:
 
   publish:
     name: Publish wheels to GitHub Release
-    # Publish whatever platforms succeeded, even if one matrix cell failed.
-    if: ${{ always() && !cancelled() }}
+    # Same-version rebuilds must not mix old wheels with a partial new build.
+    if: ${{ needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -81,22 +81,12 @@ jobs:
         path: dist
     - name: List wheels
       run: ls -la dist
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: apodex-0.7.24.7
-        name: 0.7.24+apodex.7
-        target_commitish: ${{ github.sha }}
-        body_path: .github/release-notes/apodex-0.7.24.7.md
-        files: dist/*
-        fail_on_unmatched_files: true
-        make_latest: true
-    - name: Check expected platforms
+    - name: Validate complete release assets
       run: |
         python3 - <<'PY'
         from pathlib import Path
         names = sorted(p.name for p in Path("dist").iterdir() if p.is_file())
-        print("published files:")
+        print("files to publish:")
         for n in names:
             print(f"  {n}")
         checks = [
@@ -110,5 +100,39 @@ jobs:
         if missing:
             print("missing platforms:", ", ".join(missing))
             raise SystemExit(1)
-        print("all expected platforms present")
+        import email.parser
+        import tarfile
+        import zipfile
+        wheels = [n for n in names if n.endswith(".whl")]
+        sdists = [n for n in names if n.endswith(".tar.gz")]
+        if len(wheels) != 5 or len(sdists) != 1 or len(names) != 6:
+            raise SystemExit("Expected exactly five wheels and one source distribution")
+        for name in wheels:
+            with zipfile.ZipFile(Path("dist") / name) as archive:
+                metadata = [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")]
+                if len(metadata) != 1:
+                    raise SystemExit(f"Invalid wheel metadata: {name}")
+                parsed = email.parser.BytesParser().parsebytes(archive.read(metadata[0]))
+            if parsed["Name"] != "daft" or parsed["Version"] != "0.7.24+apodex.7":
+                raise SystemExit(f"Unexpected package name/version: {name}")
+        with tarfile.open(Path("dist") / sdists[0]) as archive:
+            metadata = [m for m in archive.getmembers() if m.name.endswith("/PKG-INFO") and m.name.count("/") == 1]
+            if len(metadata) != 1:
+                raise SystemExit("Invalid source distribution metadata")
+            with archive.extractfile(metadata[0]) as source:
+                parsed = email.parser.BytesParser().parse(source)
+            if parsed["Name"] != "daft" or parsed["Version"] != "0.7.24+apodex.7":
+                raise SystemExit("Unexpected source distribution name/version")
+        print("all expected platforms and package versions verified")
         PY
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: apodex-0.7.24.7
+        name: 0.7.24+apodex.7
+        target_commitish: ${{ github.sha }}
+        body_path: .github/release-notes/apodex-0.7.24.7.md
+        files: dist/*
+        fail_on_unmatched_files: true
+        overwrite_files: true
+        make_latest: true
