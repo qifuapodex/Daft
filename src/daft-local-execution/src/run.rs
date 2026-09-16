@@ -177,6 +177,7 @@ struct PlanState {
     enqueue_input_sender: Sender<EnqueueInputMessage>,
     stats_handle: RuntimeStatsManagerHandle,
     active_input_ids: HashSet<InputId>,
+    has_cancelled_inputs: bool,
     skipped_corrupt_files: Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
 }
 
@@ -258,8 +259,9 @@ impl PyNativeExecutor {
         let plan = local_physical_plan.plan.clone();
         let exec_cfg = daft_ctx.execution_config();
         let subscribers = daft_ctx.subscribers();
-        let (fingerprint, enqueue_future) = {
-            self.executor.lock_py_attached(py).unwrap().run(
+        let (input, enqueue_future) = {
+            let mut executor = self.executor.lock_py_attached(py).unwrap();
+            let (fingerprint, enqueue_future) = executor.run(
                 &plan,
                 exec_cfg,
                 subscribers,
@@ -267,18 +269,21 @@ impl PyNativeExecutor {
                 inputs,
                 input_id,
                 maintain_order,
-            )?
+            )?;
+            let input = NativeInputGuard {
+                fingerprint,
+                generation: executor.plans[&fingerprint].generation,
+                input_id,
+                executor: self.executor.clone(),
+            };
+            (input, enqueue_future)
         };
 
-        let executor = self.executor.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = enqueue_future.await?;
             Ok(PyResultReceiver {
-                generation: result.generation,
                 result: Arc::new(tokio::sync::Mutex::new(Some(result))),
-                fingerprint,
-                input_id,
-                executor,
+                input,
             })
         })
     }
@@ -639,6 +644,7 @@ impl NativeExecutor {
                     enqueue_input_sender: enqueue_input_tx,
                     stats_handle,
                     active_input_ids: HashSet::new(),
+                    has_cancelled_inputs: false,
                     skipped_corrupt_files: ctx.skipped_corrupt_files.clone(),
                 },
             );
@@ -711,7 +717,14 @@ impl NativeExecutor {
                 // the stats manager may be finished so this can fail — that's OK.
                 let stats = plan_state.stats_handle.take_input_snapshot(input_id).await;
                 drop(plan_state.enqueue_input_sender);
-                plan_state.task_handle.await??;
+                // A cancelled input may still be running in the shared pipeline.
+                // Once its last live sibling has finished, stop that work instead
+                // of waiting for it to produce an output nobody will consume.
+                if plan_state.has_cancelled_inputs {
+                    drop(plan_state.task_handle);
+                } else {
+                    plan_state.task_handle.await??;
+                }
                 let skipped = plan_state
                     .skipped_corrupt_files
                     .lock()
@@ -738,6 +751,35 @@ impl NativeExecutor {
                     .with_skipped_corrupt_files(skipped))
             }
             .boxed())
+        }
+    }
+
+    fn cancel_input(&mut self, fingerprint: u64, input_id: InputId, generation: u64) {
+        let current = self
+            .plans
+            .get(&fingerprint)
+            .is_some_and(|state| state.generation == generation);
+        let state = if current {
+            self.plans.get_mut(&fingerprint)
+        } else {
+            self.retired_plans.get_mut(&(fingerprint, generation))
+        };
+        let Some(state) = state else {
+            return;
+        };
+        if !state.active_input_ids.remove(&input_id) {
+            return;
+        }
+        state.has_cancelled_inputs = true;
+        // Inputs with the same fingerprint share a pipeline. Keep it alive for
+        // its remaining consumers, but abort it as soon as the last one leaves.
+        // Dropping the task propagates to the shuffle writer's cancellation guard.
+        if state.active_input_ids.is_empty() {
+            if current {
+                self.plans.remove(&fingerprint);
+            } else {
+                self.retired_plans.remove(&(fingerprint, generation));
+            }
         }
     }
 
@@ -882,21 +924,56 @@ impl ExecutionEngineResult {
     }
 }
 
-#[cfg_attr(
-    feature = "python",
-    pyclass(module = "daft.daft", name = "PyResultReceiver", frozen)
-)]
-pub struct PyResultReceiver {
-    result: Arc<tokio::sync::Mutex<Option<ExecutionEngineResult>>>,
+/// Own an input from before enqueue until its receiver finishes or is cancelled.
+/// This also covers cancellation while Python is still awaiting `run()`.
+struct NativeInputGuard {
     fingerprint: u64,
     generation: u64,
     input_id: InputId,
     executor: Arc<Mutex<NativeExecutor>>,
 }
 
+impl NativeInputGuard {
+    fn cancel(&self) {
+        #[cfg(feature = "python")]
+        Python::attach(|py| {
+            self.executor.lock_py_attached(py).unwrap().cancel_input(
+                self.fingerprint,
+                self.input_id,
+                self.generation,
+            );
+        });
+        #[cfg(not(feature = "python"))]
+        self.executor.lock().unwrap().cancel_input(
+            self.fingerprint,
+            self.input_id,
+            self.generation,
+        );
+    }
+}
+
+impl Drop for NativeInputGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[cfg_attr(
+    feature = "python",
+    pyclass(module = "daft.daft", name = "PyResultReceiver", frozen)
+)]
+pub struct PyResultReceiver {
+    result: Arc<tokio::sync::Mutex<Option<ExecutionEngineResult>>>,
+    input: NativeInputGuard,
+}
+
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyResultReceiver {
+    fn cancel(&self) {
+        self.input.cancel();
+    }
+
     fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -933,10 +1010,10 @@ impl PyResultReceiver {
 
     fn try_finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let result = self.result.clone();
-        let executor = self.executor.clone();
-        let fingerprint = self.fingerprint;
-        let generation = self.generation;
-        let input_id = self.input_id;
+        let executor = self.input.executor.clone();
+        let fingerprint = self.input.fingerprint;
+        let generation = self.input.generation;
+        let input_id = self.input.input_id;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Take the result to drop the receiver
             let mut result = result.lock().await;

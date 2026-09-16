@@ -181,6 +181,90 @@ finally:
 """
 
 
+CANCEL_DRIVER = r"""
+import os
+from pathlib import Path
+import threading
+import time
+
+import daft
+import ray
+from daft.runners import get_or_create_runner
+
+root = Path(os.environ["DAFT_TEST_SHUFFLE_IO_ROOT"])
+ray.init(num_cpus=2, include_dashboard=False, object_store_memory=256 * 1024 * 1024)
+daft.set_runner_ray()
+try:
+    cfg = dict(shuffle_algorithm="flight_shuffle", flight_shuffle_dirs=[str(root)],
+        flight_shuffle_compression="none", flight_shuffle_eio_local_max_retries=6,
+        flight_shuffle_eio_local_initial_backoff_ms=32000,
+        flight_shuffle_eio_local_max_backoff_ms=32000,
+        enable_scan_task_split_and_merge=False)
+    if os.environ["DAFT_TEST_PLACEMENT"] == "shared_only":
+        cfg.update(flight_shuffle_placement="shared_only", flight_shuffle_shared_dir=str(root),
+            flight_shuffle_read_source="shared", flight_shuffle_shared_durability="sync")
+    data = {"k": list(range(8192)), "v": [str(i) + ":" + "x" * 2048 for i in range(8192)]}
+    source = daft.from_pydict(data)
+    outcome = {}
+    def consume():
+        try:
+            with daft.execution_config_ctx(**cfg):
+                outcome["result"] = source.repartition(2, "k").sort("k").to_pydict()
+        except Exception as error:
+            outcome["error"] = repr(error)
+    thread = threading.Thread(target=consume, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 60
+    while not list(root.glob("fault-*")) and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert list(root.glob("fault-*")), outcome
+    control = get_or_create_runner().flotilla_plan_runner.runner
+    plan_ids = ray.get(control.__ray_call__.remote(lambda actor: list(actor.curr_plans)))
+    assert len(plan_ids) == 1, plan_ids
+    started = time.monotonic()
+    ray.get(control.cancel_plan.remote(plan_ids[0]), timeout=15)
+    thread.join(timeout=max(0, 16 - (time.monotonic() - started)))
+    cancelled_seconds = time.monotonic() - started
+    assert not thread.is_alive(), "query did not stop after cancellation"
+    assert cancelled_seconds < 16
+    assert not outcome.get("result", {}).get("k"), outcome
+    # Cleanup only removes these directories after every worker acknowledges
+    # zero active writers. A zero-row result alone does not prove write drain.
+    assert not list(root.glob("daft_shuffle/*")), "shuffle writes did not drain and clean up"
+    faults = {p.name: p.read_text() for p in root.glob("fault-*")}
+    time.sleep(2)
+    assert {p.name: p.read_text() for p in root.glob("fault-*")} == faults, "writes continued after cancel"
+    assert not list(root.glob("daft_shuffle/*")), "cancelled writer recreated its files"
+    with daft.execution_config_ctx(shuffle_algorithm="map_reduce"):
+        assert daft.from_pydict({"v": [1, 2, 3]}).agg(daft.col("v").sum()).to_pydict() == {"v": [6]}
+    print("CANCEL_DRAINED", cancelled_seconds, "faults", len(faults), flush=True)
+finally:
+    ray.shutdown()
+"""
+
+
+@pytest.mark.parametrize("placement", ["shared_only", "local_only"])
+@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Requires local Ray task execution")
+def test_cancel_during_shuffle_eio_backoff(tmp_path, shuffle_io_injector, placement):
+    env = dict(os.environ)
+    env.update(
+        LD_PRELOAD=str(shuffle_io_injector),
+        DAFT_TEST_SHUFFLE_IO_ROOT=str(tmp_path),
+        DAFT_TEST_SHUFFLE_IO_OPERATION="write",
+        DAFT_TEST_SHUFFLE_IO_FAILURES="100",
+        DAFT_TEST_SHUFFLE_IO_ERRNO="5",
+        DAFT_TEST_PLACEMENT=placement,
+        DAFT_RUNNER="ray",
+        DAFT_PROGRESS_BAR="0",
+        RAY_ADDRESS="local",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", CANCEL_DRIVER], env=env, capture_output=True, text=True, timeout=120, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CANCEL_DRAINED" in result.stdout
+
+
 @pytest.mark.parametrize(
     "operation,placement,read_source,retries,failures,errno,expected_errno,min_offset,source",
     [
