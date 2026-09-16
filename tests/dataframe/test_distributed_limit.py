@@ -131,49 +131,54 @@ def test_is_done_transitions():
 
 
 @pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
-def test_distributed_limit_retries_after_worker_death(tmp_path):
+@pytest.mark.parametrize("start", [0, 1])
+def test_distributed_limit_retries_after_worker_death(tmp_path, start):
     """`.limit(N)` must still produce N rows when a SwordfishTask crashes mid-claim.
 
     Without the rewind in `_LimitCounterImpl.start_task`, the failed attempt's
     claim stays charged against the global budget while its slice never reaches
     downstream — the retry then sees a smaller budget and the output undercounts.
     """
+    import json
     import os
 
+    # On a multi-node cluster, use --basetemp on a filesystem shared by the
+    # driver and all workers so they contend for the same one-shot marker.
     marker = str(tmp_path / "crashed_once")
 
-    @func(return_dtype=DataType.int64(), cpus=os.cpu_count())
-    def crash_once_on_zero(v: int) -> int:
-        import os
+    @func(return_dtype=DataType.int64())
+    def crash_once(v: int) -> int:
+        # LIMIT is unordered: crash the first invocation that gets any row.
+        # Exclusive creation ensures concurrent invocations kill one worker.
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return v
+        with os.fdopen(fd, "w") as f:
+            json.dump({"node": ray.get_runtime_context().get_node_id(), "pid": os.getpid(), "value": v}, f)
+        # Hard-exit the swordfish actor process after closing the marker.
+        # Ray surfaces ActorDiedError; flotilla replaces the worker and retries
+        # the failed task. DistributedLimitSink then calls start_task(input_id)
+        # to refund the crashed attempt's claim before claiming again.
+        os._exit(1)
 
-        if v == 0 and not os.path.exists(marker):
-            with open(marker, "w") as f:
-                f.write("crashed")
-            # Hard-exit the swordfish actor process. Ray surfaces this as
-            # ActorDiedError → RayTaskResult.worker_died() → dispatcher marks
-            # WorkerDied. flotilla's RayWorkerManager.refresh_workers loop
-            # then spawns a fresh actor on this node within ~5s, onto which
-            # the failed task is re-dispatched. The retry's
-            # DistributedLimitSink calls start_task(input_id), which refunds
-            # the crashed attempt's prior claim before claiming again.
-            os._exit(1)
-        return v
-
-    df = daft.range(0, 15, partitions=15).limit(3).select(crash_once_on_zero(col("id")))
-    result = df.to_pydict()
-
-    import os
+    # The nonzero start deterministically guards against a value-specific
+    # crash condition, even when local scheduling happens to pick row 0 first.
+    df = daft.range(start, start + 15, partitions=15).limit(3).select(crash_once(col("id")))
+    result = df.to_pydict()["id"]
 
     assert os.path.exists(marker), "UDF never crashed — retry path not exercised"
-    # Single-CPU serialization makes contributor order deterministic: task 0
-    # retries and finishes first, then tasks 1 and 2 run in sequence. Without
-    # rewind in start_task, the crashed task's row would be missing
-    # (e.g. [1, 2] instead of [0, 1, 2]).
-    assert result["id"] == [0, 1, 2], (
-        f"expected [0, 1, 2] after retry, got {result['id']}. "
-        "If 0 is missing, the limit actor failed to rewind the crashed "
-        "task's claim in start_task."
-    )
+    with open(marker) as f:
+        fault = json.load(f)
+    assert fault["node"] and fault["pid"] > 0, fault
+    assert fault["value"] in range(start, start + 15), fault
+    # A distributed, unordered LIMIT promises cardinality, not particular rows
+    # or contributor order. Missing claim refunds would undercount the output.
+    assert len(result) == len(set(result)) == 3, (fault, result)
+    assert set(result) <= set(range(start, start + 15)), (fault, result)
+
+    # A separate query must still run after the worker has been replaced.
+    assert daft.from_pydict({"x": [1, 2, 3]}).agg(col("x").sum()).to_pydict() == {"x": [6]}
 
 
 def test_claim_signals_done_event():
@@ -349,21 +354,18 @@ def test_limit_under_broadcast_join_emits_every_limited_row():
 
 
 @pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
-def test_limit_stops_upstream_work():
-    """A satisfied `LIMIT` must stop upstream production, not just discard it.
+@pytest.mark.parametrize("partitions", [1, 8])
+def test_limit_stops_upstream_work(partitions):
+    """A satisfied `LIMIT` stops work that has not already been started.
 
-    Regression test for the distributed limit doing no work-saving at all: the
-    counter actor's `done` flag was dropped on the floor, so every task drained
-    its whole partition through the (non-pushdown-able) UDF and the query cost
-    the same as having no `LIMIT`.
-
-    Asserts on rows actually fed to the UDF rather than on wall clock, so it
-    does not depend on machine speed. The bound is deliberately loose — how much
-    is saved depends on scheduling, and the counter increments are
-    fire-and-forget so the total can undercount slightly — but the pre-fix
-    behavior feeds the UDF *every* row, which is far outside it.
+    Bound UDF concurrency so some work remains cancellable: at 128 concurrent
+    2,000-row batches, all 160,000 rows can enter the UDF before the first
+    result reaches LIMIT. No work-saving percentage is guaranteed in that case.
+    A single partition also exercises cancellation inside a contributing task;
+    cancelling only subsequent tasks cannot make that case pass.
     """
     total_rows = 8 * 20_000
+    batch_size = 2_000
 
     @ray.remote(num_cpus=0)
     class RowCounter:
@@ -376,32 +378,47 @@ def test_limit_stops_upstream_work():
         def get(self) -> int:
             return self.n
 
-    counter = RowCounter.options(name="limit_row_counter", lifetime=None).remote()
+        def reset(self) -> None:
+            self.n = 0
 
-    @func(return_dtype=DataType.bool())
-    def keep_and_count(a: int) -> bool:
-        import ray as _ray
-
-        _ray.get_actor("limit_row_counter").add.remote(1)
-        return a % 1_000 == 0
+    counter = RowCounter.remote()
 
     try:
-        # Small morsels so the early-stop signal has a chance to land partway
-        # through a partition; the default morsel is larger than these
-        # partitions, which would make the test measure nothing.
-        daft.set_execution_config(default_morsel_size=2_000)
-        df = daft.range(0, total_rows, partitions=8).where(keep_and_count(col("id"))).limit(4)
-        result = df.to_pydict()
-        assert len(result["id"]) == 4
+        # Request a whole worker's CPUs, rather than the driver's os.cpu_count()
+        # or the cluster-wide sum. On heterogeneous clusters, use the largest
+        # worker so eligible workers run just one UDF batch at a time.
+        cpus = max(node["Resources"].get("CPU", 0) for node in ray.nodes() if node["Alive"])
 
-        processed = ray.get(counter.get.remote())
-        assert processed < total_rows * 0.9, (
-            f"UDF saw {processed} of {total_rows} rows; the limit saved almost nothing. "
-            "The DistributedLimitSink is not honoring the counter actor's `done` flag, "
-            "or the cancellation is not reaching the source."
-        )
+        @func.batch(return_dtype=DataType.bool(), batch_size=batch_size, cpus=cpus, use_process=False)
+        def keep_and_count(values):
+            # Acknowledge each increment before returning its batch. A get()
+            # from the driver does not fence fire-and-forget RPCs from workers.
+            ray.get(counter.add.remote(len(values)))
+            return [value % 1_000 == 0 for value in values.to_pylist()]
+
+        with daft.execution_config_ctx(default_morsel_size=batch_size):
+
+            def frame():
+                # Create a fresh frame: to_pydict() caches materialized results.
+                return daft.range(0, total_rows, partitions=partitions).where(keep_and_count(col("id")))
+
+            expected = list(range(0, total_rows, 1_000))
+            assert sorted(frame().to_pydict()["id"]) == expected
+            assert ray.get(counter.get.remote()) == total_rows
+            ray.get(counter.reset.remote())
+
+            result = frame().limit(4).to_pydict()["id"]
+            assert len(result) == len(set(result)) == 4
+            assert set(result) <= set(expected)
+
+            processed = ray.get(counter.get.remote())
+            assert 2 * batch_size <= processed < total_rows * 0.9, (
+                f"UDF saw {processed} of {total_rows} rows with {partitions} partitions; "
+                "expected acknowledged work and early stopping under bounded concurrency."
+            )
+            # An early stop must leave the shared worker usable for a new query.
+            assert daft.range(10, partitions=1).to_pydict()["id"] == list(range(10))
     finally:
-        daft.set_execution_config(default_morsel_size=None)
         ray.kill(counter)
 
 

@@ -375,58 +375,63 @@ class RaySwordfishActor:
                 context,
                 False,
             )
-            partition_refs: list[FlightPartitionRef] = []
-            metas = []
-            is_flight_shuffle = False
-            # Coalesce small MicroPartition outputs to reduce head-node ObjectRef pressure. Skip
-            # when the plan emits a fixed output per partition slot (RepartitionWrite/GatherWrite)
-            # — downstream transpose depends on count and order.
-            target_bytes = 0 if plan.has_partitioned_output() else 64 * 1024 * 1024
-            buf: list[MicroPartition] = []
-            buf_bytes = 0
-
-            def flush() -> MicroPartition:
-                nonlocal buf, buf_bytes
-                merged = MicroPartition.concat(buf)
-                metas.append(PartitionMetadata.from_table(merged))
-                buf = []
+            try:
+                partition_refs: list[FlightPartitionRef] = []
+                metas = []
+                is_flight_shuffle = False
+                # Coalesce small MicroPartition outputs to reduce head-node ObjectRef pressure. Skip
+                # when the plan emits a fixed output per partition slot (RepartitionWrite/GatherWrite)
+                # — downstream transpose depends on count and order.
+                target_bytes = 0 if plan.has_partitioned_output() else 64 * 1024 * 1024
+                buf: list[MicroPartition] = []
                 buf_bytes = 0
-                return merged
 
-            async for partition in result_handle:
-                if isinstance(partition, FlightPartitionRef):
-                    is_flight_shuffle = True
-                    metas.append(PartitionMetadata.from_flight_partition_ref(partition))
-                    partition_refs.append(partition)
-                    continue
-                if not isinstance(partition, PyMicroPartition):
-                    break
-                mp = MicroPartition._from_pymicropartition(partition)
-                if target_bytes <= 0:
-                    metas.append(PartitionMetadata.from_table(mp))
-                    yield mp
-                    continue
-                buf.append(mp)
-                # Zero is a known size for an empty partition, not missing metadata.
-                # Unknown sizes flush immediately; the count cap also bounds empty buffers.
-                size = mp.size_bytes()
-                buf_bytes += target_bytes if size is None else size
-                if buf_bytes >= target_bytes or len(buf) >= 1024:
+                def flush() -> MicroPartition:
+                    nonlocal buf, buf_bytes
+                    merged = MicroPartition.concat(buf)
+                    metas.append(PartitionMetadata.from_table(merged))
+                    buf = []
+                    buf_bytes = 0
+                    return merged
+
+                async for partition in result_handle:
+                    if isinstance(partition, FlightPartitionRef):
+                        is_flight_shuffle = True
+                        metas.append(PartitionMetadata.from_flight_partition_ref(partition))
+                        partition_refs.append(partition)
+                        continue
+                    if not isinstance(partition, PyMicroPartition):
+                        break
+                    mp = MicroPartition._from_pymicropartition(partition)
+                    if target_bytes <= 0:
+                        metas.append(PartitionMetadata.from_table(mp))
+                        yield mp
+                        continue
+                    buf.append(mp)
+                    # Zero is a known size for an empty partition, not missing metadata.
+                    # Unknown sizes flush immediately; the count cap also bounds empty buffers.
+                    size = mp.size_bytes()
+                    buf_bytes += target_bytes if size is None else size
+                    if buf_bytes >= target_bytes or len(buf) >= 1024:
+                        yield flush()
+
+                # batch flight partition refs before sending the scheduler
+                if partition_refs:
+                    yield FlightPartitions(partition_refs)
+
+                if buf:
                     yield flush()
 
-            # batch flight partition refs before sending the scheduler
-            if partition_refs:
-                yield FlightPartitions(partition_refs)
-
-            if buf:
-                yield flush()
-
-            stats = await result_handle.try_finish()
-            yield SwordfishTaskMetadata(
-                partition_metadatas=metas,
-                stats=stats.encode(),
-                is_flight_shuffle=is_flight_shuffle,
-            )
+                stats = await result_handle.try_finish()
+                yield SwordfishTaskMetadata(
+                    partition_metadatas=metas,
+                    stats=stats.encode(),
+                    is_flight_shuffle=is_flight_shuffle,
+                )
+            finally:
+                # Ray cancellation/early generator close must release the native
+                # input even when no stats are requested or a traceback retains it.
+                result_handle.cancel()
 
 
 @ray.remote  # type: ignore[untyped-decorator]

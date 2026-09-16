@@ -465,11 +465,25 @@ shuffle algorithm, resize the cluster, or compact final Parquet files.
 
 ### Binary compatibility of this experimental build
 
-The affected config, distributed-plan and shuffle-input pickles use the versioned
-`_from_serialized_shuffle_aqe_v1` reconstruction entry point. Old builds cannot load
-these pickles; this build rejects their legacy `_from_serialized` payloads before
-bincode decoding. **Driver and workers must use identical builds.** Recreate affected
-persisted configs/plans with this build; automatic legacy-pickle migration and mixed
-version Ray execution are not supported. Python positional-argument compatibility
-is separate from binary compatibility. `serde(default)` only supplies missing fields
-in tagged formats and does not make positional bincode payloads compatible.
+Execution-config and distributed-plan pickles use the versioned
+`_from_serialized_shuffle_eio_v2` reconstruction entry point introduced in
+`0.7.24+apodex.7`; distributed plans embed the execution config. Shuffle-input
+pickles still use `_from_serialized_shuffle_aqe_v1`.
+
+Config and plan pickles from `0.7.24+apodex.6` use
+`_from_serialized_shuffle_aqe_v1` and are incompatible with the EIO layout in both
+directions. This build rejects that retired factory with a `ValueError` naming the
+received and expected formats and explaining how to recover, before bincode
+decoding. Legacy `_from_serialized` payloads are also rejected. Unpatched `.7`
+builds reject `.6` config/plan pickles with an `AttributeError`; `.6` builds still
+reject `.7` config/plan pickles with an `AttributeError` for the missing EIO factory.
+Adding a diagnostic to this build cannot change errors raised by an older build.
+
+**Driver and workers must use identical builds.** When upgrading or rolling back,
+recreate persisted configs/plans from the original configuration and logical query
+using the destination build. Automatic pickle migration and mixed-version Ray
+execution are not supported. This boundary applies to these internal pickles, not
+all Python objects or external storage formats. Python positional-argument
+compatibility is separate from binary compatibility. `serde(default)` only supplies
+missing fields in tagged formats and does not make positional bincode payloads
+compatible.
