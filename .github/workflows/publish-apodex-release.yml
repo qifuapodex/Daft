@@ -24,6 +24,7 @@ on:
   push:
     tags:
     - apodex-*
+    - '!apodex-assets-*'
 
 permissions: {}
 
@@ -40,7 +41,23 @@ defaults:
     shell: bash
 
 jobs:
+  release-notes:
+    name: Publish release notes before building
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v7
+    - uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
+        name: ${{ inputs.package_version || '0.7.24+apodex.7' }}
+        target_commitish: ${{ github.sha }}
+        body_path: .github/release-notes/${{ inputs.tag_name || 'apodex-0.7.24.7' }}.md
+        make_latest: true
+
   build:
+    needs: release-notes
     name: "Build Daft wheel for ${{ matrix.os }}-${{ matrix.arch }}"
     permissions:
       contents: read
@@ -65,11 +82,32 @@ jobs:
           arch: aarch64
 
   publish:
-    name: Publish wheels to GitHub Release
-    # Same-version rebuilds must not mix old wheels with a partial new build.
+    name: Publish each platform as soon as it is ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    needs: release-notes
+    permissions:
+      contents: write
+      actions: read
+    steps:
+    - uses: actions/checkout@v7
+    - name: Upload completed platform artifacts
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        BUILD_RUN_ID: ${{ github.run_id }}
+        BUILD_SHA: ${{ github.sha }}
+        RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
+        PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.7' }}
+      run: |
+        python3 .github/scripts/publish_apodex_artifacts.py \
+          --run-id "$BUILD_RUN_ID" --sha "$BUILD_SHA" \
+          --tag "$RELEASE_TAG" --version "$PACKAGE_VERSION"
+
+  verify:
+    name: Verify complete release assets
     if: ${{ needs.build.result == 'success' }}
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, publish]
     permissions:
       contents: write
     steps:
@@ -82,6 +120,8 @@ jobs:
     - name: List wheels
       run: ls -la dist
     - name: Validate complete release assets
+      env:
+        PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.7' }}
       run: |
         python3 - <<'PY'
         from pathlib import Path
@@ -101,6 +141,7 @@ jobs:
             print("missing platforms:", ", ".join(missing))
             raise SystemExit(1)
         import email.parser
+        import os
         import tarfile
         import zipfile
         wheels = [n for n in names if n.endswith(".whl")]
@@ -113,7 +154,7 @@ jobs:
                 if len(metadata) != 1:
                     raise SystemExit(f"Invalid wheel metadata: {name}")
                 parsed = email.parser.BytesParser().parsebytes(archive.read(metadata[0]))
-            if parsed["Name"] != "daft" or parsed["Version"] != "0.7.24+apodex.7":
+            if parsed["Name"] != "daft" or parsed["Version"] != os.environ["PACKAGE_VERSION"]:
                 raise SystemExit(f"Unexpected package name/version: {name}")
         with tarfile.open(Path("dist") / sdists[0]) as archive:
             metadata = [m for m in archive.getmembers() if m.name.endswith("/PKG-INFO") and m.name.count("/") == 1]
@@ -121,18 +162,7 @@ jobs:
                 raise SystemExit("Invalid source distribution metadata")
             with archive.extractfile(metadata[0]) as source:
                 parsed = email.parser.BytesParser().parse(source)
-            if parsed["Name"] != "daft" or parsed["Version"] != "0.7.24+apodex.7":
+            if parsed["Name"] != "daft" or parsed["Version"] != os.environ["PACKAGE_VERSION"]:
                 raise SystemExit("Unexpected source distribution name/version")
         print("all expected platforms and package versions verified")
         PY
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: apodex-0.7.24.7
-        name: 0.7.24+apodex.7
-        target_commitish: ${{ github.sha }}
-        body_path: .github/release-notes/apodex-0.7.24.7.md
-        files: dist/*
-        fail_on_unmatched_files: true
-        overwrite_files: true
-        make_latest: true

@@ -1,0 +1,77 @@
+name: Publish platforms from an existing apodex build
+
+# Attach a publisher to a build that is already running; no compilation is restarted.
+# The tag suffix is a GitHub Actions run ID, e.g. apodex-assets-35045336433.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Existing apodex build run ID
+        required: true
+      tag_name:
+        description: Release to update
+        default: apodex-0.7.24.7
+      package_version:
+        description: Expected wheel version
+        default: 0.7.24+apodex.7
+  push:
+    tags:
+    - apodex-assets-*
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: apodex-existing-build-${{ inputs.run_id || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REQUESTED_RUN_ID: ${{ inputs.run_id }}
+      RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
+      PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.7' }}
+    steps:
+    - uses: actions/checkout@v7
+    - name: Verify source run and release tag
+      id: source
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+        import subprocess
+        def api(path):
+            return json.loads(subprocess.check_output(["gh", "api", path], text=True))
+        run_id = os.environ["REQUESTED_RUN_ID"] or os.environ["GITHUB_REF_NAME"].removeprefix("apodex-assets-")
+        if not run_id.isdigit():
+            raise SystemExit("Expected a numeric source run ID")
+        base = "repos/" + os.environ["GITHUB_REPOSITORY"]
+        run = api(f"{base}/actions/runs/{run_id}")
+        ref = api(f"{base}/git/ref/tags/{os.environ['RELEASE_TAG']}")
+        if run["path"] != ".github/workflows/publish-apodex-release.yml":
+            raise SystemExit("Expected an apodex release build")
+        if ref["object"]["type"] != "commit" or ref["object"]["sha"] != run["head_sha"]:
+            raise SystemExit("Release tag does not match the source build")
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"run_id={run_id}\nsha={run['head_sha']}\n")
+        PY
+    - name: Publish release notes first
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ env.RELEASE_TAG }}
+        name: ${{ env.PACKAGE_VERSION }}
+        target_commitish: ${{ steps.source.outputs.sha }}
+        body_path: .github/release-notes/${{ env.RELEASE_TAG }}.md
+        make_latest: true
+    - name: Upload each platform when available
+      env:
+        BUILD_RUN_ID: ${{ steps.source.outputs.run_id }}
+        BUILD_SHA: ${{ steps.source.outputs.sha }}
+      run: |
+        python3 .github/scripts/publish_apodex_artifacts.py \
+          --run-id "$BUILD_RUN_ID" --sha "$BUILD_SHA" \
+          --tag "$RELEASE_TAG" --version "$PACKAGE_VERSION"
