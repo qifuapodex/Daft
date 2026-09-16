@@ -170,6 +170,14 @@ impl Drop for MessageRouter {
 /// Per-plan execution state
 type PipelineFailure = Arc<OnceLock<Arc<DaftError>>>;
 
+/// First attempts share a pipeline. Retried inputs run independently so a
+/// sibling's failure cannot repeatedly consume their remaining retry budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExecutionPlanKey {
+    fingerprint: u64,
+    retry: Option<(InputId, u32)>,
+}
+
 struct PlanState {
     generation: u64,
     failure: PipelineFailure,
@@ -261,7 +269,7 @@ impl PyNativeExecutor {
         let subscribers = daft_ctx.subscribers();
         let (input, enqueue_future) = {
             let mut executor = self.executor.lock_py_attached(py).unwrap();
-            let (fingerprint, enqueue_future) = executor.run(
+            let (plan_key, enqueue_future) = executor.run(
                 &plan,
                 exec_cfg,
                 subscribers,
@@ -271,8 +279,8 @@ impl PyNativeExecutor {
                 maintain_order,
             )?;
             let input = NativeInputGuard {
-                fingerprint,
-                generation: executor.plans[&fingerprint].generation,
+                plan_key,
+                generation: executor.plans[&plan_key].generation,
                 input_id,
                 executor: self.executor.clone(),
             };
@@ -492,8 +500,8 @@ pub struct NativeExecutor {
     is_flotilla_worker: bool,
     shuffle_server: Option<Arc<ShuffleFlightServer>>,
     shuffle_server_connection: Option<FlightServerConnectionHandle>,
-    plans: HashMap<u64, PlanState>,
-    retired_plans: HashMap<(u64, u64), PlanState>,
+    plans: HashMap<ExecutionPlanKey, PlanState>,
+    retired_plans: HashMap<(ExecutionPlanKey, u64), PlanState>,
 }
 
 impl NativeExecutor {
@@ -547,7 +555,10 @@ impl NativeExecutor {
         inputs: HashMap<SourceId, Input>,
         input_id: InputId,
         maintain_order: bool,
-    ) -> DaftResult<(u64, BoxFuture<'static, DaftResult<ExecutionEngineResult>>)> {
+    ) -> DaftResult<(
+        ExecutionPlanKey,
+        BoxFuture<'static, DaftResult<ExecutionEngineResult>>,
+    )> {
         let (query_id, fingerprint, task_id) = parse_context(additional_context.as_ref());
 
         if self.is_flotilla_worker {
@@ -587,16 +598,26 @@ impl NativeExecutor {
             None
         };
 
+        let attempt = additional_context
+            .as_ref()
+            .and_then(|ctx| ctx.get("task_attempt"))
+            .and_then(|attempt| attempt.parse::<u32>().ok())
+            .unwrap_or(0);
+        let plan_key = ExecutionPlanKey {
+            fingerprint,
+            retry: (attempt > 0).then_some((input_id, attempt)),
+        };
+
         if self
             .plans
-            .get(&fingerprint)
+            .get(&plan_key)
             .is_some_and(|state| state.enqueue_input_sender.is_closed())
         {
-            let state = self.plans.remove(&fingerprint).unwrap();
+            let state = self.plans.remove(&plan_key).unwrap();
             self.retired_plans
-                .insert((fingerprint, state.generation), state);
+                .insert((plan_key, state.generation), state);
         }
-        if !self.plans.contains_key(&fingerprint) {
+        if !self.plans.contains_key(&plan_key) {
             let cancel = self.cancel.clone();
             let additional_context = additional_context.unwrap_or_default();
             let shuffle_address = self.shuffle_address();
@@ -636,7 +657,7 @@ impl NativeExecutor {
 
             let task_handle = RuntimeTask::new(handle, task);
             self.plans.insert(
-                fingerprint,
+                plan_key,
                 PlanState {
                     generation: next_auto_fingerprint(),
                     failure,
@@ -650,14 +671,22 @@ impl NativeExecutor {
             );
         }
 
-        let plan_state = self.plans.get_mut(&fingerprint).unwrap();
+        let plan_state = self.plans.get_mut(&plan_key).unwrap();
         let enqueue_input_sender = plan_state.enqueue_input_sender.clone();
         let failure = plan_state.failure.clone();
         let generation = plan_state.generation;
         plan_state.active_input_ids.insert(input_id);
+        tracing::debug!(
+            input_id,
+            task_attempt = attempt,
+            plan_fingerprint = plan_key.fingerprint,
+            pipeline_generation = generation,
+            isolated = plan_key.retry.is_some(),
+            "Enqueueing pipeline input"
+        );
 
         Ok((
-            fingerprint,
+            plan_key,
             async move {
                 let mut result =
                     ExecutionEngineResult::enqueue(enqueue_input_sender, inputs, input_id, failure)
@@ -679,18 +708,18 @@ impl NativeExecutor {
     /// release a retired execution without touching a replacement pipeline.
     pub fn try_finish(
         &mut self,
-        fingerprint: u64,
+        plan_key: ExecutionPlanKey,
         input_id: InputId,
         generation: u64,
     ) -> DaftResult<BoxFuture<'static, DaftResult<ExecutionStats>>> {
         let current = self
             .plans
-            .get(&fingerprint)
+            .get(&plan_key)
             .is_some_and(|state| state.generation == generation);
         let state = if current {
-            self.plans.get_mut(&fingerprint)
+            self.plans.get_mut(&plan_key)
         } else {
-            self.retired_plans.get_mut(&(fingerprint, generation))
+            self.retired_plans.get_mut(&(plan_key, generation))
         };
         let Some(plan_state) = state else {
             // Plan already removed (pipeline died and another input_id cleaned it up).
@@ -706,11 +735,9 @@ impl NativeExecutor {
 
         if should_remove {
             let plan_state = if current {
-                self.plans.remove(&fingerprint).unwrap()
+                self.plans.remove(&plan_key).unwrap()
             } else {
-                self.retired_plans
-                    .remove(&(fingerprint, generation))
-                    .unwrap()
+                self.retired_plans.remove(&(plan_key, generation)).unwrap()
             };
             Ok(async move {
                 // Try to get stats for this input_id. If the pipeline already died,
@@ -754,15 +781,15 @@ impl NativeExecutor {
         }
     }
 
-    fn cancel_input(&mut self, fingerprint: u64, input_id: InputId, generation: u64) {
+    fn cancel_input(&mut self, plan_key: ExecutionPlanKey, input_id: InputId, generation: u64) {
         let current = self
             .plans
-            .get(&fingerprint)
+            .get(&plan_key)
             .is_some_and(|state| state.generation == generation);
         let state = if current {
-            self.plans.get_mut(&fingerprint)
+            self.plans.get_mut(&plan_key)
         } else {
-            self.retired_plans.get_mut(&(fingerprint, generation))
+            self.retired_plans.get_mut(&(plan_key, generation))
         };
         let Some(state) = state else {
             return;
@@ -771,23 +798,23 @@ impl NativeExecutor {
             return;
         }
         state.has_cancelled_inputs = true;
-        // Inputs with the same fingerprint share a pipeline. Keep it alive for
+        // Inputs with the same execution key share a pipeline. Keep it alive for
         // its remaining consumers, but abort it as soon as the last one leaves.
         // Dropping the task propagates to the shuffle writer's cancellation guard.
         if state.active_input_ids.is_empty() {
             if current {
-                self.plans.remove(&fingerprint);
+                self.plans.remove(&plan_key);
             } else {
-                self.retired_plans.remove(&(fingerprint, generation));
+                self.retired_plans.remove(&(plan_key, generation));
             }
         }
     }
 
     pub fn cancel_plan(&mut self, fingerprint: u64) {
         // RuntimeTask drop cancels the spawned task
-        self.plans.remove(&fingerprint);
+        self.plans.retain(|key, _| key.fingerprint != fingerprint);
         self.retired_plans
-            .retain(|(plan, _), _| *plan != fingerprint);
+            .retain(|(key, _), _| key.fingerprint != fingerprint);
     }
 
     fn repr_ascii(
@@ -927,7 +954,7 @@ impl ExecutionEngineResult {
 /// Own an input from before enqueue until its receiver finishes or is cancelled.
 /// This also covers cancellation while Python is still awaiting `run()`.
 struct NativeInputGuard {
-    fingerprint: u64,
+    plan_key: ExecutionPlanKey,
     generation: u64,
     input_id: InputId,
     executor: Arc<Mutex<NativeExecutor>>,
@@ -938,17 +965,16 @@ impl NativeInputGuard {
         #[cfg(feature = "python")]
         Python::attach(|py| {
             self.executor.lock_py_attached(py).unwrap().cancel_input(
-                self.fingerprint,
+                self.plan_key,
                 self.input_id,
                 self.generation,
             );
         });
         #[cfg(not(feature = "python"))]
-        self.executor.lock().unwrap().cancel_input(
-            self.fingerprint,
-            self.input_id,
-            self.generation,
-        );
+        self.executor
+            .lock()
+            .unwrap()
+            .cancel_input(self.plan_key, self.input_id, self.generation);
     }
 }
 
@@ -1011,7 +1037,7 @@ impl PyResultReceiver {
     fn try_finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let result = self.result.clone();
         let executor = self.input.executor.clone();
-        let fingerprint = self.input.fingerprint;
+        let plan_key = self.input.plan_key;
         let generation = self.input.generation;
         let input_id = self.input.input_id;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1024,11 +1050,10 @@ impl PyResultReceiver {
             drop(result);
 
             // Delegate to NativeExecutor::try_finish
-            let finish_future =
-                executor
-                    .lock()
-                    .unwrap()
-                    .try_finish(fingerprint, input_id, generation)?;
+            let finish_future = executor
+                .lock()
+                .unwrap()
+                .try_finish(plan_key, input_id, generation)?;
             let stats = finish_future.await;
             // Always finish tracking this input before returning its pipeline error.
             // Another input may already have removed the shared plan and consumed
@@ -1055,6 +1080,73 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test]
+    async fn retry_inputs_use_independent_pipelines() -> DaftResult<()> {
+        use daft_core::prelude::{DataType, Field, Schema};
+        use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan};
+        use daft_logical_plan::stats::StatsState;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64)]));
+        let plan = LocalPhysicalPlan::in_memory_scan(
+            0,
+            schema.clone(),
+            0,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        let mut executor = tokio::task::spawn_blocking(|| NativeExecutor::new(false, ""))
+            .await
+            .unwrap();
+        let mut executions = Vec::new();
+        // Keep all receivers alive, including an earlier attempt of input 1.
+        // New retries must not join it or another input with the same plan.
+        for (input_id, attempt) in [(0, 0), (1, 0), (1, 1), (2, 1), (1, 2)] {
+            let context = HashMap::from([
+                ("plan_fingerprint".into(), "123".into()),
+                ("task_attempt".into(), attempt.to_string()),
+            ]);
+            let inputs = HashMap::from([(
+                0,
+                Input::InMemory(vec![Arc::new(MicroPartition::empty(Some(schema.clone())))]),
+            )]);
+            let (key, result) = executor.run(
+                &plan,
+                Arc::new(DaftExecutionConfig::default()),
+                vec![],
+                Some(context),
+                inputs,
+                input_id,
+                true,
+            )?;
+            executions.push((key, input_id, result.await?));
+        }
+        assert_eq!(executions[0].2.generation, executions[1].2.generation);
+        let generations: HashSet<_> = executions[1..]
+            .iter()
+            .map(|(_, _, result)| result.generation)
+            .collect();
+        assert_eq!(
+            generations.len(),
+            4,
+            "each retry must have its own pipeline"
+        );
+
+        // Cancelling a logical plan must also cancel all of its isolated retries.
+        executor.cancel_plan(123);
+        assert!(executor.plans.is_empty());
+        assert!(executor.retired_plans.is_empty());
+        for (key, input_id, mut result) in executions {
+            while result.next().await.is_some() {}
+            executor
+                .try_finish(key, input_id, result.generation)?
+                .await?;
+        }
+        tokio::task::spawn_blocking(move || drop(executor))
+            .await
+            .unwrap();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn late_finisher_cannot_remove_replacement_generation() -> DaftResult<()> {

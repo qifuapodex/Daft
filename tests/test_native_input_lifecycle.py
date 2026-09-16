@@ -30,11 +30,14 @@ async def wait_for_no_plans(executor):
 
 
 @pytest.mark.parametrize("release", ["cancel", "drop", "cancel_enqueue"])
-def test_abandoned_native_input_releases_its_pipeline(native_plan, release):
+@pytest.mark.parametrize("attempt", [0, 1])
+def test_abandoned_native_input_releases_its_pipeline(native_plan, release, attempt):
     async def run():
         executor = NativeExecutor(False, "")
         plan, inputs = native_plan
-        pending = executor.run(plan, PyDaftContext(), 1, inputs, {"plan_fingerprint": "123"})
+        pending = executor.run(
+            plan, PyDaftContext(), 1, inputs, {"plan_fingerprint": "123", "task_attempt": str(attempt)}
+        )
         if release == "cancel_enqueue":
             pending.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -48,6 +51,33 @@ def test_abandoned_native_input_releases_its_pipeline(native_plan, release):
             else:
                 del receiver
                 gc.collect()
+        await wait_for_no_plans(executor)
+
+    asyncio.run(run())
+
+
+def test_cancel_retry_preserves_other_inputs_and_attempts(native_plan):
+    async def run():
+        executor = NativeExecutor(False, "")
+        plan, inputs = native_plan
+        ctx = PyDaftContext()
+        initial = await executor.run(plan, ctx, 1, inputs, {"plan_fingerprint": "123"})
+        retry_context = {"plan_fingerprint": "123", "task_attempt": "1"}
+        cancelled = await executor.run(plan, ctx, 1, inputs, retry_context)
+        sibling = await executor.run(plan, ctx, 2, inputs, retry_context)
+        assert executor.active_plan_count() == 3
+        cancelled.cancel()
+        del cancelled
+        gc.collect()
+        assert executor.active_plan_count() == 2
+        for receiver in (initial, sibling):
+            values = []
+            async for partition in receiver:
+                if partition is None:
+                    break
+                values.extend(MicroPartition._from_pymicropartition(partition).to_pydict()["x"])
+            assert values == [1, 2, 3]
+            await receiver.try_finish()
         await wait_for_no_plans(executor)
 
     asyncio.run(run())

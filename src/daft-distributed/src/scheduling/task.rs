@@ -125,6 +125,10 @@ pub(crate) trait TaskPriority: PartialOrd + PartialEq + Ord + Eq + Copy + Clone 
 pub(crate) use daft_io::shuffle_file::EioRetryPolicy as ShuffleEioRetryPolicy;
 
 pub(crate) trait Task: Send + Sync + Clone + Debug + 'static {
+    /// Propagate the scheduler's attempt number to the worker on every dispatch.
+    /// Zero is the original execution; positive attempts must not share pipelines.
+    fn set_attempt(&mut self, _attempt: u32) {}
+
     fn shuffle_eio_retry_policy(&self) -> Option<ShuffleEioRetryPolicy> {
         None
     }
@@ -449,6 +453,11 @@ impl SwordfishTask {
 }
 
 impl Task for SwordfishTask {
+    fn set_attempt(&mut self, attempt: u32) {
+        self.context
+            .insert("task_attempt".into(), attempt.to_string());
+    }
+
     fn shuffle_eio_retry_policy(&self) -> Option<ShuffleEioRetryPolicy> {
         super::shuffle_recovery::task_restartable_after_shuffle_eio(self).then_some(
             ShuffleEioRetryPolicy {

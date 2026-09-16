@@ -195,7 +195,8 @@ impl<T: Task> ScheduledTask<T> {
         let attempts = pending_task.attempts();
         let not_before = pending_task.not_before;
         let avoid_worker = pending_task.avoid_worker.clone();
-        let (task, result_tx, cancel_token) = pending_task.into_inner();
+        let (mut task, result_tx, cancel_token) = pending_task.into_inner();
+        task.set_attempt(attempts);
         Self {
             task,
             result_tx,
@@ -432,6 +433,48 @@ pub(super) mod test_utils {
     #[test]
     fn linear_scheduler_drains_without_starving_affinity() {
         check_drain_scheduling::<super::linear::LinearScheduler<MockTask>>();
+    }
+
+    #[test]
+    fn scheduled_task_context_preserves_attempt_through_deferral() {
+        use common_daft_config::DaftExecutionConfig;
+        use daft_local_plan::{LocalNodeContext, LocalPhysicalPlan};
+        use daft_logical_plan::stats::StatsState;
+
+        use crate::scheduling::task::SwordfishTask;
+
+        let plan = LocalPhysicalPlan::in_memory_scan(
+            0,
+            Arc::new(daft_schema::schema::Schema::empty()),
+            0,
+            StatsState::NotMaterialized,
+            LocalNodeContext::default(),
+        );
+        let task = SwordfishTask::for_recovery_test(
+            plan,
+            HashMap::new(),
+            Arc::new(DaftExecutionConfig::default()),
+            1,
+        );
+        let (pending, _submitted) =
+            SchedulerHandle::prepare_task_for_submission(SubmittableTask::task_only(task));
+        let scheduled = ScheduledTask::new(pending, Arc::from("worker"));
+        assert_eq!(scheduled.task_ref().context()["task_attempt"], "0");
+        let (_, task, result_tx, cancel_token, _) = scheduled.into_inner();
+        let pending = PendingTask::retry(
+            task,
+            result_tx,
+            cancel_token,
+            2,
+            Duration::ZERO,
+            Arc::from("worker"),
+        );
+        let scheduled = ScheduledTask::new(pending, Arc::from("retry-worker"));
+        assert_eq!(scheduled.task_ref().context()["task_attempt"], "2");
+        let deferred = scheduled.defer();
+        assert_eq!(deferred.attempts(), 2);
+        let rescheduled = ScheduledTask::new(deferred, Arc::from("another-worker"));
+        assert_eq!(rescheduled.task_ref().context()["task_attempt"], "2");
     }
 
     #[test]
