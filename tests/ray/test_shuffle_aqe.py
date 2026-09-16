@@ -233,7 +233,7 @@ def test_shuffle_pickle_rejects_legacy_and_malformed_payloads(class_name):
         cls._from_serialized(b"old positional payload")
     with pytest.raises(ValueError, match="Invalid versioned"):
         factory = (
-            cls._from_serialized_shuffle_eio_v2
+            cls._from_serialized_local_write_buffer_v3
             if class_name in ("PyDaftExecutionConfig", "DistributedPhysicalPlan")
             else cls._from_serialized_shuffle_aqe_v1
         )
@@ -246,7 +246,7 @@ def test_shuffle_config_versioned_pickle_roundtrip():
     with daft.execution_config_ctx(experimental_shuffle_aqe=True, experimental_shuffle_aqe_min_partitions=3):
         config = get_context().daft_execution_config
         factory, (payload,) = config.__reduce__()
-        assert factory.__name__ == "_from_serialized_shuffle_eio_v2"
+        assert factory.__name__ == "_from_serialized_local_write_buffer_v3"
         restored = pickle.loads(pickle.dumps(config))
         assert restored.experimental_shuffle_aqe is True
         assert restored.experimental_shuffle_aqe_min_partitions == 3

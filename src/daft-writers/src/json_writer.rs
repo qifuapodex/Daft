@@ -1,4 +1,4 @@
-use std::{fmt::Write, path::PathBuf, sync::Arc};
+use std::{fmt::Write, io::Write as _, path::PathBuf, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, RecordBatch as ArrowRecordBatch, builder::LargeStringBuilder, cast::AsArray,
@@ -91,6 +91,7 @@ pub(crate) fn create_native_json_writer(
     partition_values: Option<&RecordBatch>,
     io_config: Option<IOConfig>,
     json_option: JsonFormatOption,
+    local_write_buffer_size_bytes: std::num::NonZeroUsize,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Option<RecordBatch>>>> {
     // Parse the root directory and add partition values if present.
     let (source_type, root_dir) = parse_url(root_dir)?;
@@ -103,7 +104,7 @@ pub(crate) fn create_native_json_writer(
     )?;
     match source_type {
         SourceType::File => {
-            let storage_backend = FileStorageBackend {};
+            let storage_backend = FileStorageBackend::new(local_write_buffer_size_bytes);
             Ok(Box::new(make_json_writer(
                 filename,
                 partition_values.cloned(),
@@ -299,6 +300,9 @@ fn make_json_writer<B: StorageBackend + Send + Sync>(
     let finish_fn: Option<JsonFinishFn<B>> =
         Some(Arc::new(|mut writer: LineDelimitedWriter<B::Writer>| {
             writer.finish()?;
+            // Arrow's finish only terminates the JSON stream. Explicitly flush
+            // the storage writer so buffered I/O errors are not lost on drop.
+            writer.into_inner().flush()?;
             Ok(())
         }));
     BatchFileWriter::new(
@@ -310,4 +314,53 @@ fn make_json_writer<B: StorageBackend + Send + Sync>(
         write_fn,
         finish_fn,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use async_trait::async_trait;
+
+    use super::*;
+
+    struct FlushErrorWriter;
+
+    impl io::Write for FlushErrorWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("buffer flush failed"))
+        }
+    }
+
+    struct FlushErrorBackend;
+
+    #[async_trait]
+    impl StorageBackend for FlushErrorBackend {
+        type Writer = FlushErrorWriter;
+
+        async fn create_writer(&mut self, _: &std::path::Path) -> DaftResult<Self::Writer> {
+            Ok(FlushErrorWriter)
+        }
+
+        async fn finalize(&mut self) -> DaftResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn json_close_propagates_buffer_flush_errors() {
+        let mut writer = make_json_writer(
+            PathBuf::from("unused.json"),
+            None,
+            FlushErrorBackend,
+            JsonFormatOption::default(),
+        );
+        writer.write(crate::test::make_dummy_mp(8)).await.unwrap();
+        let error = writer.close().await.unwrap_err();
+        assert!(error.to_string().contains("buffer flush failed"));
+    }
 }

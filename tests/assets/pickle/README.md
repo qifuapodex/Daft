@@ -8,6 +8,10 @@ from the released Linux x86_64 wheels on Python 3.11.11:
 | `0.7.24+apodex.6` | `83898cdce391c07406e33b4ac3662660208a0015` | `_from_serialized_shuffle_aqe_v1` |
 | `0.7.24+apodex.7` | `6a845f7a0ca48dcbe09003ec8435aa874734ed5b` | `_from_serialized_shuffle_eio_v2` |
 
+Both layouts predate the local file write buffer setting. Current config/plan
+pickles use `_from_serialized_local_write_buffer_v3`; the archived fixtures
+verify that older layouts are rejected before decoding.
+
 Generated on 2026-09-16 from the installed release wheels, using the same helper
 as regression report A7-005. Run this script with each release's interpreter and
 `config` or `plan` as the argument, outside a Daft source checkout:

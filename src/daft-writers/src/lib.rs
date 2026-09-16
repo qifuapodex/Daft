@@ -141,8 +141,12 @@ pub fn make_physical_writer_factory(
     let (data_schema, non_partition_column_indices) =
         split_schema_for_partitioned_write(file_info.partition_cols.as_deref(), file_schema);
 
-    let base_writer_factory =
-        PhysicalWriterFactory::new(file_info.clone(), data_schema, cfg.native_parquet_writer)?;
+    let base_writer_factory = PhysicalWriterFactory::new(
+        file_info.clone(),
+        data_schema,
+        cfg.native_parquet_writer,
+        cfg.local_write_buffer_size_bytes,
+    )?;
     match file_info.file_format {
         FileFormat::Parquet => {
             let row_group_size_calculator = TargetInMemorySizeBytesCalculator::new(

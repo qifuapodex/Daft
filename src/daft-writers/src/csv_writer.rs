@@ -124,6 +124,7 @@ pub(crate) fn create_native_csv_writer(
     partition_values: Option<&RecordBatch>,
     io_config: Option<IOConfig>,
     csv_option: CsvFormatOption,
+    local_write_buffer_size_bytes: std::num::NonZeroUsize,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Option<RecordBatch>>>> {
     let (source_type, root_dir) = parse_url(root_dir)?;
     let filename = build_filename(
@@ -135,7 +136,7 @@ pub(crate) fn create_native_csv_writer(
     )?;
     match source_type {
         SourceType::File => {
-            let storage_backend = FileStorageBackend {};
+            let storage_backend = FileStorageBackend::new(local_write_buffer_size_bytes);
             Ok(Box::new(make_csv_writer(
                 filename,
                 partition_values.cloned(),

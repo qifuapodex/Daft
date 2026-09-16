@@ -145,6 +145,7 @@ impl PyDaftExecutionConfig {
         experimental_shuffle_aqe=None,
         experimental_shuffle_aqe_target_bytes=None,
         experimental_shuffle_aqe_min_partitions=None,
+        local_write_buffer_size_bytes=None,
     ))]
     fn with_config_values(
         &self,
@@ -205,8 +206,16 @@ impl PyDaftExecutionConfig {
         experimental_shuffle_aqe: Option<bool>,
         experimental_shuffle_aqe_target_bytes: Option<usize>,
         experimental_shuffle_aqe_min_partitions: Option<usize>,
+        local_write_buffer_size_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
+        if let Some(value) = local_write_buffer_size_bytes {
+            config.local_write_buffer_size_bytes = NonZeroUsize::new(value).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "local_write_buffer_size_bytes must be greater than zero",
+                )
+            })?;
+        }
         if let Some(value) = flight_shuffle_eio_local_max_retries {
             config.flight_shuffle_eio_local_max_retries = value;
         }
@@ -536,6 +545,11 @@ impl PyDaftExecutionConfig {
     }
 
     #[getter]
+    fn local_write_buffer_size_bytes(&self) -> usize {
+        self.config.local_write_buffer_size_bytes.get()
+    }
+
+    #[getter]
     fn experimental_shuffle_aqe(&self) -> bool {
         self.config.experimental_shuffle_aqe
     }
@@ -806,8 +820,11 @@ impl PyDaftExecutionConfig {
 
 common_py_serde::impl_versioned_bincode_py_state_serialization!(
     PyDaftExecutionConfig,
-    _from_serialized_shuffle_eio_v2,
-    incompatible = [_from_serialized_shuffle_aqe_v1]
+    _from_serialized_local_write_buffer_v3,
+    incompatible = [
+        _from_serialized_shuffle_aqe_v1,
+        _from_serialized_shuffle_eio_v2
+    ]
 );
 
 #[derive(Clone, Default, Serialize, Deserialize)]

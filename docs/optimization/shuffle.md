@@ -466,17 +466,17 @@ shuffle algorithm, resize the cluster, or compact final Parquet files.
 ### Binary compatibility of this experimental build
 
 Execution-config and distributed-plan pickles use the versioned
-`_from_serialized_shuffle_eio_v2` reconstruction entry point introduced in
-`0.7.24+apodex.7`; distributed plans embed the execution config. Shuffle-input
-pickles still use `_from_serialized_shuffle_aqe_v1`.
+`_from_serialized_local_write_buffer_v3` reconstruction entry point, which
+includes the local file write buffer setting; distributed plans embed the
+execution config. Shuffle-input pickles still use `_from_serialized_shuffle_aqe_v1`.
 
-Config and plan pickles from `0.7.24+apodex.6` use
-`_from_serialized_shuffle_aqe_v1` and are incompatible with the EIO layout in both
-directions. This build rejects that retired factory with a `ValueError` naming the
-received and expected formats and explaining how to recover, before bincode
-decoding. Legacy `_from_serialized` payloads are also rejected. Unpatched `.7`
-builds reject `.6` config/plan pickles with an `AttributeError`; `.6` builds still
-reject `.7` config/plan pickles with an `AttributeError` for the missing EIO factory.
+Config and plan pickles from `0.7.24+apodex.6` and `0.7.24+apodex.7` use
+`_from_serialized_shuffle_aqe_v1` and `_from_serialized_shuffle_eio_v2`, respectively,
+and are incompatible with the current layout. This build rejects both retired
+factories with a `ValueError` naming the received and expected formats and
+explaining how to recover, before bincode
+decoding. Legacy `_from_serialized` payloads are also rejected. Older builds reject
+current config/plan pickles with an `AttributeError` for the missing v3 factory.
 Adding a diagnostic to this build cannot change errors raised by an older build.
 
 **Driver and workers must use identical builds.** When upgrading or rolling back,

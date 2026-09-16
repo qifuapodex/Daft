@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use common_error::{DaftError, DaftResult};
 use common_file_formats::{FileFormat, WriteMode};
 use daft_core::prelude::*;
@@ -23,6 +25,7 @@ pub struct PhysicalWriterFactory {
     output_file_info: OutputFileInfo<BoundExpr>,
     schema: SchemaRef,
     writer_type: WriterType,
+    local_write_buffer_size_bytes: NonZeroUsize,
 }
 
 impl PhysicalWriterFactory {
@@ -30,6 +33,7 @@ impl PhysicalWriterFactory {
         output_file_info: OutputFileInfo<BoundExpr>,
         file_schema: SchemaRef,
         native_enabled: bool,
+        local_write_buffer_size_bytes: NonZeroUsize,
     ) -> DaftResult<Self> {
         let writer_type =
             Self::select_writer_type(&output_file_info, &file_schema, native_enabled)?;
@@ -38,6 +42,7 @@ impl PhysicalWriterFactory {
             output_file_info,
             schema: file_schema,
             writer_type,
+            local_write_buffer_size_bytes,
         })
     }
 
@@ -132,6 +137,7 @@ impl WriterFactory for PhysicalWriterFactory {
                 self.output_file_info.compression.as_deref(),
                 self.output_file_info.single_file,
                 self.output_file_info.write_mode,
+                self.local_write_buffer_size_bytes,
             ),
             WriterType::Pyarrow => create_pyarrow_file_writer(
                 &self.output_file_info.root_dir,
@@ -203,6 +209,7 @@ fn create_native_writer(
     compression: Option<&str>,
     single_file: bool,
     write_mode: WriteMode,
+    local_write_buffer_size_bytes: NonZeroUsize,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Option<RecordBatch>>>> {
     let (path, io_config) = parse_url_and_config(root_dir, io_config)?;
     let root_dir = path.as_str();
@@ -223,6 +230,7 @@ fn create_native_writer(
                 parquet_option.compression_level,
                 single_file,
                 single_file && matches!(write_mode, WriteMode::Overwrite),
+                local_write_buffer_size_bytes,
             )
         }
         FileFormat::Json => {
@@ -232,7 +240,14 @@ fn create_native_writer(
                 ));
             }
             let json_option = format_option.map(|opt| opt.to_json()).unwrap_or_default();
-            create_native_json_writer(root_dir, file_idx, partition_values, io_config, json_option)
+            create_native_json_writer(
+                root_dir,
+                file_idx,
+                partition_values,
+                io_config,
+                json_option,
+                local_write_buffer_size_bytes,
+            )
         }
         FileFormat::Csv => {
             if single_file {
@@ -241,7 +256,14 @@ fn create_native_writer(
                 ));
             }
             let csv_option = format_option.map(|opt| opt.to_csv()).unwrap_or_default();
-            create_native_csv_writer(root_dir, file_idx, partition_values, io_config, csv_option)
+            create_native_csv_writer(
+                root_dir,
+                file_idx,
+                partition_values,
+                io_config,
+                csv_option,
+                local_write_buffer_size_bytes,
+            )
         }
         _ => Err(DaftError::ComputeError(
             "Unsupported file format for native write".to_string(),

@@ -1460,8 +1460,12 @@ fn physical_plan_to_pipeline(
             context,
         }) => {
             let child_node = physical_plan_to_pipeline(input, cfg, ctx, input_senders)?;
-            let write_sink =
-                CommitWriteSink::new(data_schema.clone(), file_schema.clone(), file_info.clone());
+            let write_sink = CommitWriteSink::new(
+                data_schema.clone(),
+                file_schema.clone(),
+                file_info.clone(),
+                cfg.local_write_buffer_size_bytes,
+            );
             BlockingSinkNode::new(
                 Arc::new(write_sink),
                 child_node,
