@@ -276,14 +276,20 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRead for RetryReader<R> {
                     this.state = ReadState::Ready;
                 }
                 ReadState::Ready | ReadState::ReadPending => {
-                    // Reuse the caller's allocation, but publish progress only on success.
-                    let mut scratch = ReadBuf::new(buf.initialize_unfilled());
+                    // Let the reader initialize only the bytes it needs. In
+                    // particular, Take can pass an uninitialized view of an
+                    // already allocated IPC body on every poll.
+                    let filled = buf.filled().len();
                     this.state = ReadState::ReadPending;
-                    let result = ready!(Pin::new(&mut this.inner).poll_read(cx, &mut scratch));
+                    let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+                    let n = buf.filled().len() - filled;
+                    // Publish progress only on success, including when a
+                    // failed read appended bytes or an I/O is still pending.
+                    buf.set_filled(filled);
+                    let result = ready!(result);
                     this.state = ReadState::Ready;
                     match result {
                         Ok(()) => {
-                            let n = scratch.filled().len();
                             this.offset += n as u64;
                             buf.advance(n);
                             return Poll::Ready(Ok(()));
@@ -541,6 +547,9 @@ fn copy_io_error(error: &io::Error) -> io::Error {
 }
 
 #[cfg(test)]
+mod bench;
+
+#[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -624,6 +633,39 @@ mod tests {
         let mut tail = Vec::new();
         reader.read_to_end(&mut tail).await.unwrap();
         assert_eq!(tail, (10..32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn short_reads_only_initialize_the_bytes_they_return() {
+        let mut reader = reader(5, 0);
+        reader.inner.fail_calls.clear();
+        let mut storage = [std::mem::MaybeUninit::uninit(); 4096];
+        let mut buf = ReadBuf::uninit(&mut storage);
+        buf.put_slice(b"prefix");
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut reader).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), b"prefix\x00\x01\x02");
+        assert_eq!(buf.initialized().len(), buf.filled().len());
+        assert_eq!(reader.offset, 3);
+    }
+
+    #[test]
+    fn failed_reads_preserve_the_callers_filled_prefix() {
+        let mut reader = reader(5, 0);
+        reader.inner.fail_calls = vec![1];
+        let mut storage = [std::mem::MaybeUninit::uninit(); 32];
+        let mut buf = ReadBuf::uninit(&mut storage);
+        buf.put_slice(b"prefix");
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let Poll::Ready(Err(error)) = Pin::new(&mut reader).poll_read(&mut cx, &mut buf) else {
+            panic!("expected the injected EIO");
+        };
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(buf.filled(), b"prefix");
+        assert_eq!(reader.offset, 0);
     }
 
     #[tokio::test]
@@ -806,8 +848,8 @@ mod tests {
                     release_rx.recv().unwrap();
                 });
                 started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                let mut storage = [0; 8];
-                let mut buf = ReadBuf::new(&mut storage);
+                let mut storage = [std::mem::MaybeUninit::uninit(); 8];
+                let mut buf = ReadBuf::uninit(&mut storage);
                 let mut cx = Context::from_waker(std::task::Waker::noop());
                 let pending = Pin::new(&mut reader)
                     .poll_read(&mut cx, &mut buf)
@@ -815,6 +857,7 @@ mod tests {
                 release_tx.send(()).unwrap();
                 assert!(pending);
                 assert!(buf.filled().is_empty());
+                assert!(buf.initialized().is_empty());
 
                 let expected = if let Some(seek) = seek {
                     reader.seek(seek).await.unwrap()
