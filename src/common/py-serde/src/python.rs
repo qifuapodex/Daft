@@ -202,9 +202,10 @@ impl<H: Hasher> Write for HashWriter<'_, H> {
 /// Use for intentionally incompatible positional bincode layouts. The factory
 /// name versions the pickle itself, before either side attempts binary decoding.
 /// This rejects legacy pickles; it is not a migration or rolling-upgrade protocol.
+/// Retired factories only report incompatibility; they must never decode bytes.
 #[macro_export]
 macro_rules! impl_versioned_bincode_py_state_serialization {
-    ($ty:ty, $factory:ident) => {
+    ($ty:ty, $factory:ident $(, incompatible = [$($retired_factory:ident),* $(,)?])?) => {
         #[cfg(feature = "python")]
         #[pymethods]
         impl $ty {
@@ -234,6 +235,17 @@ macro_rules! impl_versioned_bincode_py_state_serialization {
                     "Use identical Daft builds on driver and workers; recreate persisted configs/plans with this build."
                 )))
             }
+
+            $($(
+                #[staticmethod]
+                pub fn $retired_factory(_serialized: &[u8]) -> PyResult<Self> {
+                    Err(pyo3::exceptions::PyValueError::new_err(concat!(
+                        stringify!($ty), " pickle format ", stringify!($retired_factory),
+                        " is incompatible with this Daft build (expected ", stringify!($factory), "). ",
+                        "Use identical Daft builds on driver and workers; recreate persisted configs/plans with this build."
+                    )))
+                }
+            )*)?
         }
     };
 }

@@ -226,7 +226,8 @@ def test_shuffle_pickle_rejects_legacy_and_malformed_payloads(class_name):
     cls = getattr(native, class_name)
     if class_name in ("PyDaftExecutionConfig", "DistributedPhysicalPlan"):
         # Plans embed the execution config and must reject its old positional layout too.
-        assert not hasattr(cls, "_from_serialized_shuffle_aqe_v1")
+        with pytest.raises(ValueError, match="pickle format _from_serialized_shuffle_aqe_v1 is incompatible"):
+            cls._from_serialized_shuffle_aqe_v1(b"old positional payload")
         assert not hasattr(cls, "_from_serialized_shuffle_eio_v1")
     with pytest.raises(ValueError, match="Legacy .* pickle is incompatible"):
         cls._from_serialized(b"old positional payload")
