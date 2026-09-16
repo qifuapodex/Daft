@@ -169,7 +169,7 @@ impl Field {
                 .clone()
                 .into_iter()
                 .chain(meta)
-                .collect(),
+                .collect::<arrow_schema::Metadata>(),
         ))
     }
 

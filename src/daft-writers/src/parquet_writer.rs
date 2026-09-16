@@ -13,11 +13,12 @@ use daft_core::prelude::*;
 use daft_io::{IOConfig, SourceType, parse_url, utils::ObjectPath};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
-#[allow(deprecated)]
 use parquet::{
     arrow::{
         ArrowSchemaConverter, add_encoded_arrow_schema_to_metadata,
-        arrow_writer::{ArrowColumnChunk, ArrowLeafColumn, compute_leaves, get_column_writers},
+        arrow_writer::{
+            ArrowColumnChunk, ArrowLeafColumn, ArrowRowGroupWriterFactory, compute_leaves,
+        },
     },
     basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel},
     file::{
@@ -66,6 +67,14 @@ pub(crate) fn parse_compression(s: &str, level: Option<i32>) -> DaftResult<Compr
         "lz4" => Ok(Compression::LZ4),
         "lz4_raw" => Ok(Compression::LZ4_RAW),
         "zstd" => Ok(Compression::ZSTD(match level {
+            // Arrow 60 accepts ZSTD's non-positive fast levels as well. Keep
+            // Daft's existing 1..=22 API contract for both native and PyArrow
+            // writers when upgrading the underlying codec implementation.
+            Some(l) if !(1..=22).contains(&l) => {
+                return Err(DaftError::ValueError(format!(
+                    "invalid compression level {l} for parquet codec zstd: valid range is 1..=22"
+                )));
+            }
             Some(l) => ZstdLevel::try_new(l).map_err(level_err)?,
             None => ZstdLevel::default(),
         })),
@@ -358,13 +367,14 @@ impl<B: StorageBackend> ParquetWriter<B> {
         record_batches: &[RecordBatch],
     ) -> DaftResult<VecDeque<Pin<Box<ColumnWriterFuture>>>> {
         // Get leaf column writers. For example, a struct<int, int> column produces two leaf column writers.
-        #[allow(deprecated)]
-        let column_writers = get_column_writers(
-            &self.parquet_schema,
-            &self.writer_properties,
-            &self.arrow_schema,
-        )
-        .map_err(|e| DaftError::ParquetError(e.to_string()))?;
+        let file_writer = self
+            .file_writer
+            .as_ref()
+            .expect("writer initialized before encoding");
+        let column_writers =
+            ArrowRowGroupWriterFactory::new(file_writer, self.arrow_schema.clone())
+                .create_column_writers(file_writer.flushed_row_groups().len())
+                .map_err(|e| DaftError::ParquetError(e.to_string()))?;
 
         // Flatten record batches into per-leaf-column Arrow data chunks.
         let leaf_columns =
@@ -406,6 +416,9 @@ impl<B: StorageBackend> AsyncFileWriter for ParquetWriter<B> {
         }
         let num_rows = data.len();
         let record_batches = data.record_batches();
+        // The factory reads the file's schema, properties and next row-group
+        // index before the file writer is moved to the blocking I/O task.
+        let mut pending_column_writers = self.build_column_writer_futures(record_batches)?;
 
         let row_group_writer_thread_handle = {
             // Wait for the workers to complete encoding, and append the resulting column chunks to the row group and the file.
@@ -433,8 +446,6 @@ impl<B: StorageBackend> AsyncFileWriter for ParquetWriter<B> {
 
                     Ok(file_writer)
                 });
-
-            let mut pending_column_writers = self.build_column_writer_futures(record_batches)?;
 
             // Spawn up to NUM_CPU workers to handle the column writes.
             let initial_spawn_count =

@@ -76,11 +76,10 @@ fn build_primitive_leaf_reader(
     let total_rows = rg.num_rows() as usize;
 
     // Page locations come from the offset index when present.
-    let page_locations = metadata.offset_index().and_then(|oi| {
-        oi.get(rg_idx)
-            .and_then(|cols| cols.get(leaf_idx))
-            .map(|loc| loc.page_locations.clone())
-    });
+    let page_locations = metadata
+        .page_index()
+        .and_then(|index| index.offset_index(rg_idx, leaf_idx))
+        .map(|index| index.page_locations.clone());
 
     let page_reader =
         SerializedPageReader::new(Arc::new(chunk_bytes), col_chunk, total_rows, page_locations)?;
