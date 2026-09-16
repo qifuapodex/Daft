@@ -24,6 +24,10 @@ pub struct DaftParquetMetadata {
     inner: Arc<ParquetMetaData>,
     /// Maps position `i` in `inner.row_groups()` → original row group index in the file.
     original_indices: Vec<usize>,
+    // Keep the original file footer shared across in-process task splits. The
+    // filtered `inner` cannot be addressed with original file RG indices.
+    // This transient cache is deliberately omitted from the existing serde tuple.
+    full_file_metadata: Option<Arc<ParquetMetaData>>,
 }
 
 impl DaftParquetMetadata {
@@ -31,6 +35,7 @@ impl DaftParquetMetadata {
     pub fn from_arrowrs(metadata: Arc<ParquetMetaData>) -> Self {
         let n = metadata.row_groups().len();
         Self {
+            full_file_metadata: Some(metadata.clone()),
             inner: metadata,
             original_indices: (0..n).collect(),
         }
@@ -79,12 +84,20 @@ impl DaftParquetMetadata {
         Self {
             inner: Arc::new(ParquetMetaData::new(new_file_metadata, rgs)),
             original_indices: indices,
+            full_file_metadata: self.full_file_metadata.clone(),
         }
     }
 
     /// Access the underlying arrow-rs `ParquetMetaData`.
     pub fn as_arrowrs(&self) -> &Arc<ParquetMetaData> {
         &self.inner
+    }
+
+    /// Original full-file footer for in-process reads, including after task
+    /// splitting. Absent after deserialization: a serialized subset alone cannot
+    /// recover full-file row offsets, so the reader must reload the footer.
+    pub fn full_file_metadata(&self) -> Option<&Arc<ParquetMetaData>> {
+        self.full_file_metadata.as_ref()
     }
 
     /// Convenience accessor for the parquet schema descriptor.
@@ -163,6 +176,7 @@ impl<'de> Deserialize<'de> for DaftParquetMetadata {
         Ok(Self {
             inner: Arc::new(metadata),
             original_indices,
+            full_file_metadata: None,
         })
     }
 }

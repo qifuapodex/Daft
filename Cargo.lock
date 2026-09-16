@@ -3491,6 +3491,7 @@ dependencies = [
  "serde",
  "snafu",
  "tango-bench",
+ "tempfile",
  "tokio",
  "tokio-stream",
 ]

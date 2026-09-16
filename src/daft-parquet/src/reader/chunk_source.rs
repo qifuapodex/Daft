@@ -4,10 +4,9 @@ use bytes::Bytes;
 use common_runtime::{RuntimeTask, get_io_runtime};
 use daft_dsl::optimization::get_required_columns;
 use parquet::{
-    arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
     errors::Result as ParquetResult,
     file::{
-        metadata::ParquetMetaData,
+        metadata::{ParquetMetaData, ParquetMetaDataReader},
         reader::{ChunkReader, Length},
     },
 };
@@ -67,7 +66,8 @@ async fn drive_group(slot: &GroupSlot, path: &str) -> GroupResult {
 
 pub(super) async fn open_local_file(
     path: &str,
-) -> crate::Result<(Arc<std::fs::File>, u64, ArrowReaderMetadata)> {
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+) -> crate::Result<(Arc<std::fs::File>, u64, Arc<ParquetMetaData>)> {
     let path_owned = path.to_string();
     let path_for_join = path.to_string();
     get_io_runtime(true)
@@ -83,12 +83,15 @@ pub(super) async fn open_local_file(
                     source: e,
                 })?
                 .len();
-            let meta =
-                ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).with_context(|_| {
-                    ParquetMetadataSnafu {
-                        path: path_owned.clone(),
-                    }
-                })?;
+            let meta = match cached_metadata {
+                Some(metadata) => Ok(metadata),
+                None => ParquetMetaDataReader::new()
+                    .parse_and_finish(&file)
+                    .map(Arc::new),
+            }
+            .with_context(|_| ParquetMetadataSnafu {
+                path: path_owned.clone(),
+            })?;
             crate::Result::Ok((Arc::new(file), file_len, meta))
         })
         .await
@@ -100,16 +103,25 @@ pub(super) async fn prepare_remote_chunk_source(
     io_client: Arc<daft_io::IOClient>,
     io_stats: Option<daft_io::IOStatsRef>,
     opts: &ParquetReadOptions,
-) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
+) -> crate::Result<(ChunkSourceBuilder, Arc<ParquetMetaData>)> {
+    let metadata_fut = async {
+        match opts.metadata.as_ref().and_then(|m| m.full_file_metadata()) {
+            Some(metadata) => Ok(metadata.clone()),
+            None => {
+                crate::metadata::read_parquet_metadata(
+                    uri,
+                    None,
+                    io_client.clone(),
+                    io_stats.clone(),
+                    None,
+                    None,
+                )
+                .await
+            }
+        }
+    };
     let (parquet_metadata_res, file_size_res) = Box::pin(futures::future::join(
-        crate::metadata::read_parquet_metadata(
-            uri,
-            None,
-            io_client.clone(),
-            io_stats.clone(),
-            None,
-            None,
-        ),
+        metadata_fut,
         io_client.single_url_get_size(uri.to_string(), io_stats.clone()),
     ))
     .await;
@@ -152,10 +164,6 @@ pub(super) async fn prepare_remote_chunk_source(
     };
 
     let path: Arc<str> = Arc::from(uri);
-    let meta = ArrowReaderMetadata::try_new(parquet_metadata, ArrowReaderOptions::new())
-        .with_context(|_| ParquetMetadataSnafu {
-            path: uri.to_string(),
-        })?;
     let builder = ChunkSourceBuilder::Remote(RemoteChunkSourcePrep {
         path,
         uri: uri.to_string(),
@@ -164,7 +172,7 @@ pub(super) async fn prepare_remote_chunk_source(
         io_client,
         io_stats,
     });
-    Ok((builder, meta))
+    Ok((builder, parquet_metadata))
 }
 
 #[derive(Copy, Clone)]

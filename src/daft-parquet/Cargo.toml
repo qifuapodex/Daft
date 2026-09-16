@@ -29,6 +29,7 @@ fastrand = "2.1.0"
 parquet = {workspace = true}
 path_macro = {workspace = true}
 tango-bench.workspace = true
+tempfile = "3.23.0"
 
 [features]
 python = [
