@@ -1,5 +1,6 @@
 mod chunk_source;
 mod field_reader;
+mod page_ranges;
 mod rg_processor;
 mod util;
 
@@ -584,7 +585,7 @@ pub async fn stream_parquet(
     let path = cs_builder.path().clone();
 
     let chunk_size = opts.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
-    let prepared = prepare_metadata(
+    let mut prepared = prepare_metadata(
         parquet_metadata,
         opts.field_id_mapping.as_ref(),
         opts.schema_infer,
@@ -623,8 +624,37 @@ pub async fn stream_parquet(
         );
     }
 
-    // Now spawn the byte-range fetches (remote) — pruned set only.
-    let chunk_source = Arc::new(cs_builder.build(prepared.parquet_metadata.clone(), &rg_indices));
+    let selection_possible = opts.start_offset.is_some_and(|offset| offset > 0)
+        || opts
+            .delete_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.is_empty())
+        || (opts.predicate.is_none()
+            && opts.num_rows.is_some_and(|rows| {
+                rows < prepared.parquet_metadata.file_metadata().num_rows() as usize
+            }))
+        || (plan.predicate_pushed && !plan.data_col_indices.is_empty());
+    let use_page_selection = selection_possible
+        && rg_indices.iter().any(|&rg| {
+            prepared
+                .parquet_metadata
+                .row_group(rg)
+                .columns()
+                .iter()
+                .any(|column| column.offset_index_offset().is_some())
+        });
+    if use_page_selection {
+        prepared.parquet_metadata = cs_builder
+            .load_offset_indexes(prepared.parquet_metadata)
+            .await?;
+    }
+    // Full remote scans retain eager/coalesced I/O. Selective scans defer data
+    // column requests until predicate decoding produces their RowSelection.
+    let chunk_source = Arc::new(cs_builder.build(
+        prepared.parquet_metadata.clone(),
+        &rg_indices,
+        use_page_selection,
+    ));
 
     let rg_inputs = build_rg_inputs(
         &chunk_source,

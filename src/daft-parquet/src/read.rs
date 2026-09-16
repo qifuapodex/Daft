@@ -646,6 +646,75 @@ mod tests {
     const PARQUET_FILE_LOCAL: &str = "tests/assets/parquet-data/mvp.parquet";
 
     #[test]
+    fn test_page_reads_with_field_id_projection() {
+        use arrow::{array::Int64Array as ArrowInt64Array, datatypes::Schema as ArrowSchema};
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let fields = [("discarded", 1), ("original", 2)].map(|(name, id)| {
+            arrow::datatypes::Field::new(name, DataType::Int64, false).with_metadata(
+                std::collections::HashMap::from([("PARQUET:field_id".to_string(), id.to_string())]),
+            )
+        });
+        let schema = Arc::new(ArrowSchema::new(fields.to_vec()));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        writer
+            .write(
+                &arrow::array::RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(ArrowInt64Array::from_iter_values(0..30)),
+                        Arc::new(ArrowInt64Array::from_iter_values(1000..1030)),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+        let uri = file.path().to_str().unwrap().to_owned();
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        get_io_runtime(true)
+            .block_within_async_context(async move {
+                let metadata = Arc::new(
+                    read_parquet_metadata(&uri, io_client.clone(), None, None)
+                        .await
+                        .unwrap(),
+                );
+                for cached in [None, Some(metadata)] {
+                    let opts = ParquetReadOptions {
+                        metadata: cached,
+                        field_id_mapping: Some(Arc::new(BTreeMap::from([(
+                            2,
+                            Field::new("renamed", daft_core::prelude::DataType::Int64),
+                        )]))),
+                        columns: Some(vec!["renamed".into()]),
+                        start_offset: Some(3),
+                        num_rows: Some(10),
+                        ..Default::default()
+                    };
+                    let rb = read_parquet_into_recordbatch(&uri, io_client.clone(), None, opts)
+                        .await
+                        .unwrap();
+                    let array = rb.get_inner_arrow_arrays().next().unwrap();
+                    let actual = array
+                        .as_any()
+                        .downcast_ref::<ArrowInt64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec();
+                    assert_eq!(actual, (1003..1013).collect::<Vec<_>>());
+                }
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn test_cached_split_metadata_preserves_file_row_indices() {
         use arrow::{array::Int64Array as ArrowInt64Array, datatypes::Schema as ArrowSchema};
         use parquet::{

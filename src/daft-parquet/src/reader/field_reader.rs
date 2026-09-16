@@ -19,7 +19,7 @@ use parquet::{
 };
 use snafu::ResultExt;
 
-use super::chunk_source::OffsetBytes;
+use super::{chunk_source::OffsetBytes, page_ranges::validate_page_locations};
 use crate::ParquetColumnDecodeSnafu;
 
 struct SinglePageIter {
@@ -76,10 +76,29 @@ fn build_primitive_leaf_reader(
     let total_rows = rg.num_rows() as usize;
 
     // Page locations come from the offset index when present.
-    let page_locations = metadata
-        .page_index()
-        .and_then(|index| index.offset_index(rg_idx, leaf_idx))
-        .map(|index| index.page_locations.clone());
+    let page_locations = if rep_level == 0 {
+        metadata
+            .page_index()
+            .and_then(|index| index.offset_index(rg_idx, leaf_idx))
+            .map(|index| -> ParquetResult<_> {
+                let (start, len) = col_chunk.byte_range();
+                let end = start
+                    .checked_add(len)
+                    .ok_or_else(|| ParquetError::General("Parquet column range overflow".into()))?;
+                validate_page_locations(
+                    &index.page_locations,
+                    start..end,
+                    col_chunk.data_page_offset(),
+                    total_rows,
+                )?;
+                Ok(index.page_locations.clone())
+            })
+            .transpose()?
+    } else {
+        // Repeated rows can cross page boundaries. Keep their established
+        // sequential page reader along with whole-column I/O.
+        None
+    };
 
     let page_reader =
         SerializedPageReader::new(Arc::new(chunk_bytes), col_chunk, total_rows, page_locations)?;
@@ -785,6 +804,12 @@ pub(super) async fn decode_one_streaming(
     path: Arc<str>,
     sender: tokio::sync::mpsc::Sender<common_error::DaftResult<ArrayRef>>,
 ) {
+    if selection
+        .as_ref()
+        .is_some_and(|selection| selection.row_count() == 0)
+    {
+        return;
+    }
     let result: ParquetResult<()> = async {
         let (mut reader, total_rows) = build_top_field_reader(
             chunks.as_ref(),
