@@ -41,6 +41,9 @@ async def consume(
         async def try_finish(self) -> SimpleNamespace:
             return SimpleNamespace(encode=lambda: b"test-stats")
 
+        def cancel(self) -> None:
+            pass
+
     async def execute(*args: Any) -> Handle:
         return Handle()
 
