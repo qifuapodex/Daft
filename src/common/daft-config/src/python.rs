@@ -806,7 +806,8 @@ impl PyDaftExecutionConfig {
 
 common_py_serde::impl_versioned_bincode_py_state_serialization!(
     PyDaftExecutionConfig,
-    _from_serialized_shuffle_eio_v2
+    _from_serialized_shuffle_eio_v2,
+    incompatible = [_from_serialized_shuffle_aqe_v1]
 );
 
 #[derive(Clone, Default, Serialize, Deserialize)]
