@@ -60,13 +60,20 @@ jobs:
             output.write(f"run_id={run_id}\nsha={run['head_sha']}\n")
         PY
     - name: Publish release notes first
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ env.RELEASE_TAG }}
-        name: ${{ env.PACKAGE_VERSION }}
-        target_commitish: ${{ steps.source.outputs.sha }}
-        body_path: .github/release-notes/${{ env.RELEASE_TAG }}.md
-        make_latest: true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
+        PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.7' }}
+      run: |
+        # The tag already identifies the build. Do not rewrite target_commitish
+        # when updating an existing release with a workflow-scoped token.
+        if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          gh release edit "$RELEASE_TAG" --title "$PACKAGE_VERSION" \
+            --notes-file ".github/release-notes/$RELEASE_TAG.md" --latest
+        else
+          gh release create "$RELEASE_TAG" --verify-tag --title "$PACKAGE_VERSION" \
+            --notes-file ".github/release-notes/$RELEASE_TAG.md" --latest
+        fi
     - name: Upload each platform when available
       env:
         BUILD_RUN_ID: ${{ steps.source.outputs.run_id }}

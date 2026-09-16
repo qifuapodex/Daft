@@ -48,13 +48,21 @@ jobs:
       contents: write
     steps:
     - uses: actions/checkout@v7
-    - uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
-        name: ${{ inputs.package_version || '0.7.24+apodex.7' }}
-        target_commitish: ${{ github.sha }}
-        body_path: .github/release-notes/${{ inputs.tag_name || 'apodex-0.7.24.7' }}.md
-        make_latest: true
+    - name: Publish release notes first
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
+        PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.7' }}
+      run: |
+        # The tag already identifies the build. Do not rewrite target_commitish
+        # when updating an existing release with a workflow-scoped token.
+        if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          gh release edit "$RELEASE_TAG" --title "$PACKAGE_VERSION" \
+            --notes-file ".github/release-notes/$RELEASE_TAG.md" --latest
+        else
+          gh release create "$RELEASE_TAG" --verify-tag --title "$PACKAGE_VERSION" \
+            --notes-file ".github/release-notes/$RELEASE_TAG.md" --latest
+        fi
 
   build:
     needs: release-notes
