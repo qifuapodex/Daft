@@ -131,49 +131,54 @@ def test_is_done_transitions():
 
 
 @pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="requires Ray Runner to be in use")
-def test_distributed_limit_retries_after_worker_death(tmp_path):
+@pytest.mark.parametrize("start", [0, 1])
+def test_distributed_limit_retries_after_worker_death(tmp_path, start):
     """`.limit(N)` must still produce N rows when a SwordfishTask crashes mid-claim.
 
     Without the rewind in `_LimitCounterImpl.start_task`, the failed attempt's
     claim stays charged against the global budget while its slice never reaches
     downstream — the retry then sees a smaller budget and the output undercounts.
     """
+    import json
     import os
 
+    # On a multi-node cluster, use --basetemp on a filesystem shared by the
+    # driver and all workers so they contend for the same one-shot marker.
     marker = str(tmp_path / "crashed_once")
 
-    @func(return_dtype=DataType.int64(), cpus=os.cpu_count())
-    def crash_once_on_zero(v: int) -> int:
-        import os
+    @func(return_dtype=DataType.int64())
+    def crash_once(v: int) -> int:
+        # LIMIT is unordered: crash the first invocation that gets any row.
+        # Exclusive creation ensures concurrent invocations kill one worker.
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return v
+        with os.fdopen(fd, "w") as f:
+            json.dump({"node": ray.get_runtime_context().get_node_id(), "pid": os.getpid(), "value": v}, f)
+        # Hard-exit the swordfish actor process after closing the marker.
+        # Ray surfaces ActorDiedError; flotilla replaces the worker and retries
+        # the failed task. DistributedLimitSink then calls start_task(input_id)
+        # to refund the crashed attempt's claim before claiming again.
+        os._exit(1)
 
-        if v == 0 and not os.path.exists(marker):
-            with open(marker, "w") as f:
-                f.write("crashed")
-            # Hard-exit the swordfish actor process. Ray surfaces this as
-            # ActorDiedError → RayTaskResult.worker_died() → dispatcher marks
-            # WorkerDied. flotilla's RayWorkerManager.refresh_workers loop
-            # then spawns a fresh actor on this node within ~5s, onto which
-            # the failed task is re-dispatched. The retry's
-            # DistributedLimitSink calls start_task(input_id), which refunds
-            # the crashed attempt's prior claim before claiming again.
-            os._exit(1)
-        return v
-
-    df = daft.range(0, 15, partitions=15).limit(3).select(crash_once_on_zero(col("id")))
-    result = df.to_pydict()
-
-    import os
+    # The nonzero start deterministically guards against a value-specific
+    # crash condition, even when local scheduling happens to pick row 0 first.
+    df = daft.range(start, start + 15, partitions=15).limit(3).select(crash_once(col("id")))
+    result = df.to_pydict()["id"]
 
     assert os.path.exists(marker), "UDF never crashed — retry path not exercised"
-    # Single-CPU serialization makes contributor order deterministic: task 0
-    # retries and finishes first, then tasks 1 and 2 run in sequence. Without
-    # rewind in start_task, the crashed task's row would be missing
-    # (e.g. [1, 2] instead of [0, 1, 2]).
-    assert result["id"] == [0, 1, 2], (
-        f"expected [0, 1, 2] after retry, got {result['id']}. "
-        "If 0 is missing, the limit actor failed to rewind the crashed "
-        "task's claim in start_task."
-    )
+    with open(marker) as f:
+        fault = json.load(f)
+    assert fault["node"] and fault["pid"] > 0, fault
+    assert fault["value"] in range(start, start + 15), fault
+    # A distributed, unordered LIMIT promises cardinality, not particular rows
+    # or contributor order. Missing claim refunds would undercount the output.
+    assert len(result) == len(set(result)) == 3, (fault, result)
+    assert set(result) <= set(range(start, start + 15)), (fault, result)
+
+    # A separate query must still run after the worker has been replaced.
+    assert daft.from_pydict({"x": [1, 2, 3]}).agg(col("x").sum()).to_pydict() == {"x": [6]}
 
 
 def test_claim_signals_done_event():
