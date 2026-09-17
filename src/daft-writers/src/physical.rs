@@ -182,6 +182,7 @@ pub fn create_pyarrow_file_writer(
                 partition,
                 parquet_option.column_compression.as_deref(),
                 parquet_option.compression_level,
+                parquet_option.data_page_version,
             )?))
         }
         #[cfg(feature = "python")]
@@ -228,6 +229,7 @@ fn create_native_writer(
                 compression,
                 parquet_option.column_compression.as_deref(),
                 parquet_option.compression_level,
+                parquet_option.data_page_version,
                 single_file,
                 single_file && matches!(write_mode, WriteMode::Overwrite),
                 local_write_buffer_size_bytes,

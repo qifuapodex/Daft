@@ -12,6 +12,10 @@ from daft.context import get_context
 from daft.daft import DistributedPhysicalPlan, PyDaftExecutionConfig
 
 
+def expected_factory(kind):
+    return "_from_serialized_local_write_buffer_v3" if kind == "config" else "_from_serialized_parquet_data_page_v4"
+
+
 @pytest.mark.parametrize("kind", ["config", "plan"])
 @pytest.mark.parametrize("version", ["0.7.24+apodex.6", "0.7.24+apodex.7"])
 def test_previous_pickle_reports_incompatible_format(kind, version):
@@ -19,7 +23,7 @@ def test_previous_pickle_reports_incompatible_format(kind, version):
     with pytest.raises(ValueError, match=f"pickle format {fixture['factory']} is incompatible") as exc:
         pickle.loads(base64.b64decode(fixture["payload"]))
     message = str(exc.value)
-    assert "expected _from_serialized_local_write_buffer_v3" in message
+    assert f"expected {expected_factory(kind)}" in message
     assert "Use identical Daft builds on driver and workers" in message
     assert "recreate persisted configs/plans with this build" in message
 
@@ -45,7 +49,8 @@ def versioned_object(request):
 
 def test_current_pickle_roundtrip(versioned_object):
     factory, (payload,) = versioned_object.__reduce__()
-    assert factory.__name__ == "_from_serialized_local_write_buffer_v3"
+    kind = "config" if isinstance(versioned_object, PyDaftExecutionConfig) else "plan"
+    assert factory.__name__ == expected_factory(kind)
     restored = pickle.loads(pickle.dumps(versioned_object))
     assert restored.__reduce__()[1] == (payload,)
     if isinstance(restored, PyDaftExecutionConfig):
@@ -74,3 +79,22 @@ def test_retired_factory_never_decodes_payload(versioned_object, payload_kind, f
 def test_unversioned_factory_remains_rejected(versioned_object):
     with pytest.raises(ValueError, match="Legacy .* pickle is incompatible"):
         type(versioned_object)._from_serialized(versioned_object.__reduce__()[1][0])
+
+
+def test_arrow60_v3_execution_config_remains_compatible():
+    fixture = json.loads((Path(__file__).parent / "assets/pickle/arrow60-v3-config.json").read_text())
+    payload = base64.b64decode(fixture["payload"])
+    restored = pickle.loads(payload)
+    assert isinstance(restored, PyDaftExecutionConfig)
+    assert restored.__reduce__()[0].__name__ == fixture["factory"]
+    assert pickle.dumps(restored) == payload
+
+
+def test_arrow60_v3_write_plan_is_rejected_before_decoding():
+    fixture = json.loads((Path(__file__).parent / "assets/pickle/arrow60-v3-plan.json").read_text())
+    with pytest.raises(ValueError, match="expected _from_serialized_parquet_data_page_v4"):
+        pickle.loads(base64.b64decode(fixture["payload"]))
+    # Retired factory must also refuse current or malformed bytes.
+    for payload in [b"", b"invalid"]:
+        with pytest.raises(ValueError, match="pickle format _from_serialized_local_write_buffer_v3 is incompatible"):
+            DistributedPhysicalPlan._from_serialized_local_write_buffer_v3(payload)

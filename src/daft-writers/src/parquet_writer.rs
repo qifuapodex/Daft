@@ -11,6 +11,7 @@ use common_error::{DaftError, DaftResult};
 use common_runtime::{get_compute_pool_num_threads, get_compute_runtime, get_io_runtime};
 use daft_core::prelude::*;
 use daft_io::{IOConfig, SourceType, parse_url, utils::ObjectPath};
+use daft_logical_plan::sink_info::ParquetDataPageVersion;
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 use parquet::{
@@ -149,10 +150,18 @@ fn native_parquet_writer_properties(
     arrow_schema: &arrow_schema::Schema,
     default_compression: Compression,
     column_compression: &[(String, Compression)],
+    data_page_version: ParquetDataPageVersion,
 ) -> WriterProperties {
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_1_0)
         .set_compression(default_compression);
+    if data_page_version == ParquetDataPageVersion::V2 {
+        // WriterVersion also changes parquet-rs's default value encodings.
+        // Select V2 pages while retaining V1's PLAIN fallback and dictionary policy.
+        builder = builder
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_encoding(parquet::basic::Encoding::PLAIN);
+    }
     for (path, compression) in column_compression {
         let parts: Vec<String> = path.split('.').map(str::to_string).collect();
         builder = builder.set_column_compression(ColumnPath::new(parts), *compression);
@@ -177,8 +186,12 @@ pub(crate) fn native_parquet_writer_supported(
     };
 
     // Schema convertibility is independent of the chosen compression, so use defaults here.
-    let writer_properties =
-        native_parquet_writer_properties(&arrow_schema, Compression::SNAPPY, &[]);
+    let writer_properties = native_parquet_writer_properties(
+        &arrow_schema,
+        Compression::SNAPPY,
+        &[],
+        ParquetDataPageVersion::V1,
+    );
     Ok(ArrowSchemaConverter::new()
         .with_coerce_types(writer_properties.coerce_types())
         .convert(&arrow_schema)
@@ -195,6 +208,7 @@ pub(crate) fn create_native_parquet_writer(
     compression: Option<&str>,
     column_compression: Option<&[(String, String)]>,
     compression_level: Option<i32>,
+    data_page_version: ParquetDataPageVersion,
     single_file: bool,
     overwrite_single_file_target: bool,
     local_write_buffer_size_bytes: std::num::NonZeroUsize,
@@ -223,6 +237,7 @@ pub(crate) fn create_native_parquet_writer(
         &arrow_schema,
         default_compression,
         &parsed_column_compression,
+        data_page_version,
     );
 
     let parquet_schema = ArrowSchemaConverter::new()
@@ -561,6 +576,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn data_page_version_preserves_encodings_and_writes_requested_page_type() {
+        use arrow_array::{Int64Array, StringArray};
+        use parquet::{basic::Encoding, column::page::Page};
+
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))
+                    as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                "value",
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None]))
+                    as Arc<dyn arrow_array::Array>,
+            ),
+        ])
+        .unwrap();
+        for version in [ParquetDataPageVersion::V1, ParquetDataPageVersion::V2] {
+            for compression in [
+                Compression::UNCOMPRESSED,
+                Compression::SNAPPY,
+                Compression::ZSTD(Default::default()),
+            ] {
+                let props =
+                    native_parquet_writer_properties(&batch.schema(), compression, &[], version);
+                for name in ["id", "value"] {
+                    let path = ColumnPath::from(name);
+                    assert!(props.dictionary_enabled(&path));
+                    if version == ParquetDataPageVersion::V2 {
+                        assert_eq!(props.encoding(&path), Some(Encoding::PLAIN));
+                    }
+                }
+                let mut output = Vec::new();
+                let mut writer =
+                    ArrowWriter::try_new(&mut output, batch.schema(), Some(props)).unwrap();
+                writer.write(&batch).unwrap();
+                writer.close().unwrap();
+                let reader = SerializedFileReader::new(Bytes::from(output)).unwrap();
+                let row_group = reader.get_row_group(0).unwrap();
+                for column in 0..2 {
+                    let mut count = 0;
+                    for page in row_group.get_column_page_reader(column).unwrap() {
+                        match page.unwrap() {
+                            Page::DataPage { .. } => {
+                                assert_eq!(version, ParquetDataPageVersion::V1);
+                                count += 1;
+                            }
+                            Page::DataPageV2 { .. } => {
+                                assert_eq!(version, ParquetDataPageVersion::V2);
+                                count += 1;
+                            }
+                            Page::DictionaryPage { .. } => {}
+                        }
+                    }
+                    assert!(count > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_parquet_writer_properties_embeds_arrow_schema_metadata() {
         let daft_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Uuid)]));
         assert!(native_parquet_writer_supported("file:///tmp", &daft_schema).unwrap());
@@ -573,7 +649,12 @@ mod tests {
                 .is_some_and(|n| n == "arrow.uuid")
         );
 
-        let props = native_parquet_writer_properties(&arrow_schema, Compression::SNAPPY, &[]);
+        let props = native_parquet_writer_properties(
+            &arrow_schema,
+            Compression::SNAPPY,
+            &[],
+            ParquetDataPageVersion::V1,
+        );
         let kv = props
             .key_value_metadata()
             .expect("expected key_value_metadata");
@@ -671,7 +752,12 @@ mod tests {
                 "unexpected error for {codec}/{level}: {err}"
             );
             assert!(
-                err.contains("valid compression range"),
+                err.contains(if codec == "zstd" {
+                    // Daft keeps the 1..=22 contract after Arrow 60 added fast levels.
+                    "valid range is 1..=22"
+                } else {
+                    "valid compression range"
+                }),
                 "error should carry the valid range: {err}"
             );
         }
@@ -756,6 +842,7 @@ mod tests {
             &arrow_schema,
             Compression::ZSTD(Default::default()),
             &overrides,
+            ParquetDataPageVersion::V1,
         );
 
         assert_eq!(
@@ -779,7 +866,12 @@ mod tests {
         let overrides = vec![("a".to_string(), "snappy".to_string())];
         let (default, columns) =
             resolve_parquet_compression(Some("zstd"), Some(&overrides), Some(19)).unwrap();
-        let props = native_parquet_writer_properties(&arrow_schema, default, &columns);
+        let props = native_parquet_writer_properties(
+            &arrow_schema,
+            default,
+            &columns,
+            ParquetDataPageVersion::V1,
+        );
 
         assert_eq!(
             props.compression(&ColumnPath::from("a")),
@@ -800,7 +892,12 @@ mod tests {
             .extension_type_name()
             .map(str::to_string);
 
-        let props = native_parquet_writer_properties(&arrow_schema, Compression::SNAPPY, &[]);
+        let props = native_parquet_writer_properties(
+            &arrow_schema,
+            Compression::SNAPPY,
+            &[],
+            ParquetDataPageVersion::V1,
+        );
         let mut buffer = Vec::new();
         {
             let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema.clone(), Some(props))
