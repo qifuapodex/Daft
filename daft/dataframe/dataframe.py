@@ -1026,6 +1026,7 @@ class DataFrame:
         column_compression: dict[str, str] | None = None,
         single_file: bool = False,
         compression_level: int | None = None,
+        data_page_version: Literal["1.0", "2.0"] = "1.0",
     ) -> "DataFrame":
         """Writes the DataFrame as parquet files, returning a new DataFrame with paths to the files that were written.
 
@@ -1041,6 +1042,7 @@ class DataFrame:
             column_compression (Optional[Dict[str, str]], optional): per-column compression overrides. Keys are dot-separated column paths (e.g. `"user.name"` for a nested struct field); values are codec names accepted by `compression`. Columns not listed fall back to `compression`. Defaults to None.
             single_file (bool, optional): If True, coalesce all data into a single parquet file at `root_dir` (treated as the exact file path). Cannot be combined with `partition_cols` or `overwrite-partitions`. Only supported on the native runner. Defaults to False.
             compression_level (Optional[int], optional): compression level for codecs that support one: "zstd" (1-22, default 1), "gzip" (0-9, default 6) and "brotli" (0-11, default 1). The level applies to every such codec in use, whether it comes from `compression` or from a `column_compression` override; codecs without levels ("snappy", "lz4", "lz4_raw", "none") are unaffected. Raises if no codec in use supports a level. Defaults to None, which uses each codec's default level.
+            data_page_version (str, optional): Parquet data page format, "1.0" (default) or "2.0". V2 can reduce copying during compressed native writes and requires a reader that supports Data Page V2. Both native and PyArrow writers honor this option. It preserves dictionary encoding and the existing fallback encoding policy; it does not select new logical types or DELTA encodings. File bytes and size may change while logical data is preserved. Native V2 may retain substantially larger compression buffers until a column chunk is written, especially for highly compressible data; evaluate memory usage with the intended row group size and concurrency.
 
         Returns:
             DataFrame: The filenames that were written out as strings.
@@ -1054,11 +1056,14 @@ class DataFrame:
             >>> df.write_parquet("output_dir", write_mode="overwrite")  # doctest: +SKIP
             >>> df.write_parquet("output.parquet", single_file=True)  # doctest: +SKIP
             >>> df.write_parquet("output_dir", compression="zstd", compression_level=6)  # doctest: +SKIP
+            >>> df.write_parquet("output_dir", compression="zstd", data_page_version="2.0")  # doctest: +SKIP
 
         Tip:
             See also [`df.write_csv()`][daft.DataFrame.write_csv] and [`df.write_json()`][daft.DataFrame.write_json]
             Other formats for writing DataFrames
         """
+        if data_page_version not in ("1.0", "2.0"):
+            raise ValueError("data_page_version must be '1.0' or '2.0'")
         if write_mode not in ["append", "overwrite", "overwrite-partitions"]:
             raise ValueError(
                 f"Only support `append`, `overwrite`, or `overwrite-partitions` mode. {write_mode} is unsupported"
@@ -1081,10 +1086,11 @@ class DataFrame:
             cols = column_inputs_to_expressions(tuple(partition_cols))
 
         file_format_option: PyFormatSinkOption | None = None
-        if column_compression or compression_level is not None:
+        if column_compression or compression_level is not None or data_page_version != "1.0":
             file_format_option = PyFormatSinkOption.parquet(
                 column_compression=list(column_compression.items()) if column_compression else None,
                 compression_level=compression_level,
+                data_page_version=data_page_version,
             )
 
         builder = self._builder.write_tabular(

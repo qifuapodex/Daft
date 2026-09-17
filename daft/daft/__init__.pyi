@@ -2258,6 +2258,7 @@ class PyFormatSinkOption:
         cls,
         column_compression: list[tuple[str, str]] | None = None,
         compression_level: int | None = None,
+        data_page_version: str = "1.0",
     ) -> PyFormatSinkOption: ...
 
 class CheckpointStoreConfig:

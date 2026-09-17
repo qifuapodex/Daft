@@ -74,7 +74,12 @@ impl PyLocalPhysicalPlan {
     }
 }
 
-impl_bincode_py_state_serialization!(PyLocalPhysicalPlan);
+// OutputFile carries ParquetFormatOption, so local plans share the page-version
+// layout boundary with distributed plans. Reject old bytes before decoding.
+common_py_serde::impl_versioned_bincode_py_state_serialization!(
+    PyLocalPhysicalPlan,
+    _from_serialized_parquet_data_page_v4
+);
 
 #[pyclass(module = "daft.daft", name = "Input", frozen, from_py_object)]
 #[derive(Debug, Clone, Serialize, Deserialize)]

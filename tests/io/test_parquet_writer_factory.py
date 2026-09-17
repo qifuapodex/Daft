@@ -8,7 +8,8 @@ import daft
 
 
 @pytest.mark.parametrize("compression", ["uncompressed", "snappy", "zstd"])
-def test_native_writer_multiple_row_groups(tmp_path, compression):
+@pytest.mark.parametrize("data_page_version", ["1.0", "2.0"])
+def test_native_writer_multiple_row_groups(tmp_path, compression, data_page_version):
     # The Arrow 60 factory takes the file's row-group index. Exercise repeated
     # factory creation, dictionary pages and offsets within a single file.
     rows = 8192
@@ -21,7 +22,9 @@ def test_native_writer_multiple_row_groups(tmp_path, compression):
     )
     path = tmp_path / "multiple-row-groups.parquet"
     with daft.execution_config_ctx(parquet_target_row_group_size=4096, native_parquet_writer=True):
-        daft.from_arrow(expected).write_parquet(str(path), single_file=True, compression=compression)
+        daft.from_arrow(expected).write_parquet(
+            str(path), single_file=True, compression=compression, data_page_version=data_page_version
+        )
     parquet_file = papq.ParquetFile(path)
     assert parquet_file.num_row_groups > 1
     batches = [parquet_file.read_row_group(i) for i in range(parquet_file.num_row_groups)]

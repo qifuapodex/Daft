@@ -912,13 +912,18 @@ def _write_and_measure(df: daft.DataFrame, root: str, **kwargs) -> tuple[int, di
 
 
 @pytest.mark.parametrize("native_parquet_writer", [True, False])
-def test_write_parquet_zstd_compression_level_is_honored(tmp_path, native_parquet_writer):
+@pytest.mark.parametrize("data_page_version", ["1.0", "2.0"])
+def test_write_parquet_zstd_compression_level_is_honored(tmp_path, native_parquet_writer, data_page_version):
     df = _compressible_df()
     with daft.context.execution_config_ctx(native_parquet_writer=native_parquet_writer):
-        default_size, default_codecs = _write_and_measure(df, str(tmp_path / "default"), compression="zstd")
-        level1_size, _ = _write_and_measure(df, str(tmp_path / "l1"), compression="zstd", compression_level=1)
+        default_size, default_codecs = _write_and_measure(
+            df, str(tmp_path / "default"), compression="zstd", data_page_version=data_page_version
+        )
+        level1_size, _ = _write_and_measure(
+            df, str(tmp_path / "l1"), compression="zstd", compression_level=1, data_page_version=data_page_version
+        )
         level9_size, level9_codecs = _write_and_measure(
-            df, str(tmp_path / "l9"), compression="zstd", compression_level=9
+            df, str(tmp_path / "l9"), compression="zstd", compression_level=9, data_page_version=data_page_version
         )
 
     assert default_codecs == {"id": "ZSTD", "text": "ZSTD"}
@@ -942,12 +947,17 @@ def test_write_parquet_compression_level_other_leveled_codecs(tmp_path, native_p
 
 
 @pytest.mark.parametrize("native_parquet_writer", [True, False])
-def test_write_parquet_compression_level_applies_to_column_override(tmp_path, native_parquet_writer):
+@pytest.mark.parametrize("data_page_version", ["1.0", "2.0"])
+def test_write_parquet_compression_level_applies_to_column_override(tmp_path, native_parquet_writer, data_page_version):
     # The default codec (snappy) has no level; the level must still reach the zstd override.
     df = _compressible_df()
     with daft.context.execution_config_ctx(native_parquet_writer=native_parquet_writer):
         base_size, base_codecs = _write_and_measure(
-            df, str(tmp_path / "base"), compression="snappy", column_compression={"text": "zstd"}
+            df,
+            str(tmp_path / "base"),
+            compression="snappy",
+            column_compression={"text": "zstd"},
+            data_page_version=data_page_version,
         )
         level9_size, level9_codecs = _write_and_measure(
             df,
@@ -955,6 +965,7 @@ def test_write_parquet_compression_level_applies_to_column_override(tmp_path, na
             compression="snappy",
             column_compression={"text": "zstd"},
             compression_level=9,
+            data_page_version=data_page_version,
         )
 
     assert base_codecs == {"id": "SNAPPY", "text": "ZSTD"}
