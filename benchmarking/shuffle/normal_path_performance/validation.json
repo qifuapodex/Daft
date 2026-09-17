@@ -1,0 +1,181 @@
+{
+  "date_utc": "2026-09-17",
+  "scope": "Current Arrow 60 source correctness and benchmark harness checks; not release performance acceptance.",
+  "base_commit": "42b8b9f3c7abd0f47deed3a2c08c4609b84d7c9d",
+  "tested_source_commit": "f16d457abb2115068b9030a860c97a0a06830854",
+  "source_identity_note": "The tested source commit precedes the documentation/evidence commit; source hashes identify all Rust and Cargo changes.",
+  "changed_source_sha256": {
+    "Cargo.lock": "6c8ac6d332a39d7c46a00c02f77697260958109f01139fd9a3bab978ba81f8a0",
+    "Cargo.toml": "194ff81294e3afd3db5975b4b46b3631605952f980ad6275df69944fa3827b80",
+    "src/daft-io/Cargo.toml": "4458424175b279da4b619415e7f318dc676ea332459609d23fdc62f04d90044a",
+    "src/daft-io/src/shuffle_file.rs": "a5214c8301819779564b6e4f9e6d5e2267c6912ee6d1dce2330dc9dd1f4ce368",
+    "src/daft-io/src/shuffle_file/checksum.rs": "836bd74a01cb1a40f3494134170bafeab8abb2e61d23fd9f36f8298a5c64724d",
+    "src/daft-shuffles/src/lib.rs": "eea65529acd82de967deec30a8ef0e4439c637a622b27fffa44ae2aebe170968",
+    "src/daft-shuffles/src/oneshot_writer.rs": "a37b1dd65ce6eeb7e2acb75e9de722bbd34cb10ee0b0b571a5555cbd39b4db2d",
+    "src/daft-shuffles/src/server/stream.rs": "b9da4e192c2c9fb7143fd0966844797cda7b6d421cdaa8b80f09f7c4a17efc76",
+    "src/daft-shuffles/src/server/stream/bench.rs": "e5c417e79d87fe538f9fb3a45b10ca50a657cb328ac84f9c9f9c79d422c029ef",
+    "src/daft-shuffles/src/server/stream/tests.rs": "565238c2b309f05025692a66070362c70441cc90dfe84dad009172c96c8d7975",
+    "src/daft-shuffles/src/shuffle_cache.rs": "59e3239e863cac68f57a17766dbefebfb049e4205d96b92bd4f44b4a9500b806",
+    "src/daft-shuffles/src/write_bench.rs": "eef7ff987da0e1dd2bdc6654b4af7ef05f9543e6a3ffa4a07aa99d93262ace6e",
+    "src/daft-writers/src/file.rs": "1dfd7f9d55a0f97891542d6ac555535b1cae93e025519df31d3dc931c4f584ce",
+    "src/daft-writers/src/ipc.rs": "47ba94560d775312244ddf9baeff9ad93bc454e8c2dd8b26bc1c0c74959cf4d7",
+    "src/daft-writers/src/lib.rs": "350ddd35cb92f5ded7349ae32f3f6b842e770a3b0a2864d294752a656dee2b64",
+    "src/daft-writers/src/parquet_writer.rs": "e4325568bbe79be1945bb39ef142ce773e282fa70c80861aec4fdb4639ec677d"
+  },
+  "build": {
+    "status": "PASS",
+    "command": "make build",
+    "profile": "dev (unoptimized + debuginfo)",
+    "dashboard_build": "skipped",
+    "network": "offline cached dependencies",
+    "cargo_build_jobs": 6,
+    "log_sha256": "946f7a7ab69b4a08f29182821ff42460bc7c6fbfeb51d39335d75256bb4bfa7e"
+  },
+  "rust_components": [
+    {
+      "package": "daft-io",
+      "status": "PASS",
+      "passed": 16,
+      "ignored": 1,
+      "filtered_out": 94,
+      "log_sha256": "246f00cfc694d3ae16027223514b13d00d03f3aac790fc778460d7c4eef98fef"
+    },
+    {
+      "package": "daft-writers",
+      "status": "PASS",
+      "passed": 28,
+      "ignored": 4,
+      "filtered_out": 0,
+      "log_sha256": "6e87b25354a82aeb623dd40cb778d0c1e8aebf27099b432c3f2a6204a53e647e"
+    },
+    {
+      "package": "daft-shuffles",
+      "status": "PASS",
+      "passed": 63,
+      "ignored": 7,
+      "filtered_out": 0,
+      "log_sha256": "6238294b4661c5f86787f198599bf45993e8a1b6bf46045407a814eb33f61198"
+    }
+  ],
+  "rust_test_commands": [
+    "cargo test -p daft-io --lib shuffle_file:: -- --test-threads=2",
+    "cargo test -p daft-writers -p daft-shuffles --lib -- --test-threads=2"
+  ],
+  "injected_cancellation": {
+    "status": "PASS",
+    "tests": [
+      "cancelled_write_poisoning_survives_close_and_reuse",
+      "cancelled_buffered_close_poisoning_survives_reuse",
+      "cancelled_final_write_poisoning_survives_reuse",
+      "shared_write_tracking_survives_cancellation"
+    ],
+    "injector": "tests/ray/shuffle_eio_injection.c",
+    "compile": "cc -shared -fPIC -O2 -o \"$INJECTOR\" tests/ray/shuffle_eio_injection.c -ldl",
+    "run": "env LD_PRELOAD=\"$INJECTOR\" DAFT_TEST_SHUFFLE_IO_ROOT=\"$PRIVATE_ROOT\" DAFT_TEST_SHUFFLE_IO_OPERATION=write DAFT_TEST_SHUFFLE_IO_FAILURES=100 DAFT_TEST_SHUFFLE_IO_ERRNO=5 \"$TEST_BINARY\" \"$TEST_NAME\" --ignored --test-threads=1",
+    "root_policy": "Fresh private temporary root for each test; verify fault marker creation."
+  },
+  "ray_eio": {
+    "status": "PASS",
+    "passed": 20,
+    "deselected": 22,
+    "seconds": 141.44,
+    "command": [
+      "python",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/ray/test_shuffle_eio_retry.py",
+      "-k",
+      "real_local_shuffle_io_failure or local_retry_exhaustion_and_unsafe_commit_errors or recovered_write_syncs_original_fd_before_returning or recovery_pass_retries_io_but_never_swallows_sync_failure or cancel_during_shuffle_eio_backoff"
+    ],
+    "environment": {
+      "DAFT_RUNNER": "ray",
+      "DAFT_PROGRESS_BAR": "0",
+      "RAYON_NUM_THREADS": "2",
+      "OMP_NUM_THREADS": "1"
+    },
+    "log_sha256": "2c5b0dbf28346c985d845b58be6b02ff5fc2888338a16b5f5b3ede67eed1b621"
+  },
+  "flight_gather_current_build": [
+    {
+      "compression": "none",
+      "status": "PASS",
+      "collects_including_warmup": 2,
+      "rows_checked_per_collect": 64000,
+      "plan": "FlightGather",
+      "output_partitions": 1,
+      "spilled_bytes": 0,
+      "extension_sha256": "f2049d56dd21fa3d21c68638732b2f0a0e5c67ef753b78f3e2225c6ab05d180f",
+      "dependencies": {
+        "numpy": "2.2.6",
+        "pandas": "2.2.3",
+        "pyarrow": "22.0.0",
+        "ray": "2.57.0"
+      }
+    },
+    {
+      "compression": "lz4",
+      "status": "PASS",
+      "collects_including_warmup": 2,
+      "rows_checked_per_collect": 64000,
+      "plan": "FlightGather",
+      "output_partitions": 1,
+      "spilled_bytes": 0,
+      "extension_sha256": "f2049d56dd21fa3d21c68638732b2f0a0e5c67ef753b78f3e2225c6ab05d180f",
+      "dependencies": {
+        "numpy": "2.2.6",
+        "pandas": "2.2.3",
+        "pyarrow": "22.0.0",
+        "ray": "2.57.0"
+      }
+    }
+  ],
+  "abba_driver_smoke": {
+    "status": "PASS",
+    "cycles": 1,
+    "order": [
+      "baseline",
+      "candidate",
+      "candidate",
+      "baseline"
+    ],
+    "warmups_per_job": 1,
+    "formal_samples_per_job": 1,
+    "compression": "none",
+    "storage": "/tmp",
+    "builds": {
+      "baseline": {
+        "wheel": "/tmp/daft-p3-wheels/pre-eio/daft-0.3.0.dev0-cp310-abi3-manylinux_2_39_x86_64.whl",
+        "sha256": "84cc3ee31303088ad12dcaf3cd48d10d15824f637f258f2524f5d4b2a70786a7",
+        "extension_sha256": "f38daa3571aef36c796706b72dfbcedf426745cbeca6575f80d8cf5f753d4e94"
+      },
+      "candidate": {
+        "wheel": "/tmp/daft-p3-wheels/write-v7/daft-0.3.0.dev0-cp310-abi3-manylinux_2_39_x86_64.whl",
+        "sha256": "78d7b5e32bebff1ca59a129564f84e168a7a592de2b9b4e81e2303150276ff7e",
+        "extension_sha256": "422eddea795eacb922313764f834410c9ad4e13c1d21d6b39e9791d10003e553"
+      }
+    },
+    "verified": [
+      "driver and worker extension hashes match each selected wheel",
+      "node identities and resource quotas remain fixed",
+      "full-data oracle passes",
+      "no object-store spill",
+      "separate min/median/max changes emitted"
+    ],
+    "scope": "Only exercises the reusable driver with preserved Arrow 59 wheels; these samples are excluded from performance evidence and do not test Arrow 60 performance."
+  },
+  "static_checks": {
+    "rustfmt": "PASS: cargo fmt --all -- --check",
+    "ruff": "PASS: check and format --check on the six committed benchmark/statistics Python files"
+  },
+  "historical_evidence_recomputation": {
+    "status": "PASS",
+    "command": "python benchmarking/shuffle/normal_path_performance/verify_evidence.py",
+    "retained_samples": 6400,
+    "formal_samples": 5120,
+    "warmups": 1280,
+    "comparisons": 14,
+    "summary_rows": 56
+  },
+  "performance_acceptance": "NOT PASSED. Historical min/median regressions remain; full release performance measurements after the Arrow 60 rebase are outstanding."
+}

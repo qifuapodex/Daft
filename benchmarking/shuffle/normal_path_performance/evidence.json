@@ -1,0 +1,146 @@
+{
+  "historical_candidate": "V7 prototype on 5833cac55 (Arrow 59), before PR rebase to Arrow 60",
+  "historical_acceptance_baseline": "c6217a8c09cbfe773f88374adf46ff2a7fcb1195 (before EIO retry)",
+  "performance_gate": "NOT PASSED: observed minima and medians exceed 1% in some cells",
+  "rebase_target": "42b8b9f3c (Arrow 60); historical measurements are not measurements of this target",
+  "cpu": "Intel Xeon Platinum 8488C",
+  "cache": "not cleared",
+  "disks": {
+    "local": "ext4 /tmp",
+    "juicefs": "/hdd-01/dev/qi.f exposed through fuse.bindfs"
+  },
+  "cycles": 8,
+  "regression_budget_pct": 1,
+  "sampling": "retain all samples and warmups; rename historical gather controls to coalesce-control",
+  "sources": {
+    "crc-v5-v7": {
+      "original_events_sha256": "b818e5a61eae7ba70c4ee2fe737e21da60b07fd8c29a4de7d4955d3070835e93",
+      "formal_samples": 768,
+      "warmups": 128
+    },
+    "pre-eio-v7": {
+      "original_events_sha256": "75fcc4e55162d4d92c6314a33710e4c3f61d7c628119630f308e479fab46478a",
+      "formal_samples": 3840,
+      "warmups": 640
+    },
+    "juicefs-writer-and-control": {
+      "original_events_sha256": "20ca4530dc61d2081ba3fdecc8ec882304bfcff729dfbc70666f527487b7b49e",
+      "formal_samples": 384,
+      "warmups": 384
+    },
+    "juicefs-flight-gather": {
+      "original_events_sha256": "8095d7b50e1aad434dfc15b6d8ab2d614c5bf5ae42cc4a1f4d069eff91bae805",
+      "formal_samples": 128,
+      "warmups": 128
+    }
+  },
+  "formal_samples": 5120,
+  "warmups": 1280,
+  "samples_sha256": "d9c525ff2209ece4aabf53d6885cc842752ba078684159ec7f2bf7da1f3584e5",
+  "legacy_source_sha256": {
+    "Cargo.lock": "71a516ea22962c53b5ffd3f2f3f075a4995b89275bfc0a38d9e2ce5011b055f4",
+    "Cargo.toml": "784b2c0e2582caed6cdf6b015f18a2594505d592fd2d76ac0850a857e200ba0d",
+    "src/daft-io/Cargo.toml": "4458424175b279da4b619415e7f318dc676ea332459609d23fdc62f04d90044a",
+    "src/daft-io/src/azure_blob.rs": "d6291ce50bb08f28e8aaad15ad4de3f0c42831c8d5854222c1c70368fcee7d73",
+    "src/daft-io/src/counting_reader.rs": "52277227b4ea78b3e81aee25e493bea86ea373ba92a708834fc536ba5845fe28",
+    "src/daft-io/src/google_cloud.rs": "950c76c521d1ea4ce4f3c5eaa0d5ec05bad6fe8ba7d9115d66d79e92633466a6",
+    "src/daft-io/src/gravitino.rs": "0c8b663b8bdc422737a6ecfbaf79c8ba5318d1019dc02d22541091e923b0b93a",
+    "src/daft-io/src/http.rs": "fef381ea0952000d636990caba7b84c009cf819f3551e12ebb13fdd655a9845c",
+    "src/daft-io/src/huggingface/error.rs": "0f0921ac6c841085ab632086580b9bb3b6e8e4e046350404c0aad64c4f2ea92d",
+    "src/daft-io/src/huggingface/mod.rs": "fd4a441d5197063a969474b36fd7460aff6511df98b598ade0523f32508fdd14",
+    "src/daft-io/src/huggingface/path.rs": "1f087e47a0370e38191b3786928b6aa1387cf3af94c4adbf15882b21c70d3a9f",
+    "src/daft-io/src/huggingface/xet.rs": "34d15964e3bd8437e235ae1b00fbad0de29fc3cbaa49cdf54cea1b46afa37dcc",
+    "src/daft-io/src/integrations.rs": "ef95841b17aa3ec87e179765bcf6d870a5f643886aa293aa6946fc70bb6ceeef",
+    "src/daft-io/src/lib.rs": "e8a45141b2399772539aef26f5afae6321073d58d08a26f3636ccd1a9161df54",
+    "src/daft-io/src/local.rs": "1335846369ea1f22a755f652f008d62eac3f4bbefd87982c382c7092ca4a06df",
+    "src/daft-io/src/mock.rs": "a05deac67fdc37f91a5627b5f218763d4f78da323b45a99f85b2e478a71659be",
+    "src/daft-io/src/multipart.rs": "8b4a97b4c1ddfac6ef3d5cb6f637c2fa3137e05a04c743f08f9e7ca11b71888c",
+    "src/daft-io/src/object_io.rs": "b81b7437fcf3db46a52100161460cbbf82c32681601745e5cfe16f84cf211a4c",
+    "src/daft-io/src/object_store_glob.rs": "7285e04b02e967e4d3168b231fcb69c89aeb2fa937a7fe2d909f9b86c6fdc09e",
+    "src/daft-io/src/opendal_source.rs": "8dc5e2e5751a2dd5456281b03b628e4115d3725269635f4f204af8ba80b5007e",
+    "src/daft-io/src/python.rs": "679cb83237bf161ef8dffefeac632152b70fe82ed21556910b8b45cbbf255b8e",
+    "src/daft-io/src/range.rs": "508ce1cce20d765a2b5a63a9120fe900a74b7637d213650a59371211a253dd42",
+    "src/daft-io/src/range_expansion.rs": "b6f292c568c34922fb62a3b50b8048b987f696ac080bebe6b941180e2f9aa723",
+    "src/daft-io/src/retry.rs": "50e71df5b20f5052e4968e7153f6ab75009d492c4513b5222f2c75c597e31d4e",
+    "src/daft-io/src/s3_like.rs": "815df4337c95d4762855fe1536248e414b57ad0665158380f4f03212208c01f5",
+    "src/daft-io/src/shuffle_file.rs": "a5214c8301819779564b6e4f9e6d5e2267c6912ee6d1dce2330dc9dd1f4ce368",
+    "src/daft-io/src/shuffle_file/bench.rs": "47bd60965f2cb9f374c8b91808f464617839231eb619d9467de54d533eee8d91",
+    "src/daft-io/src/stats.rs": "5da46dda1f86171048ed698cc2d5314d7a47a6c2c05ae95cf8037ea5ee1f77f2",
+    "src/daft-io/src/stream_utils.rs": "bec31025a21215e39276779a50d8fbce7b4370b99b4d3eb52ed06d6266501f1b",
+    "src/daft-io/src/unity.rs": "71f1b1f96054470e4c0da9ea9670db77cdf17b0d6ef6143186534d583ae13810",
+    "src/daft-io/src/utils.rs": "9f42eb0616a919b30ecc77512401719eac36b80ba99a5f67a931a77991272476",
+    "src/daft-shuffles/Cargo.toml": "6052fa6ada4740bb9555ea57f857d818479ebf47a9efe195a55275fc9772b6bd",
+    "src/daft-shuffles/src/client/flight_client.rs": "12ec15ee75520ee8884e97243fce9f4fe6f1e405086973f17c1fb623f6843548",
+    "src/daft-shuffles/src/client/mod.rs": "8db972b6aabb43d478e3d98a71502412d8064fa678d68115431326750744d26e",
+    "src/daft-shuffles/src/error.rs": "258267d64aaec98e48b28ea76dcb2dc3b8cf5527a96098e906024c8a043abc65",
+    "src/daft-shuffles/src/lib.rs": "eea65529acd82de967deec30a8ef0e4439c637a622b27fffa44ae2aebe170968",
+    "src/daft-shuffles/src/local_io.rs": "40dd35edf2bdc1a79e73e0c4954469a68d4752e166ef851f35c704feac411894",
+    "src/daft-shuffles/src/oneshot_writer.rs": "a37b1dd65ce6eeb7e2acb75e9de722bbd34cb10ee0b0b571a5555cbd39b4db2d",
+    "src/daft-shuffles/src/server/flight_server.rs": "bbbca3aee50049964c6b488c889c93f86887ac8dbb274169aa3600278ff7f066",
+    "src/daft-shuffles/src/server/mod.rs": "752a81176348c089f27d8862eb87006e117a2af4de350403645b40f78e641abb",
+    "src/daft-shuffles/src/server/stream.rs": "b9da4e192c2c9fb7143fd0966844797cda7b6d421cdaa8b80f09f7c4a17efc76",
+    "src/daft-shuffles/src/server/stream/bench.rs": "e5c417e79d87fe538f9fb3a45b10ca50a657cb328ac84f9c9f9c79d422c029ef",
+    "src/daft-shuffles/src/shuffle_cache.rs": "59e3239e863cac68f57a17766dbefebfb049e4205d96b92bd4f44b4a9500b806",
+    "src/daft-shuffles/src/store/bench.rs": "e400e3e58b65e8780e7da9efd7908c196175529a9d19f6ae8bd027670d4eaf59",
+    "src/daft-shuffles/src/store/index.rs": "aefd74cbb031fc341108a172f7ba4c67abe38b5bfd89d4389b84617d8b25b31d",
+    "src/daft-shuffles/src/store/mod.rs": "637c4c89b4a1f9d0fba92911e428435eaa6897b9550b0dba69c1d509d37d7d2a",
+    "src/daft-shuffles/src/store/read_stats.rs": "3cbb95ad6819ef6695aa01c776ecf84316ad7f9e970983812f7010ed5bb35bbc",
+    "src/daft-shuffles/src/store/reader.rs": "ca3149b0866f49e55112ca151d646dd24891119b153c0680614a597456ebcfe7",
+    "src/daft-shuffles/src/store/verify.rs": "91bc2927fb14d44d23637094dfad62052d6b1c32c0f170244f8f36e843f1c3bc",
+    "src/daft-shuffles/src/store/writer.rs": "5b9b05284a7f4f6d8b8cfa71eee5bb2f481994d4dcf3fcfb297f33e092568190",
+    "src/daft-shuffles/src/write_bench.rs": "eef7ff987da0e1dd2bdc6654b4af7ef05f9543e6a3ffa4a07aa99d93262ace6e",
+    "src/daft-writers/Cargo.toml": "ef699da51c1d51fbf2df20a881253b64af8a89cdfb0a162d4a263d75a86f086c",
+    "src/daft-writers/src/batch.rs": "ffe199fdce9b531b8558ca0955e17ba0db6e069dd5ca736ea77714ad4bac61b7",
+    "src/daft-writers/src/batch_file_writer.rs": "434b745b88ee0e0f8c9c43c3e912d70c5ee4805423b15e4144210350cbc1bd3b",
+    "src/daft-writers/src/catalog.rs": "a164f8d487bb1dcf00f769a2065c098109ca29ddbe8fe143064fca8f58961af9",
+    "src/daft-writers/src/csv_writer.rs": "4b2b49252129a2ca1b855988e0d8b9399deeac1a8046dc46d97bd48dbec4a380",
+    "src/daft-writers/src/file.rs": "1dfd7f9d55a0f97891542d6ac555535b1cae93e025519df31d3dc931c4f584ce",
+    "src/daft-writers/src/ipc.rs": "07af88f1da2c63a97b2f31ee32eb39fb939e8ae0679072b5a184155fa55247b9",
+    "src/daft-writers/src/json_writer.rs": "d711bba5bc9dd692e080432ca70cb90f97f81f1dd77edf33b657fa586ed897bc",
+    "src/daft-writers/src/lance.rs": "6b1079c04e0de218eddbbec3833bceda8401522f0c0718747b7db2d99816bf18",
+    "src/daft-writers/src/lib.rs": "636891137f1532125029a79fb5cdc9fe8fd3f8896528db5f61d04a7b2cf60c82",
+    "src/daft-writers/src/parquet_writer.rs": "61278953b950d39b19229c12c19c24ecac8423b94407042a20b622faad725460",
+    "src/daft-writers/src/partition.rs": "5e3c465f06bb49de45d69f13e1cf3d939882a4e38b798440a57024e7ea32c004",
+    "src/daft-writers/src/physical.rs": "eaa7ea9dda36e8b2d6961c56e8d115818d4bf67e2f88545bb095d5812b0aa6f2",
+    "src/daft-writers/src/pyarrow.rs": "b7b1a5dcc6cf37d827dc7d9356260fcfa7a23aeff075c0fc14d817e580d525d5",
+    "src/daft-writers/src/sink.rs": "4faa65e7b5ff8ae4398f3406d4a8035fe59002f62fbef9fc3d0b87fffcdc8bb7",
+    "src/daft-writers/src/storage_backend.rs": "6898aec0a190ea9a9a3e53f8d2c3ab8675e83950e7b6f645779d579658c26718",
+    "src/daft-writers/src/test.rs": "230be62af4b43fbee71df8c18fd453a5e199449d05098d98ae86359e9e9371b9",
+    "src/daft-writers/src/utils.rs": "6050560dfad4a9bb0d693e2a5618aa186c25ea7e34cf8116db7cf45dc57dfdbb",
+    "src/daft-shuffles/src/server/stream/tests.rs": "c873df9b522c24fb61c903828d33f755337853422408a77a8e0f435cfdf17598",
+    "src/daft-io/src/shuffle_file/checksum.rs": "836bd74a01cb1a40f3494134170bafeab8abb2e61d23fd9f36f8298a5c64724d"
+  },
+  "binaries": {
+    "old": {
+      "path": "/tmp/daft-p3-pre-eio-write-bench",
+      "sha256": "8624c94e12ac87ba56b506c714b9bfb492813259366d6d9bbb9fbb7b9f20a6a2"
+    },
+    "v7": {
+      "path": "/tmp/daft-p3-candidate-daft-shuffles-v7",
+      "sha256": "f6e11a9de31d3749a08b48d80bc2801887a07d1a6dc88880de3f527abff0ec51",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      }
+    }
+  },
+  "wheels": {
+    "pre-eio": {
+      "path": "/tmp/daft-p3-wheels/pre-eio/daft-0.3.0.dev0-cp310-abi3-manylinux_2_39_x86_64.whl",
+      "sha256": "84cc3ee31303088ad12dcaf3cd48d10d15824f637f258f2524f5d4b2a70786a7",
+      "extension_sha256": "f38daa3571aef36c796706b72dfbcedf426745cbeca6575f80d8cf5f753d4e94",
+      "extension": "/tmp/daft-p3-v7-verify/pre-eio/daft/daft.abi3.so",
+      "retry_api": false
+    },
+    "v7": {
+      "path": "/tmp/daft-p3-wheels/write-v7/daft-0.3.0.dev0-cp310-abi3-manylinux_2_39_x86_64.whl",
+      "sha256": "78d7b5e32bebff1ca59a129564f84e168a7a592de2b9b4e81e2303150276ff7e",
+      "extension_sha256": "422eddea795eacb922313764f834410c9ad4e13c1d21d6b39e9791d10003e553",
+      "extension": "/tmp/daft-p3-v7-verify/v7/daft/daft.abi3.so",
+      "retry_api": true
+    }
+  }
+}
