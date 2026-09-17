@@ -4,7 +4,15 @@ The implementation preserves local EIO recovery and cancellation safety while re
 normal-path IPC work. **The pre-EIO baseline's 1% regression target is not met.**
 This change is suitable for code review; the historical data below is not a release acceptance claim.
 
-A new [latest-source comparison](arrow60_20260917/README.md) measures commit
+The latest [deferred-first-batch comparison](deferred_first_batch_20260917/README.md)
+keeps CRC enabled and avoids an async forwarding task for a single input of at
+most 8 KiB. Against the pre-EIO version, the 4 KiB single-batch writer improves
+min/median by 2.70%/3.31% locally and 0.96%/1.69% on the JuiceFS mount path.
+The complete 1% target remains unmet: wider writes and queries retain regressions
+or statistical uncertainty, and local small-file maximum latency increases.
+The report retains separate incremental comparisons and same-binary noise controls.
+
+The preceding [Arrow 60 comparison](arrow60_20260917/README.md) measures commit
 `3ec21f0ec` after integrating release `ffe64ff10` (Arrow-rs 60), with 48 formal
 samples per version/storage/case. It also does not meet the 1% target; see its
 separate min/median/max tables and current-source validation.
@@ -27,9 +35,13 @@ initial Arrow 60 rebase at `42b8b9f3c`; the new report records the latest checks
   retain crc32fast. The polynomial, initial state, final XOR and file format are unchanged.
 - IPC buffers small writes in 8 KiB. Its buffer never flushes from Drop, so a
   cancelled future cannot perform untracked I/O after its blocking task drains.
-- The queue drains ready input without waiting to fill a batch. Groups stop at
+- Once running, the writer drains ready input without waiting to fill a batch. Groups stop at
   32 inputs or after reaching the 32 MiB threshold. A final write and close can
   share one blocking operation. Queue and blocking work share an active-write guard.
+- A first input of at most 8 KiB stays in that queue until another input or close.
+  Close consumes a single pending batch directly, while IPC still offloads its
+  blocking work. Large or subsequent inputs start the background writer. Deferred
+  state retains active-write tracking, and started writers avoid the state mutex.
 
 Blocking file operations stay off the async executor. Dropping a pending operation
 poisons the writer, and cleanup waits for owned blocking operations to finish.

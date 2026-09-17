@@ -1,0 +1,20 @@
+{
+  "status": "PASS",
+  "source_hashes_checked": 1233,
+  "binaries_wheels_unchanged": true,
+  "finished": 1789650502.29854,
+  "all_studies_finished": 1789651540.901663,
+  "all_study_source_and_binary_hashes_unchanged": true,
+  "formal_samples_total": 12288,
+  "warmups_total": 2016,
+  "studies": [
+    "isolated-final",
+    "historical-final",
+    "crc-final",
+    "isolated-matrix-final",
+    "isolated-matrix-confirm",
+    "aa-tiny-c1-lz4",
+    "aa-wide-c8-none",
+    "aa-oneshot-c8-lz4"
+  ]
+}

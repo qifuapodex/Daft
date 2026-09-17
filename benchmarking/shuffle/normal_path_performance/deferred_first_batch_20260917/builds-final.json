@@ -1,0 +1,46 @@
+{
+  "baseline": {
+    "commit": "c6217a8c09cbfe773f88374adf46ff2a7fcb1195",
+    "arrow_rs_major": 59,
+    "binary": {
+      "path": "/tmp/daft-p3-pre-eio-write-bench",
+      "sha256": "8624c94e12ac87ba56b506c714b9bfb492813259366d6d9bbb9fbb7b9f20a6a2",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      }
+    },
+    "wheel": {
+      "path": "/tmp/daft-p3-wheels/pre-eio/daft-0.3.0.dev0-cp310-abi3-manylinux_2_39_x86_64.whl",
+      "sha256": "84cc3ee31303088ad12dcaf3cd48d10d15824f637f258f2524f5d4b2a70786a7",
+      "extension_sha256": "f38daa3571aef36c796706b72dfbcedf426745cbeca6575f80d8cf5f753d4e94",
+      "profile": "release"
+    }
+  },
+  "candidate": {
+    "commit": "e063e2ab646c22210f3f0f5fe6cd401aac3a3342",
+    "source_state": "working tree plus final.patch",
+    "patch_sha256": "b03eb19f5e11bcbf76d219b046a6bd1d6d6a45289b248ef8aa9282e16a554b51",
+    "arrow_rs_major": 60,
+    "binary": {
+      "path": "/tmp/daft-task-handle-20260917/final-daft_shuffles",
+      "sha256": "e7e3d8a9db8864ecfd8da87ef1064b517a2d6ed0df46d5d01ab81441c7c2cc4c",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      }
+    },
+    "wheel": {
+      "path": "/tmp/daft-task-handle-20260917/wheels/daft-0.3.0.dev0-cp310-abi3-manylinux_2_39_x86_64.whl",
+      "sha256": "5d292017c32c566e1ffec0dccec17991bfc7b1979a79ab48499ce79c77f18353",
+      "extension_sha256": "f74b03246b8a861e266655a76026647fdee531b64efc304a1f5a3956a96af16e",
+      "profile": "release"
+    }
+  }
+}
