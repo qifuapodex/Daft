@@ -9,7 +9,14 @@ import pyarrow.parquet as pq
 import pytest
 
 import daft
-from daft.daft import DistributedPhysicalPlan, FileFormat, PyDaftExecutionConfig, PyFormatSinkOption, WriteMode
+from daft.daft import (
+    DistributedPhysicalPlan,
+    FileFormat,
+    LocalPhysicalPlan,
+    PyDaftExecutionConfig,
+    PyFormatSinkOption,
+    WriteMode,
+)
 from tests.conftest import get_tests_daft_runner_name
 
 
@@ -72,7 +79,8 @@ def test_invalid_page_version_fails_before_writing(tmp_path, version):
 
 
 @pytest.mark.parametrize("version", ["1.0", "2.0"])
-def test_page_version_in_serialized_write_plan(version):
+@pytest.mark.parametrize("plan_type", [DistributedPhysicalPlan, LocalPhysicalPlan])
+def test_page_version_in_serialized_write_plan(version, plan_type):
     config = PyDaftExecutionConfig()
     frame = daft.range(0, 16, partitions=2)
     payloads = {}
@@ -88,9 +96,11 @@ def test_page_version_in_serialized_write_plan(version):
             io_config=None,
             single_file=False,
         )
-        plan = DistributedPhysicalPlan.from_logical_plan_builder(
-            builder.optimize(config)._builder, "page-version", config
-        )
+        optimized = builder.optimize(config)._builder
+        if plan_type is LocalPhysicalPlan:
+            plan, _ = plan_type.from_logical_plan_builder(optimized, {})
+        else:
+            plan = plan_type.from_logical_plan_builder(optimized, "page-version", config)
         payloads[page_version] = plan.__reduce__()[1][0]
         if page_version == version:
             restored = pickle.loads(pickle.dumps(plan))
@@ -98,8 +108,60 @@ def test_page_version_in_serialized_write_plan(version):
             assert factory.__name__ == "_from_serialized_parquet_data_page_v4"
             assert payload == payloads[page_version]
             with pytest.raises(ValueError, match="incompatible"):
-                DistributedPhysicalPlan._from_serialized_local_write_buffer_v3(payload)
+                plan_type._from_serialized(payload)
+            if plan_type is DistributedPhysicalPlan:
+                with pytest.raises(ValueError, match="incompatible"):
+                    plan_type._from_serialized_local_write_buffer_v3(payload)
+            with pytest.raises(ValueError, match="Trailing bytes"):
+                factory(payload + b"extra")
+            with pytest.raises(ValueError, match="Invalid versioned"):
+                factory(b"")
     assert payloads["1.0"] != payloads["2.0"]
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("cardinality", [7, 4096])
+def test_page_version_preserves_physical_dictionary_policy(tmp_path, native, cardinality):
+    values = [None if i % 17 == 0 else (i % cardinality).to_bytes(16, "little") for i in range(4096)]
+    expected = pa.table(
+        {
+            "id": range(len(values)),
+            "fixed.with.dot": pa.array(values, type=pa.binary(16)),
+            "wide_decimal": pa.array(
+                [None if v is None else Decimal(int.from_bytes(v, "little")) for v in values],
+                type=pa.decimal128(38, 0),
+            ),
+            "nested": pa.array([[v, None] for v in values], type=pa.list_(pa.binary(16))),
+            "struct": pa.array([{"fixed": v} for v in values], type=pa.struct([("fixed", pa.binary(16))])),
+            "label": [f"label-{i % 7}" for i in range(len(values))],
+        }
+    )
+    policies = {}
+    for version in ["1.0", "2.0"]:
+        path = tmp_path / version
+        with daft.execution_config_ctx(native_parquet_writer=native):
+            daft.from_arrow(expected).write_parquet(str(path), data_page_version=version, compression="zstd")
+        files = sorted(path.glob("*.parquet"))
+        assert files
+        for file in files:
+            assert_data_page_headers(file, version)
+            metadata = pq.read_metadata(file)
+            for i in range(metadata.num_row_groups):
+                for j in range(metadata.num_columns):
+                    column = metadata.row_group(i).column(j)
+                    has_dictionary = column.dictionary_page_offset is not None
+                    key = column.path_in_schema
+                    if version == "1.0":
+                        policies[key] = has_dictionary
+                    else:
+                        assert has_dictionary == policies[key]
+                    if native and column.physical_type == "FIXED_LEN_BYTE_ARRAY":
+                        assert not has_dictionary
+                    if key == "label":
+                        assert has_dictionary
+        actual = pa.concat_tables([pq.read_table(file) for file in files]).sort_by("id").cast(expected.schema)
+        assert actual.equals(expected)
+        assert daft.read_parquet(str(path)).to_arrow().sort_by("id").cast(expected.schema).equals(expected)
 
 
 @pytest.mark.parametrize("native", [True, False])

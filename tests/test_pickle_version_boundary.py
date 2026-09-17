@@ -9,7 +9,7 @@ import pytest
 
 import daft
 from daft.context import get_context
-from daft.daft import DistributedPhysicalPlan, PyDaftExecutionConfig
+from daft.daft import DistributedPhysicalPlan, LocalPhysicalPlan, PyDaftExecutionConfig
 
 
 def expected_factory(kind):
@@ -98,3 +98,12 @@ def test_arrow60_v3_write_plan_is_rejected_before_decoding():
     for payload in [b"", b"invalid"]:
         with pytest.raises(ValueError, match="pickle format _from_serialized_local_write_buffer_v3 is incompatible"):
             DistributedPhysicalPlan._from_serialized_local_write_buffer_v3(payload)
+
+
+def test_arrow60_v3_local_write_plan_is_rejected_before_decoding():
+    fixture = json.loads((Path(__file__).parent / "assets/pickle/arrow60-v3-local-plan.json").read_text())
+    with pytest.raises(ValueError, match="Legacy PyLocalPhysicalPlan pickle is incompatible"):
+        pickle.loads(base64.b64decode(fixture["payload"]))
+    for payload in [b"", b"invalid"]:
+        with pytest.raises(ValueError, match="Legacy PyLocalPhysicalPlan pickle is incompatible"):
+            LocalPhysicalPlan._from_serialized(payload)

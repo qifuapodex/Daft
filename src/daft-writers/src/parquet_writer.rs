@@ -157,7 +157,8 @@ fn native_parquet_writer_properties(
         .set_compression(default_compression);
     if data_page_version == ParquetDataPageVersion::V2 {
         // WriterVersion also changes parquet-rs's default value encodings.
-        // Select V2 pages while retaining V1's PLAIN fallback and dictionary policy.
+        // Select V2 pages while retaining V1's PLAIN fallback. Dictionary support
+        // also depends on the physical type; preserve it after schema conversion.
         builder = builder
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_encoding(parquet::basic::Encoding::PLAIN);
@@ -230,8 +231,6 @@ pub(crate) fn create_native_parquet_writer(
     let (default_compression, parsed_column_compression) =
         resolve_parquet_compression(compression, column_compression, compression_level)?;
 
-    // TODO(desmond): Explore configurations such data page size limit, writer version, etc. Parquet format v2
-    // could be interesting but has much less support in the ecosystem (including ourselves).
     let arrow_schema = Arc::new(schema.to_arrow()?.into());
     let writer_properties = native_parquet_writer_properties(
         &arrow_schema,
@@ -244,6 +243,21 @@ pub(crate) fn create_native_parquet_writer(
         .with_coerce_types(writer_properties.coerce_types())
         .convert(&arrow_schema)
         .expect("By this point `native_writer_supported` should have been called which would have verified that the schema is convertible");
+
+    let writer_properties = if data_page_version == ParquetDataPageVersion::V2 {
+        let mut builder = writer_properties.into_builder();
+        // parquet-rs disables dictionaries for FIXED_LEN_BYTE_ARRAY under V1,
+        // regardless of dictionary_enabled. V2 would otherwise enable them.
+        // Use physical leaf paths to cover decimals, UUIDs and nested columns.
+        for column in parquet_schema.columns() {
+            if column.physical_type() == parquet::basic::Type::FIXED_LEN_BYTE_ARRAY {
+                builder = builder.set_column_dictionary_enabled(column.path().clone(), false);
+            }
+        }
+        builder.build()
+    } else {
+        writer_properties
+    };
 
     match source_type {
         SourceType::File => {

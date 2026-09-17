@@ -227,7 +227,8 @@ def test_roundtrip_boolean_rle(tmp_path, has_none):
     reason="PyArrow version doesn't support the canonical uuid extension type.",
 )
 @pytest.mark.parametrize("native_parquet_writer", [True, False])
-def test_roundtrip_uuid_type(tmp_path, native_parquet_writer: bool) -> None:
+@pytest.mark.parametrize("data_page_version", ["1.0", "2.0"])
+def test_roundtrip_uuid_type(tmp_path, native_parquet_writer: bool, data_page_version: str) -> None:
     """Parquet write/read preserves Arrow uuid (logical) and Daft DataType.uuid()."""
     pydict = {"uuid_col": [uuid.uuid4().bytes for _ in range(3)]}
     pa_schema = pa.schema([pa.field("uuid_col", pa.uuid())])
@@ -236,7 +237,7 @@ def test_roundtrip_uuid_type(tmp_path, native_parquet_writer: bool) -> None:
     before = before.concat(before)
 
     with execution_config_ctx(native_parquet_writer=native_parquet_writer):
-        before.write_parquet(str(tmp_path))
+        before.write_parquet(str(tmp_path), data_page_version=data_page_version)
         after = daft.read_parquet(str(tmp_path))
 
     assert before.schema()["uuid_col"].dtype == DataType.uuid()
