@@ -1,5 +1,6 @@
 mod chunk_source;
 mod field_reader;
+mod page_ranges;
 mod rg_processor;
 mod util;
 
@@ -19,7 +20,7 @@ use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr, optimization::get_required_
 use daft_recordbatch::RecordBatch;
 use futures::{Stream, StreamExt, stream::BoxStream};
 use parquet::{
-    arrow::arrow_reader::{ArrowReaderMetadata, RowSelection, RowSelector},
+    arrow::arrow_reader::{RowSelection, RowSelector},
     file::metadata::ParquetMetaData,
 };
 use rg_processor::{
@@ -69,17 +70,22 @@ const DEFAULT_BATCH_SIZE: usize = 128 * 1024;
 async fn open_chunk_source(
     source: &ParquetSource<'_>,
     opts: &ParquetReadOptions,
-) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
+) -> crate::Result<(ChunkSourceBuilder, Arc<ParquetMetaData>)> {
     match source {
         ParquetSource::Local { path } => {
-            let (file, file_len, arrow_metadata) = open_local_file(path).await?;
+            let cached_metadata = opts
+                .metadata
+                .as_ref()
+                .and_then(|m| m.full_file_metadata())
+                .cloned();
+            let (file, file_len, parquet_metadata) = open_local_file(path, cached_metadata).await?;
             let cs = LocalChunkSource {
                 path: Arc::from(*path),
                 file,
                 file_len,
-                metadata: arrow_metadata.metadata().clone(),
+                metadata: parquet_metadata.clone(),
             };
-            Ok((ChunkSourceBuilder::Local(cs), arrow_metadata))
+            Ok((ChunkSourceBuilder::Local(cs), parquet_metadata))
         }
         ParquetSource::Url {
             uri,
@@ -103,12 +109,12 @@ struct PreparedMetadata {
 }
 
 fn prepare_metadata(
-    arrow_metadata: ArrowReaderMetadata,
+    parquet_metadata: Arc<ParquetMetaData>,
     field_id_mapping: Option<&Arc<BTreeMap<i32, Field>>>,
     opts: ParquetSchemaInferenceOptions,
     path: &str,
 ) -> crate::Result<PreparedMetadata> {
-    let mut parquet_metadata = arrow_metadata.metadata().clone();
+    let mut parquet_metadata = parquet_metadata;
     if let Some(mapping) = field_id_mapping {
         parquet_metadata =
             apply_field_ids_to_arrowrs_parquet_metadata(parquet_metadata, mapping, path)?;
@@ -575,12 +581,12 @@ pub async fn stream_parquet(
     source: ParquetSource<'_>,
     opts: &ParquetReadOptions,
 ) -> DaftResult<(Arc<Schema>, BoxStream<'static, DaftResult<RecordBatch>>)> {
-    let (cs_builder, arrow_metadata) = open_chunk_source(&source, opts).await?;
+    let (cs_builder, parquet_metadata) = open_chunk_source(&source, opts).await?;
     let path = cs_builder.path().clone();
 
     let chunk_size = opts.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
-    let prepared = prepare_metadata(
-        arrow_metadata,
+    let mut prepared = prepare_metadata(
+        parquet_metadata,
         opts.field_id_mapping.as_ref(),
         opts.schema_infer,
         &path,
@@ -618,8 +624,37 @@ pub async fn stream_parquet(
         );
     }
 
-    // Now spawn the byte-range fetches (remote) — pruned set only.
-    let chunk_source = Arc::new(cs_builder.build(prepared.parquet_metadata.clone(), &rg_indices));
+    let selection_possible = opts.start_offset.is_some_and(|offset| offset > 0)
+        || opts
+            .delete_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.is_empty())
+        || (opts.predicate.is_none()
+            && opts.num_rows.is_some_and(|rows| {
+                rows < prepared.parquet_metadata.file_metadata().num_rows() as usize
+            }))
+        || (plan.predicate_pushed && !plan.data_col_indices.is_empty());
+    let use_page_selection = selection_possible
+        && rg_indices.iter().any(|&rg| {
+            prepared
+                .parquet_metadata
+                .row_group(rg)
+                .columns()
+                .iter()
+                .any(|column| column.offset_index_offset().is_some())
+        });
+    if use_page_selection {
+        prepared.parquet_metadata = cs_builder
+            .load_offset_indexes(prepared.parquet_metadata)
+            .await?;
+    }
+    // Full remote scans retain eager/coalesced I/O. Selective scans defer data
+    // column requests until predicate decoding produces their RowSelection.
+    let chunk_source = Arc::new(cs_builder.build(
+        prepared.parquet_metadata.clone(),
+        &rg_indices,
+        use_page_selection,
+    ));
 
     let rg_inputs = build_rg_inputs(
         &chunk_source,

@@ -19,7 +19,7 @@ use parquet::{
 };
 use snafu::ResultExt;
 
-use super::chunk_source::OffsetBytes;
+use super::{chunk_source::OffsetBytes, page_ranges::validate_page_locations};
 use crate::ParquetColumnDecodeSnafu;
 
 struct SinglePageIter {
@@ -69,17 +69,36 @@ fn build_primitive_leaf_reader(
     def_level: i16,
     rep_level: i16,
     chunk_size: usize,
+    padding_threshold: Option<i16>,
 ) -> ParquetResult<Box<dyn ArrayReader>> {
     let rg = metadata.row_group(rg_idx);
     let col_chunk = rg.column(leaf_idx);
     let total_rows = rg.num_rows() as usize;
 
     // Page locations come from the offset index when present.
-    let page_locations = metadata.offset_index().and_then(|oi| {
-        oi.get(rg_idx)
-            .and_then(|cols| cols.get(leaf_idx))
-            .map(|loc| loc.page_locations.clone())
-    });
+    let page_locations = if rep_level == 0 {
+        metadata
+            .page_index()
+            .and_then(|index| index.offset_index(rg_idx, leaf_idx))
+            .map(|index| -> ParquetResult<_> {
+                let (start, len) = col_chunk.byte_range();
+                let end = start
+                    .checked_add(len)
+                    .ok_or_else(|| ParquetError::General("Parquet column range overflow".into()))?;
+                validate_page_locations(
+                    &index.page_locations,
+                    start..end,
+                    col_chunk.data_page_offset(),
+                    total_rows,
+                )?;
+                Ok(index.page_locations.clone())
+            })
+            .transpose()?
+    } else {
+        // Repeated rows can cross page boundaries. Keep their established
+        // sequential page reader along with whole-column I/O.
+        None
+    };
 
     let page_reader =
         SerializedPageReader::new(Arc::new(chunk_bytes), col_chunk, total_rows, page_locations)?;
@@ -108,7 +127,10 @@ fn build_primitive_leaf_reader(
 
     let reader: Box<dyn ArrayReader> = if matches!(arrow_type, arrow::datatypes::DataType::Null) {
         Box::new(NullArrayReader::<Int32Type>::new(
-            pages, col_descr, batch_size,
+            pages,
+            col_descr,
+            batch_size,
+            padding_threshold,
         )?)
     } else {
         match physical_type {
@@ -117,46 +139,68 @@ fn build_primitive_leaf_reader(
                 col_descr,
                 Some(arrow_type),
                 batch_size,
+                padding_threshold,
             )?),
             PhysicalType::INT32 => Box::new(PrimitiveArrayReader::<Int32Type>::new(
                 pages,
                 col_descr,
                 Some(arrow_type),
                 batch_size,
+                padding_threshold,
             )?),
             PhysicalType::INT64 => Box::new(PrimitiveArrayReader::<Int64Type>::new(
                 pages,
                 col_descr,
                 Some(arrow_type),
                 batch_size,
+                padding_threshold,
             )?),
             PhysicalType::FLOAT => Box::new(PrimitiveArrayReader::<FloatType>::new(
                 pages,
                 col_descr,
                 Some(arrow_type),
                 batch_size,
+                padding_threshold,
             )?),
             PhysicalType::DOUBLE => Box::new(PrimitiveArrayReader::<DoubleType>::new(
                 pages,
                 col_descr,
                 Some(arrow_type),
                 batch_size,
+                padding_threshold,
             )?),
             PhysicalType::INT96 => Box::new(PrimitiveArrayReader::<Int96Type>::new(
                 pages,
                 col_descr,
                 Some(arrow_type),
                 batch_size,
+                padding_threshold,
             )?),
             PhysicalType::BYTE_ARRAY => match arrow_type {
                 arrow::datatypes::DataType::Utf8View | arrow::datatypes::DataType::BinaryView => {
-                    make_byte_view_array_reader(pages, col_descr, Some(arrow_type), batch_size)?
+                    make_byte_view_array_reader(
+                        pages,
+                        col_descr,
+                        Some(arrow_type),
+                        batch_size,
+                        padding_threshold,
+                    )?
                 }
-                _ => make_byte_array_reader(pages, col_descr, Some(arrow_type), batch_size)?,
+                _ => make_byte_array_reader(
+                    pages,
+                    col_descr,
+                    Some(arrow_type),
+                    batch_size,
+                    padding_threshold,
+                )?,
             },
-            PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-                make_fixed_len_byte_array_reader(pages, col_descr, Some(arrow_type), batch_size)?
-            }
+            PhysicalType::FIXED_LEN_BYTE_ARRAY => make_fixed_len_byte_array_reader(
+                pages,
+                col_descr,
+                Some(arrow_type),
+                batch_size,
+                padding_threshold,
+            )?,
         }
     };
     Ok(reader)
@@ -231,6 +275,7 @@ fn wrap_in_list_like(
     def_level: i16,
     rep_level: i16,
     nullable: bool,
+    parent_threshold: Option<i16>,
 ) -> Box<dyn ArrayReader> {
     match arrow_type {
         arrow::datatypes::DataType::LargeList(_) => Box::new(ListArrayReader::<i64>::new(
@@ -239,6 +284,7 @@ fn wrap_in_list_like(
             def_level,
             rep_level,
             nullable,
+            parent_threshold,
         )),
         arrow::datatypes::DataType::FixedSizeList(_, size) => {
             Box::new(FixedSizeListArrayReader::new(
@@ -248,6 +294,7 @@ fn wrap_in_list_like(
                 def_level,
                 rep_level,
                 nullable,
+                parent_threshold,
             ))
         }
         _ => Box::new(ListArrayReader::<i32>::new(
@@ -256,6 +303,7 @@ fn wrap_in_list_like(
             def_level,
             rep_level,
             nullable,
+            parent_threshold,
         )),
     }
 }
@@ -281,6 +329,7 @@ fn build_top_field_reader(
         metadata,
         rg_idx,
         chunk_size,
+        padding_threshold: None,
     };
     let reader = builder.build(parquet_type, arrow_field.data_type(), 0, 0, &mut leaf_idx)?;
     Ok((reader, total_rows))
@@ -291,14 +340,24 @@ fn build_top_field_reader(
 /// `leaf_idx` is the depth-first cursor into parquet leaf columns.
 /// `parent_def_level` / `parent_rep_level` are the PARENT-context level
 /// counters (before this type's repetition is applied).
+#[derive(Clone, Copy)]
 struct FieldReaderBuilder<'a> {
     chunks: &'a HashMap<usize, OffsetBytes>,
     metadata: &'a ParquetMetaData,
     rg_idx: usize,
     chunk_size: usize,
+    // List/map children omit entries for null or empty parent containers.
+    // Structs propagate the nearest enclosing list threshold unchanged.
+    padding_threshold: Option<i16>,
 }
 
 impl FieldReaderBuilder<'_> {
+    fn with_padding_threshold(&self, threshold: i16) -> Self {
+        Self {
+            padding_threshold: Some(threshold),
+            ..*self
+        }
+    }
     fn chunk_for(&self, leaf_idx: usize) -> ParquetResult<OffsetBytes> {
         self.chunks.get(&leaf_idx).cloned().ok_or_else(|| {
             ParquetError::General(format!(
@@ -385,6 +444,7 @@ impl FieldReaderBuilder<'_> {
                 def_level,
                 rep_level,
                 self.chunk_size,
+                Some(def_level),
             )?;
             return Ok(wrap_in_list_like(
                 inner_reader,
@@ -392,6 +452,7 @@ impl FieldReaderBuilder<'_> {
                 def_level,
                 rep_level,
                 false,
+                self.padding_threshold,
             ));
         }
 
@@ -407,6 +468,7 @@ impl FieldReaderBuilder<'_> {
             def_level,
             rep_level,
             self.chunk_size,
+            self.padding_threshold,
         )
     }
 
@@ -459,8 +521,13 @@ impl FieldReaderBuilder<'_> {
 
         let mut child_readers = Vec::with_capacity(parquet_fields.len());
         let mut child_arrow_fields: Vec<Arc<ArrowField>> = Vec::with_capacity(parquet_fields.len());
+        let child_builder = if repetition == Repetition::REPEATED {
+            self.with_padding_threshold(def_level)
+        } else {
+            *self
+        };
         for (parquet_child, arrow_child) in parquet_fields.iter().zip(arrow_fields.iter()) {
-            let reader = self.build(
+            let reader = child_builder.build(
                 parquet_child,
                 arrow_child.data_type(),
                 def_level,
@@ -485,6 +552,7 @@ impl FieldReaderBuilder<'_> {
             def_level,
             rep_level,
             nullable,
+            child_builder.padding_threshold,
         ));
 
         if repetition == Repetition::REPEATED {
@@ -496,6 +564,7 @@ impl FieldReaderBuilder<'_> {
                 def_level,
                 rep_level,
                 false,
+                self.padding_threshold,
             ))
         } else {
             Ok(struct_reader)
@@ -569,6 +638,7 @@ impl FieldReaderBuilder<'_> {
                 elem_def_level,
                 elem_rep_level,
                 self.chunk_size,
+                Some(elem_def_level),
             )?;
             return Ok(wrap_in_list_like(
                 inner_reader,
@@ -576,6 +646,7 @@ impl FieldReaderBuilder<'_> {
                 elem_def_level,
                 elem_rep_level,
                 nullable,
+                self.padding_threshold,
             ));
         }
 
@@ -601,7 +672,7 @@ impl FieldReaderBuilder<'_> {
 
         // Standard 3-level LIST.
         let item_type = &items[0];
-        let item_reader = self.build(
+        let item_reader = self.with_padding_threshold(elem_def_level).build(
             item_type,
             inner_arrow_field.data_type(),
             elem_def_level,
@@ -614,6 +685,7 @@ impl FieldReaderBuilder<'_> {
             elem_def_level,
             elem_rep_level,
             nullable,
+            self.padding_threshold,
         ))
     }
 
@@ -689,14 +761,15 @@ impl FieldReaderBuilder<'_> {
             }
         };
 
-        let key_reader = self.build(
+        let child_builder = self.with_padding_threshold(def_level);
+        let key_reader = child_builder.build(
             map_key,
             arrow_key_field.data_type(),
             def_level,
             rep_level,
             leaf_idx,
         )?;
-        let value_reader = self.build(
+        let value_reader = child_builder.build(
             map_value,
             arrow_value_field.data_type(),
             def_level,
@@ -711,6 +784,7 @@ impl FieldReaderBuilder<'_> {
             def_level,
             rep_level,
             nullable,
+            self.padding_threshold,
         )))
     }
 }
@@ -730,6 +804,12 @@ pub(super) async fn decode_one_streaming(
     path: Arc<str>,
     sender: tokio::sync::mpsc::Sender<common_error::DaftResult<ArrayRef>>,
 ) {
+    if selection
+        .as_ref()
+        .is_some_and(|selection| selection.row_count() == 0)
+    {
+        return;
+    }
     let result: ParquetResult<()> = async {
         let (mut reader, total_rows) = build_top_field_reader(
             chunks.as_ref(),

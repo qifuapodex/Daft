@@ -40,6 +40,7 @@ pub struct GlobScanOperator {
     // When creating the glob scan operator, we might collect file metadata for the first file during schema inference.
     // Cache this metadata (along with the first filepath) so we can use it to populate the stats for the first scan task.
     first_metadata: Option<(String, TableMetadata)>,
+    first_parquet_metadata: Option<Arc<daft_parquet::DaftParquetMetadata>>,
 }
 
 /// Wrapper struct that implements a sync Iterator for a BoxStream
@@ -174,6 +175,7 @@ impl GlobScanOperator {
             "GlobScanOperator::try_new schema inference for {first_glob_path}"
         ));
 
+        let mut first_parquet_metadata = None;
         let (schema, first_metadata, first_filepath) = if infer_schema {
             // Limit to 1 so the background listing task blocks after the first result,
             // avoiding unnecessary S3 list-objects calls during schema inference.
@@ -305,6 +307,7 @@ impl GlobScanOperator {
                             column_sizes: (!column_sizes.is_empty()).then_some(column_sizes),
                         },
                     ));
+                    first_parquet_metadata = Some(Arc::new(metadata));
                     (schema, first_metadata, filepath)
                 }
                 FileFormatConfig::Csv(CsvSourceConfig {
@@ -557,6 +560,7 @@ impl GlobScanOperator {
             generated_fields: Arc::new(generated_fields),
             skip_glob,
             first_metadata,
+            first_parquet_metadata,
         })
     }
 }
@@ -737,6 +741,11 @@ impl ScanOperator for GlobScanOperator {
                     } else {
                         (None, None)
                     };
+                    let parquet_metadata = if first_filepath.is_some_and(|first| path == *first) {
+                        self.first_parquet_metadata.clone()
+                    } else {
+                        None
+                    };
                     let row_group = row_groups
                         .as_ref()
                         .and_then(|rgs| rgs.get(idx).cloned())
@@ -758,7 +767,7 @@ impl ScanOperator for GlobScanOperator {
                                 path,
                                 chunk_spec,
                                 iceberg_delete_files: None,
-                                parquet_metadata: None,
+                                parquet_metadata,
                             },
                         }],
                         source_config.clone(),

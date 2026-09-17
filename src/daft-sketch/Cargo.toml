@@ -1,6 +1,10 @@
 [dependencies]
-arrow-array = {workspace = true}
+arrow-array = {workspace = true, features = ["ffi"]}
 arrow-schema = {workspace = true}
+# serde_arrow does not yet support Arrow 60. Keep its Arrow version confined
+# to the C Data Interface adapter in arrow_serde.rs.
+arrow-array-59 = {package = "arrow-array", version = "59.3.0", features = ["ffi"]}
+arrow-schema-59 = {package = "arrow-schema", version = "59.3.0", features = ["ffi"]}
 common-error = {path = "../common/error", default-features = false}
 serde_arrow = {version = "0.14.2", features = ["arrow-59"]}
 sketches-ddsketch = {workspace = true}

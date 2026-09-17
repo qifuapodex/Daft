@@ -60,7 +60,10 @@ pub(super) async fn spawn_col_decoders(
     // The reader picks its own per-RG access pattern (batched pre-fetch for
     // local, lazy per-column for remote). See `ChunkSource::open_rg`.
     let all_leaves: Arc<[usize]> = leaves_for_top_fields(metadata.as_ref(), col_indices).into();
-    let rg_reader = chunk_source.clone().open_rg(rg_idx, all_leaves).await?;
+    let rg_reader = chunk_source
+        .clone()
+        .open_rg(rg_idx, all_leaves, selection)
+        .await?;
 
     let compute = get_compute_runtime();
     let mut rxs = Vec::with_capacity(col_indices.len());

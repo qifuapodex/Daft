@@ -242,13 +242,18 @@ fn split_by_row_groups(
                         let io_stats =
                             IOStatsContext::new(format!("split_by_row_groups for {path:#?}"));
 
-                        let file_metadata = io_runtime
-                            .block_on_current_thread(read_parquet_metadata(
-                                path,
-                                io_client,
-                                Some(io_stats),
-                                field_id_mapping.clone(),
-                            ))?;
+                        let file_metadata = match source.get_parquet_metadata()
+                            .filter(|m| m.full_file_metadata().is_some())
+                        {
+                            Some(metadata) => metadata.clone(),
+                            None => Arc::new(io_runtime
+                                .block_on_current_thread(read_parquet_metadata(
+                                    path,
+                                    io_client,
+                                    Some(io_stats),
+                                    field_id_mapping.clone(),
+                                ))?),
+                        };
 
                         let mut new_tasks: Vec<DaftResult<ScanTaskRef>> = Vec::new();
                         let mut curr_row_group_indices = Vec::new();

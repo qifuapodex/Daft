@@ -94,9 +94,8 @@ pub struct ParquetReadOptions {
     pub field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
     pub delete_rows: Option<Vec<i64>>,
     pub batch_size: Option<usize>,
-    // TODO(arrow-rs): wire this through to the arrowrs reader to skip redundant footer reads.
-    // The arrowrs reader currently reads its own metadata via ArrowReaderMetadata::load(),
-    // but callers (e.g. scan_task.rs) already have pre-fetched DaftParquetMetadata from planning.
+    /// Reuse the planning footer when its original full-file metadata is available.
+    /// Serialized subsets fall back to a footer read to preserve global row indices.
     pub metadata: Option<Arc<DaftParquetMetadata>>,
     pub ignore_corrupt_files: bool,
     pub skipped_corrupt_files: SkippedCorruptFilesCollector,
@@ -645,6 +644,170 @@ mod tests {
 
     const PARQUET_FILE: &str = "s3://daft-public-data/test_fixtures/parquet-dev/mvp.parquet";
     const PARQUET_FILE_LOCAL: &str = "tests/assets/parquet-data/mvp.parquet";
+
+    #[test]
+    fn test_page_reads_with_field_id_projection() {
+        use arrow::{array::Int64Array as ArrowInt64Array, datatypes::Schema as ArrowSchema};
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let fields = [("discarded", 1), ("original", 2)].map(|(name, id)| {
+            arrow::datatypes::Field::new(name, DataType::Int64, false).with_metadata(
+                std::collections::HashMap::from([("PARQUET:field_id".to_string(), id.to_string())]),
+            )
+        });
+        let schema = Arc::new(ArrowSchema::new(fields.to_vec()));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        writer
+            .write(
+                &arrow::array::RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(ArrowInt64Array::from_iter_values(0..30)),
+                        Arc::new(ArrowInt64Array::from_iter_values(1000..1030)),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+        let uri = file.path().to_str().unwrap().to_owned();
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        get_io_runtime(true)
+            .block_within_async_context(async move {
+                let metadata = Arc::new(
+                    read_parquet_metadata(&uri, io_client.clone(), None, None)
+                        .await
+                        .unwrap(),
+                );
+                for cached in [None, Some(metadata)] {
+                    let opts = ParquetReadOptions {
+                        metadata: cached,
+                        field_id_mapping: Some(Arc::new(BTreeMap::from([(
+                            2,
+                            Field::new("renamed", daft_core::prelude::DataType::Int64),
+                        )]))),
+                        columns: Some(vec!["renamed".into()]),
+                        start_offset: Some(3),
+                        num_rows: Some(10),
+                        ..Default::default()
+                    };
+                    let rb = read_parquet_into_recordbatch(&uri, io_client.clone(), None, opts)
+                        .await
+                        .unwrap();
+                    let array = rb.get_inner_arrow_arrays().next().unwrap();
+                    let actual = array
+                        .as_any()
+                        .downcast_ref::<ArrowInt64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec();
+                    assert_eq!(actual, (1003..1013).collect::<Vec<_>>());
+                }
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_cached_split_metadata_preserves_file_row_indices() {
+        use arrow::{array::Int64Array as ArrowInt64Array, datatypes::Schema as ArrowSchema};
+        use parquet::{
+            arrow::ArrowWriter,
+            file::{
+                properties::WriterProperties, reader::FileReader,
+                serialized_reader::SerializedFileReader,
+            },
+        };
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        writer
+            .write(
+                &arrow::array::RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(ArrowInt64Array::from_iter_values(0..30))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+        let metadata = Arc::new(
+            SerializedFileReader::new(file.reopen().unwrap())
+                .unwrap()
+                .metadata()
+                .clone(),
+        );
+        let full = DaftParquetMetadata::from_arrowrs(metadata.clone());
+        let split =
+            full.clone_with_row_groups(20, full.row_groups().filter(|(i, _)| *i != 1).collect());
+        assert!(Arc::ptr_eq(split.full_file_metadata().unwrap(), &metadata));
+        let config = bincode::config::legacy();
+        let bytes = bincode::serde::encode_to_vec(&split, config).unwrap();
+        // The existing 3-element wire representation is unchanged. A subset
+        // crossing a serialization boundary must reload the original footer.
+        let ((_, indices, rows), _): ((Vec<u8>, Vec<usize>, i64), _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(indices, vec![0, 2]);
+        assert_eq!(rows, 20);
+        let (decoded, _): (DaftParquetMetadata, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert!(decoded.full_file_metadata().is_none());
+
+        let uri = file.path().to_str().unwrap().to_owned();
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        get_io_runtime(true)
+            .block_within_async_context(async move {
+                for cached in [
+                    None,
+                    Some(Arc::new(full)),
+                    Some(Arc::new(split)),
+                    Some(Arc::new(decoded)),
+                ] {
+                    for offset in [0, 12, 22] {
+                        let opts = ParquetReadOptions {
+                            metadata: cached.clone(),
+                            row_groups: Some(vec![2, 0, 2]),
+                            start_offset: Some(offset),
+                            delete_rows: Some(vec![5, 22, 27]),
+                            batch_size: Some(3),
+                            ..Default::default()
+                        };
+                        let rb = read_parquet_into_recordbatch(&uri, io_client.clone(), None, opts)
+                            .await
+                            .unwrap();
+                        let array = rb.get_inner_arrow_arrays().next().unwrap();
+                        let actual = array
+                            .as_any()
+                            .downcast_ref::<ArrowInt64Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec();
+                        let expected: Vec<i64> = [2, 0, 2]
+                            .into_iter()
+                            .flat_map(|rg| rg * 10..rg * 10 + 10)
+                            .filter(|&i| i >= offset as i64 && ![5, 22, 27].contains(&i))
+                            .collect();
+                        assert_eq!(actual, expected);
+                    }
+                }
+            })
+            .unwrap();
+    }
 
     fn get_local_parquet_path() -> String {
         let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

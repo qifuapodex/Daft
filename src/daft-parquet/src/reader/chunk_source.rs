@@ -3,16 +3,18 @@ use std::{collections::HashMap, pin::Pin, sync::Arc};
 use bytes::Bytes;
 use common_runtime::{RuntimeTask, get_io_runtime};
 use daft_dsl::optimization::get_required_columns;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use parquet::{
-    arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
+    arrow::{arrow_reader::RowSelection, async_reader::MetadataFetch},
     errors::Result as ParquetResult,
     file::{
-        metadata::ParquetMetaData,
+        metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
         reader::{ChunkReader, Length},
     },
 };
 use snafu::{OptionExt, ResultExt};
 
+use super::page_ranges::{LeafRange, PAGE_COALESCE_GAP, selected_leaf_ranges};
 use crate::{
     ParquetMetadataSnafu, ReaderInternalSnafu,
     metadata::apply_field_ids_to_arrowrs_parquet_metadata, read::ParquetReadOptions, task_err,
@@ -67,7 +69,8 @@ async fn drive_group(slot: &GroupSlot, path: &str) -> GroupResult {
 
 pub(super) async fn open_local_file(
     path: &str,
-) -> crate::Result<(Arc<std::fs::File>, u64, ArrowReaderMetadata)> {
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+) -> crate::Result<(Arc<std::fs::File>, u64, Arc<ParquetMetaData>)> {
     let path_owned = path.to_string();
     let path_for_join = path.to_string();
     get_io_runtime(true)
@@ -83,12 +86,15 @@ pub(super) async fn open_local_file(
                     source: e,
                 })?
                 .len();
-            let meta =
-                ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).with_context(|_| {
-                    ParquetMetadataSnafu {
-                        path: path_owned.clone(),
-                    }
-                })?;
+            let meta = match cached_metadata {
+                Some(metadata) => Ok(metadata),
+                None => ParquetMetaDataReader::new()
+                    .parse_and_finish(&file)
+                    .map(Arc::new),
+            }
+            .with_context(|_| ParquetMetadataSnafu {
+                path: path_owned.clone(),
+            })?;
             crate::Result::Ok((Arc::new(file), file_len, meta))
         })
         .await
@@ -100,16 +106,25 @@ pub(super) async fn prepare_remote_chunk_source(
     io_client: Arc<daft_io::IOClient>,
     io_stats: Option<daft_io::IOStatsRef>,
     opts: &ParquetReadOptions,
-) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
+) -> crate::Result<(ChunkSourceBuilder, Arc<ParquetMetaData>)> {
+    let metadata_fut = async {
+        match opts.metadata.as_ref().and_then(|m| m.full_file_metadata()) {
+            Some(metadata) => Ok(metadata.clone()),
+            None => {
+                crate::metadata::read_parquet_metadata(
+                    uri,
+                    None,
+                    io_client.clone(),
+                    io_stats.clone(),
+                    None,
+                    None,
+                )
+                .await
+            }
+        }
+    };
     let (parquet_metadata_res, file_size_res) = Box::pin(futures::future::join(
-        crate::metadata::read_parquet_metadata(
-            uri,
-            None,
-            io_client.clone(),
-            io_stats.clone(),
-            None,
-            None,
-        ),
+        metadata_fut,
         io_client.single_url_get_size(uri.to_string(), io_stats.clone()),
     ))
     .await;
@@ -152,10 +167,6 @@ pub(super) async fn prepare_remote_chunk_source(
     };
 
     let path: Arc<str> = Arc::from(uri);
-    let meta = ArrowReaderMetadata::try_new(parquet_metadata, ArrowReaderOptions::new())
-        .with_context(|_| ParquetMetadataSnafu {
-            path: uri.to_string(),
-        })?;
     let builder = ChunkSourceBuilder::Remote(RemoteChunkSourcePrep {
         path,
         uri: uri.to_string(),
@@ -164,14 +175,7 @@ pub(super) async fn prepare_remote_chunk_source(
         io_client,
         io_stats,
     });
-    Ok((builder, meta))
-}
-
-#[derive(Copy, Clone)]
-struct LeafRange {
-    leaf: usize,
-    start: u64,
-    len: u64,
+    Ok((builder, parquet_metadata))
 }
 
 struct RangeGroup {
@@ -180,14 +184,45 @@ struct RangeGroup {
     members: Vec<LeafRange>,
 }
 
-/// `ChunkReader` windowed over a single column chunk's bytes. Reports the
-/// file's total length but translates absolute offsets to local-buffer offsets,
-/// so `SerializedPageReader` works without holding the whole file in memory.
+/// A column's contiguous bytes or selected page fragments, addressed by their
+/// absolute file offsets. Full scans use the contiguous representation without
+/// allocating a fragment vector.
 #[derive(Clone)]
 pub(crate) struct OffsetBytes {
     base: u64,
     file_len: u64,
     bytes: Bytes,
+    fragments: Option<Arc<Vec<(u64, Bytes)>>>,
+}
+
+impl OffsetBytes {
+    fn from_fragments(file_len: u64, mut fragments: Vec<(u64, Bytes)>) -> Self {
+        fragments.sort_unstable_by_key(|(offset, _)| *offset);
+        Self {
+            base: 0,
+            file_len,
+            bytes: Bytes::new(),
+            fragments: Some(Arc::new(fragments)),
+        }
+    }
+
+    fn window(&self, start: u64) -> ParquetResult<(u64, &Bytes)> {
+        match &self.fragments {
+            None => Ok((self.base, &self.bytes)),
+            Some(fragments) => {
+                let index = fragments.partition_point(|(base, _)| *base <= start);
+                let (base, bytes) = index
+                    .checked_sub(1)
+                    .and_then(|i| fragments.get(i))
+                    .ok_or_else(|| {
+                        parquet::errors::ParquetError::General(format!(
+                            "Parquet byte offset {start} was not fetched"
+                        ))
+                    })?;
+                Ok((*base, bytes))
+            }
+        }
+    }
 }
 
 impl Length for OffsetBytes {
@@ -200,43 +235,51 @@ impl ChunkReader for OffsetBytes {
     type T = bytes::buf::Reader<Bytes>;
 
     fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
-        let local = start.checked_sub(self.base).ok_or_else(|| {
-            parquet::errors::ParquetError::General(format!(
-                "OffsetBytes::get_read: start {} < base {}",
-                start, self.base
-            ))
-        })? as usize;
-        if local > self.bytes.len() {
+        let (base, bytes) = self.window(start)?;
+        let local = start
+            .checked_sub(base)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| {
+                parquet::errors::ParquetError::General(format!(
+                    "OffsetBytes::get_read: invalid start {} relative to base {}",
+                    start, base
+                ))
+            })?;
+        if local > bytes.len() {
             return Err(parquet::errors::ParquetError::General(format!(
                 "OffsetBytes::get_read: start {} past chunk end (local {} > len {})",
                 start,
                 local,
-                self.bytes.len()
+                bytes.len()
             )));
         }
         use bytes::Buf;
-        Ok(self.bytes.slice(local..).reader())
+        Ok(bytes.slice(local..).reader())
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        let local = start.checked_sub(self.base).ok_or_else(|| {
-            parquet::errors::ParquetError::General(format!(
-                "OffsetBytes::get_bytes: start {} < base {}",
-                start, self.base
-            ))
-        })? as usize;
+        let (base, bytes) = self.window(start)?;
+        let local = start
+            .checked_sub(base)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| {
+                parquet::errors::ParquetError::General(format!(
+                    "OffsetBytes::get_bytes: invalid start {} relative to base {}",
+                    start, base
+                ))
+            })?;
         let end = local.checked_add(length).ok_or_else(|| {
             parquet::errors::ParquetError::General("OffsetBytes::get_bytes: offset overflow".into())
         })?;
-        if end > self.bytes.len() {
+        if end > bytes.len() {
             return Err(parquet::errors::ParquetError::General(format!(
                 "OffsetBytes::get_bytes: range {}..{} past chunk end (len {})",
                 local,
                 end,
-                self.bytes.len()
+                bytes.len()
             )));
         }
-        Ok(self.bytes.slice(local..end))
+        Ok(bytes.slice(local..end))
     }
 }
 
@@ -267,6 +310,44 @@ pub(crate) struct RemoteChunkSourcePrep {
 }
 
 impl ChunkSourceBuilder {
+    pub(super) async fn load_offset_indexes(
+        &self,
+        metadata: Arc<ParquetMetaData>,
+    ) -> crate::Result<Arc<ParquetMetaData>> {
+        let mut reader = ParquetMetaDataReader::new_with_metadata((*metadata).clone())
+            .with_offset_index_policy(PageIndexPolicy::Optional)
+            .with_column_index_policy(PageIndexPolicy::Skip);
+        let path = self.path().to_string();
+        match self {
+            Self::Local(source) => {
+                let file = source.file.clone();
+                let join_path = path.clone();
+                get_io_runtime(true)
+                    .spawn_blocking(move || {
+                        reader
+                            .read_page_indexes(file.as_ref())
+                            .with_context(|_| ParquetMetadataSnafu { path: path.clone() })?;
+                        reader
+                            .finish()
+                            .map(Arc::new)
+                            .with_context(|_| ParquetMetadataSnafu { path })
+                    })
+                    .await
+                    .map_err(task_err(join_path))?
+            }
+            Self::Remote(source) => {
+                reader
+                    .load_page_index(RemoteMetadataFetch(source))
+                    .await
+                    .with_context(|_| ParquetMetadataSnafu { path: path.clone() })?;
+                reader
+                    .finish()
+                    .map(Arc::new)
+                    .with_context(|_| ParquetMetadataSnafu { path })
+            }
+        }
+    }
+
     pub(super) fn path(&self) -> &Arc<str> {
         match self {
             Self::Local(s) => &s.path,
@@ -280,9 +361,18 @@ impl ChunkSourceBuilder {
         self,
         parquet_metadata: Arc<ParquetMetaData>,
         rg_indices: &[usize],
+        defer_reads: bool,
     ) -> ChunkSource {
         match self {
-            Self::Local(cs) => ChunkSource::Local(cs),
+            Self::Local(mut cs) => {
+                // Prepared metadata may remap/drop Iceberg columns or include
+                // offset indexes. I/O and decoding must use the same leaf indices.
+                cs.metadata = parquet_metadata;
+                ChunkSource::Local(cs)
+            }
+            Self::Remote(prep) if defer_reads => {
+                ChunkSource::Remote(RemoteChunkSource::from_deferred(prep, parquet_metadata))
+            }
             Self::Remote(prep) => ChunkSource::Remote(RemoteChunkSource::from_ranged(
                 prep.path,
                 parquet_metadata,
@@ -297,11 +387,53 @@ impl ChunkSourceBuilder {
     }
 }
 
+struct RemoteMetadataFetch<'a>(&'a RemoteChunkSourcePrep);
+
+impl MetadataFetch for RemoteMetadataFetch<'_> {
+    fn fetch(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, ParquetResult<Bytes>> {
+        async move {
+            if range.start > range.end || range.end > self.0.file_size as u64 {
+                return Err(parquet::errors::ParquetError::General(
+                    "Parquet index range exceeds file length".into(),
+                ));
+            }
+            let len = (range.end - range.start) as usize;
+            let result = self
+                .0
+                .io_client
+                .single_url_get(
+                    self.0.uri.clone(),
+                    Some(daft_io::range::GetRange::Bounded(
+                        range.start as usize..range.end as usize,
+                    )),
+                    self.0.io_stats.clone(),
+                )
+                .await
+                .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))?;
+            let bytes = result
+                .bytes()
+                .await
+                .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))?;
+            if bytes.len() != len {
+                return Err(parquet::errors::ParquetError::General(
+                    "Parquet index range response length mismatch".into(),
+                ));
+            }
+            Ok(bytes)
+        }
+        .boxed()
+    }
+}
+
 impl ChunkSource {
     pub(super) async fn read_rg_chunks(
         &self,
         rg_idx: usize,
         leaves: Arc<[usize]>,
+        selection: Option<&RowSelection>,
     ) -> crate::Result<HashMap<usize, OffsetBytes>> {
         match self {
             // Local pread is sync; offload to the IO runtime's blocking pool so
@@ -310,12 +442,15 @@ impl ChunkSource {
             Self::Local(s) => {
                 let s = s.clone();
                 let path = s.path.clone();
+                let selection = selection.cloned();
                 get_io_runtime(true)
-                    .spawn_blocking(move || s.read_rg_chunks_sync(rg_idx, &leaves))
+                    .spawn_blocking(move || {
+                        s.read_rg_chunks_sync(rg_idx, &leaves, selection.as_ref())
+                    })
                     .await
                     .map_err(task_err(path.to_string()))?
             }
-            Self::Remote(s) => s.read_rg_chunks(rg_idx, &leaves).await,
+            Self::Remote(s) => s.read_rg_chunks(rg_idx, &leaves, selection).await,
         }
     }
 
@@ -327,24 +462,28 @@ impl ChunkSource {
     ///   every column decoder reads slices from the same `Arc<HashMap>`. The
     ///   alternative (per-column reads) would multiply `spawn_blocking` calls
     ///   by `num_cols`, dominating wide-schema runtimes.
-    /// - `Remote`: returns a lazy handle. Each decoder later asks for its own
+    /// - Full remote scans return a lazy handle. Each decoder asks for its own
     ///   leaves and awaits only the coalesced byte-range groups covering them,
     ///   so fast columns start streaming while slower groups are still in
     ///   flight.
+    /// - Selective remote scans batch all requested leaves after the selection
+    ///   is known, so sparse requests can still coalesce across columns.
     pub(super) async fn open_rg(
         self: Arc<Self>,
         rg_idx: usize,
         all_leaves: Arc<[usize]>,
+        selection: Option<&RowSelection>,
     ) -> crate::Result<RgReader> {
         match self.as_ref() {
-            Self::Local(_) => {
-                let chunks = self.read_rg_chunks(rg_idx, all_leaves).await?;
-                Ok(RgReader::PreFetched(Arc::new(chunks)))
-            }
-            Self::Remote(_) => Ok(RgReader::Lazy {
+            Self::Remote(s) if s.deferred.is_none() => Ok(RgReader::Lazy {
                 chunk_source: self,
                 rg_idx,
+                selection: selection.cloned().map(Arc::new),
             }),
+            _ => {
+                let chunks = self.read_rg_chunks(rg_idx, all_leaves, selection).await?;
+                Ok(RgReader::PreFetched(Arc::new(chunks)))
+            }
         }
     }
 }
@@ -358,6 +497,7 @@ pub(crate) enum RgReader {
     Lazy {
         chunk_source: Arc<ChunkSource>,
         rg_idx: usize,
+        selection: Option<Arc<RowSelection>>,
     },
 }
 
@@ -371,8 +511,11 @@ impl RgReader {
             Self::Lazy {
                 chunk_source,
                 rg_idx,
+                selection,
             } => Ok(Arc::new(
-                chunk_source.read_rg_chunks(*rg_idx, col_leaves).await?,
+                chunk_source
+                    .read_rg_chunks(*rg_idx, col_leaves, selection.as_deref())
+                    .await?,
             )),
         }
     }
@@ -399,81 +542,125 @@ impl LocalChunkSource {
         &self,
         rg_idx: usize,
         leaves: &[usize],
+        selection: Option<&RowSelection>,
     ) -> crate::Result<HashMap<usize, OffsetBytes>> {
         if leaves.is_empty() {
             return Ok(HashMap::new());
         }
-        let rg = self.metadata.row_group(rg_idx);
-        let leaf_ranges: Vec<LeafRange> = leaves
-            .iter()
-            .map(|&l| {
-                let (start, len) = rg.column(l).byte_range();
-                LeafRange {
-                    leaf: l,
-                    start,
-                    len,
-                }
-            })
-            .collect();
+        let leaf_ranges = match selection {
+            Some(selection) => selected_leaf_ranges(
+                &self.metadata,
+                rg_idx,
+                leaves,
+                Some(selection),
+                self.file_len,
+            )
+            .with_context(|_| ParquetMetadataSnafu {
+                path: self.path.to_string(),
+            })?,
+            None => leaves
+                .iter()
+                .map(|&leaf| {
+                    let (start, len) = self.metadata.row_group(rg_idx).column(leaf).byte_range();
+                    LeafRange { leaf, start, len }
+                })
+                .collect(),
+        };
         let groups = coalesce_ranges(leaf_ranges, Self::MAX_COALESCE_GAP);
         let mut out = HashMap::with_capacity(leaves.len());
+        let mut sparse = selection.map(|_| HashMap::<usize, Vec<(u64, Bytes)>>::new());
         for RangeGroup {
             start: group_start,
             end: group_end,
             members,
         } in groups
         {
-            let group_len = (group_end - group_start) as usize;
+            let group_len = usize::try_from(group_end - group_start).map_err(|_| {
+                crate::Error::ReaderInternal {
+                    path: self.path.to_string(),
+                    message: "Parquet read range is too large".into(),
+                }
+            })?;
             let mut buf = vec![0u8; group_len];
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileExt;
-                self.file
-                    .read_at(&mut buf, group_start)
-                    .map_err(|e| crate::Error::LocalIO {
-                        path: self.path.to_string(),
-                        source: std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "pread for rg={} coalesced range {}..{}: {}",
-                                rg_idx, group_start, group_end, e
-                            ),
-                        ),
-                    })?;
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::FileExt;
-                self.file
-                    .seek_read(&mut buf, group_start)
-                    .map_err(|e| crate::Error::LocalIO {
-                        path: self.path.to_string(),
-                        source: std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "seek_read for rg={} coalesced range {}..{}: {}",
-                                rg_idx, group_start, group_end, e
-                            ),
-                        ),
-                    })?;
-            }
+            read_exact_file_at(&self.file, &mut buf, group_start).map_err(|e| {
+                crate::Error::LocalIO {
+                    path: self.path.to_string(),
+                    source: std::io::Error::new(
+                        e.kind(),
+                        format!("pread for rg={rg_idx} range {group_start}..{group_end}: {e}"),
+                    ),
+                }
+            })?;
             let group_bytes = Bytes::from(buf);
             for LeafRange { leaf, start, len } in members {
                 let local_start = (start - group_start) as usize;
-                let local_end = local_start + len as usize;
-                let slice = group_bytes.slice(local_start..local_end);
-                out.insert(
-                    leaf,
-                    OffsetBytes {
-                        base: start,
-                        file_len: self.file_len,
-                        bytes: slice,
-                    },
-                );
+                let slice = group_bytes.slice(local_start..local_start + len as usize);
+                if let Some(sparse) = sparse.as_mut() {
+                    sparse.entry(leaf).or_default().push((start, slice));
+                } else {
+                    out.insert(
+                        leaf,
+                        OffsetBytes {
+                            base: start,
+                            file_len: self.file_len,
+                            bytes: slice,
+                            fragments: None,
+                        },
+                    );
+                }
             }
+        }
+        if let Some(sparse) = sparse {
+            out.extend(
+                sparse
+                    .into_iter()
+                    .map(|(leaf, parts)| (leaf, OffsetBytes::from_fragments(self.file_len, parts))),
+            );
         }
         Ok(out)
     }
+}
+
+fn read_exact_range(
+    mut target: &mut [u8],
+    mut offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    while !target.is_empty() {
+        let n = match read(target, offset) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short Parquet range read",
+            ));
+        }
+        offset = offset.checked_add(n as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Parquet read offset overflow",
+            )
+        })?;
+        target = &mut target[n..];
+    }
+    Ok(())
+}
+
+fn read_exact_file_at(file: &std::fs::File, target: &mut [u8], offset: u64) -> std::io::Result<()> {
+    read_exact_range(target, offset, |buf, offset| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_at(buf, offset)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(buf, offset)
+        }
+    })
 }
 
 type SharedErr = Arc<crate::Error>;
@@ -521,12 +708,34 @@ pub(crate) struct RemoteChunkSource {
     path: Arc<str>,
     rgs: HashMap<usize, RgState>,
     file_len: u64,
+    deferred: Option<DeferredRemoteRead>,
+}
+
+struct DeferredRemoteRead {
+    metadata: Arc<ParquetMetaData>,
+    uri: String,
+    io_client: Arc<daft_io::IOClient>,
+    io_stats: Option<daft_io::IOStatsRef>,
 }
 
 impl RemoteChunkSource {
     const MAX_COALESCE_GAP: u64 = 1024 * 1024;
     const SPLIT_THRESHOLD: u64 = 24 * 1024 * 1024;
     const MAX_REQUEST_SIZE: u64 = 16 * 1024 * 1024;
+
+    fn from_deferred(source: RemoteChunkSourcePrep, metadata: Arc<ParquetMetaData>) -> Self {
+        Self {
+            path: source.path,
+            file_len: source.file_size as u64,
+            rgs: HashMap::new(),
+            deferred: Some(DeferredRemoteRead {
+                metadata,
+                uri: source.uri,
+                io_client: source.io_client,
+                io_stats: source.io_stats,
+            }),
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn from_ranged(
@@ -613,11 +822,16 @@ impl RemoteChunkSource {
             path,
             rgs,
             file_len,
+            deferred: None,
         }
     }
 
     fn coalesce_and_split(leaf_ranges: Vec<LeafRange>) -> Vec<RangeGroup> {
-        let mut groups = coalesce_ranges(leaf_ranges, Self::MAX_COALESCE_GAP);
+        Self::coalesce_and_split_with_gap(leaf_ranges, Self::MAX_COALESCE_GAP)
+    }
+
+    fn coalesce_and_split_with_gap(leaf_ranges: Vec<LeafRange>, max_gap: u64) -> Vec<RangeGroup> {
+        let mut groups = coalesce_ranges(leaf_ranges, max_gap);
         let mut split_groups: Vec<RangeGroup> = Vec::with_capacity(groups.len());
         for RangeGroup {
             start: group_start,
@@ -662,13 +876,89 @@ impl RemoteChunkSource {
         split_groups
     }
 
+    async fn read_selected_chunks(
+        &self,
+        source: &DeferredRemoteRead,
+        rg_idx: usize,
+        leaves: &[usize],
+        selection: Option<&RowSelection>,
+    ) -> crate::Result<HashMap<usize, OffsetBytes>> {
+        let ranges =
+            selected_leaf_ranges(&source.metadata, rg_idx, leaves, selection, self.file_len)
+                .with_context(|_| ParquetMetadataSnafu {
+                    path: self.path.to_string(),
+                })?;
+        let max_gap = if selection.is_some() {
+            PAGE_COALESCE_GAP
+        } else {
+            Self::MAX_COALESCE_GAP
+        };
+        let groups = Self::coalesce_and_split_with_gap(ranges, max_gap);
+        let fetched: Vec<(RangeGroup, Bytes)> = futures::stream::iter(groups)
+            .map(|group| {
+                let io_client = source.io_client.clone();
+                let io_stats = source.io_stats.clone();
+                let uri = source.uri.clone();
+                let path = self.path.clone();
+                async move {
+                    let join_path = path.to_string();
+                    get_io_runtime(true)
+                        .spawn(async move {
+                            let expected_len = (group.end - group.start) as usize;
+                            let result = io_client
+                                .single_url_get(
+                                    uri,
+                                    Some(daft_io::range::GetRange::Bounded(
+                                        group.start as usize..group.end as usize,
+                                    )),
+                                    io_stats,
+                                )
+                                .await?;
+                            let bytes = result.bytes().await?;
+                            if bytes.len() != expected_len {
+                                return Err(crate::Error::ReaderInternal {
+                                    path: path.to_string(),
+                                    message: "Parquet data range response length mismatch".into(),
+                                });
+                            }
+                            crate::Result::Ok((group, bytes))
+                        })
+                        .await
+                        .map_err(task_err(join_path))?
+                }
+            })
+            .buffer_unordered(8)
+            .try_collect()
+            .await?;
+        let mut fragments: HashMap<usize, Vec<(u64, Bytes)>> = HashMap::with_capacity(leaves.len());
+        for (group, bytes) in fetched {
+            for member in group.members {
+                let start = (member.start - group.start) as usize;
+                fragments.entry(member.leaf).or_default().push((
+                    member.start,
+                    bytes.slice(start..start + member.len as usize),
+                ));
+            }
+        }
+        Ok(fragments
+            .into_iter()
+            .map(|(leaf, parts)| (leaf, OffsetBytes::from_fragments(self.file_len, parts)))
+            .collect())
+    }
+
     async fn read_rg_chunks(
         &self,
         rg_idx: usize,
         leaves: &[usize],
+        selection: Option<&RowSelection>,
     ) -> crate::Result<HashMap<usize, OffsetBytes>> {
         if leaves.is_empty() {
             return Ok(HashMap::new());
+        }
+        if let Some(source) = &self.deferred {
+            return self
+                .read_selected_chunks(source, rg_idx, leaves, selection)
+                .await;
         }
         let rg = self.rgs.get(&rg_idx).with_context(|| ReaderInternalSnafu {
             path: self.path.to_string(),
@@ -725,9 +1015,73 @@ impl RemoteChunkSource {
                     base: loc.leaf_start,
                     file_len: self.file_len,
                     bytes: slice,
+                    fragments: None,
                 },
             );
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_reads_retry_interruptions_and_short_reads() {
+        let input = [1, 2, 3, 4, 5];
+        let mut output = [0; 5];
+        let mut offsets = Vec::new();
+        read_exact_range(&mut output, 100, |buf, offset| {
+            offsets.push(offset);
+            if offsets.len() == 1 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(2);
+            let start = (offset - 100) as usize;
+            buf[..n].copy_from_slice(&input[start..start + n]);
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!(input, output);
+        assert_eq!(offsets, [100, 100, 102, 104]);
+    }
+
+    #[test]
+    fn exact_reads_propagate_eof_and_errors() {
+        let eof = read_exact_range(&mut [0; 4], 0, |buf, offset| {
+            if offset == 0 {
+                buf[..2].copy_from_slice(&[1, 2]);
+                Ok(2)
+            } else {
+                Ok(0)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(eof.kind(), std::io::ErrorKind::UnexpectedEof);
+        let error = read_exact_range(&mut [0; 1], 0, |_, _| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn sparse_bytes_use_absolute_offsets_and_reject_gaps() {
+        let bytes = OffsetBytes::from_fragments(
+            300,
+            vec![
+                (200, Bytes::from_static(b"xy")),
+                (100, Bytes::from_static(b"abc")),
+            ],
+        );
+        assert_eq!(bytes.len(), 300);
+        assert_eq!(bytes.get_bytes(100, 3).unwrap().as_ref(), b"abc");
+        assert_eq!(bytes.get_bytes(200, 2).unwrap().as_ref(), b"xy");
+        assert!(bytes.get_bytes(99, 1).is_err());
+        assert!(bytes.get_bytes(102, 2).is_err());
+        assert!(bytes.get_bytes(150, 1).is_err());
+        assert!(bytes.get_bytes(201, usize::MAX).is_err());
+        assert!(bytes.get_read(150).is_err());
     }
 }

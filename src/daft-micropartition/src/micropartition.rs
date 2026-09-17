@@ -537,6 +537,7 @@ fn read_parquet_into_loaded_micropartition<T: AsRef<str>>(
     catalog_provided_schema: Option<SchemaRef>,
     field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
     chunk_size: Option<usize>,
+    parquet_metadata: Option<Vec<Arc<DaftParquetMetadata>>>,
 ) -> DaftResult<MicroPartition> {
     let delete_map = iceberg_delete_files
         .map(|files| {
@@ -560,18 +561,19 @@ fn read_parquet_into_loaded_micropartition<T: AsRef<str>>(
 
     let file_column_names = get_file_column_names(columns.as_deref(), partition_spec);
     let row_groups = row_groups.as_deref();
-    let per_file: Vec<PerFileOptions> = if row_groups.is_none() && delete_map.is_none() {
-        Vec::new()
-    } else {
-        uris.iter()
-            .enumerate()
-            .map(|(i, uri)| PerFileOptions {
-                row_groups: row_groups.and_then(|rgs| rgs[i].clone()),
-                delete_rows: delete_map.as_ref().and_then(|m| m.get(*uri).cloned()),
-                metadata: None,
-            })
-            .collect()
-    };
+    let per_file: Vec<PerFileOptions> =
+        if row_groups.is_none() && delete_map.is_none() && parquet_metadata.is_none() {
+            Vec::new()
+        } else {
+            uris.iter()
+                .enumerate()
+                .map(|(i, uri)| PerFileOptions {
+                    row_groups: row_groups.and_then(|rgs| rgs[i].clone()),
+                    delete_rows: delete_map.as_ref().and_then(|m| m.get(*uri).cloned()),
+                    metadata: parquet_metadata.as_ref().and_then(|m| m.get(i)).cloned(),
+                })
+                .collect()
+        };
     let opts = ParquetBulkReadOptions {
         columns: file_column_names.map(|v| v.into_iter().map(str::to_string).collect()),
         start_offset,
@@ -672,6 +674,7 @@ pub fn read_parquet_into_micropartition<T: AsRef<str>>(
             catalog_provided_schema,
             field_id_mapping,
             chunk_size,
+            parquet_metadata,
         );
     }
     let runtime_handle = get_io_runtime(multithreaded_io);
@@ -755,6 +758,7 @@ pub fn read_parquet_into_micropartition<T: AsRef<str>>(
         catalog_provided_schema,
         field_id_mapping,
         chunk_size,
+        Some(metadata),
     )
 }
 
