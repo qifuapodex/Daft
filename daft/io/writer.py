@@ -131,6 +131,7 @@ class ParquetFileWriter(FileWriterBase):
         metadata_collector: list[pq.FileMetaData] | None = None,
         column_compression: dict[str, str] | None = None,
         compression_level: int | None = None,
+        data_page_version: str = "1.0",
     ):
         super().__init__(
             root_dir=root_dir,
@@ -147,6 +148,9 @@ class ParquetFileWriter(FileWriterBase):
         self.metadata_collector: list[pq.FileMetaData] | None = metadata_collector
         self.column_compression = column_compression
         self.compression_level = compression_level
+        if data_page_version not in ("1.0", "2.0"):
+            raise ValueError("data_page_version must be '1.0' or '2.0'")
+        self.data_page_version = data_page_version
 
     def _create_writer(self, schema: pa.Schema) -> pq.ParquetWriter:
         opts: dict[str, Any] = {}
@@ -171,6 +175,7 @@ class ParquetFileWriter(FileWriterBase):
             # https://issues.apache.org/jira/browse/ARROW-12201
             # The fix is to always use at least Parquet version 2.
             version="2.6",
+            data_page_version=self.data_page_version,
             **opts,
         )
 

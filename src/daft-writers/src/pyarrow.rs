@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use common_error::DaftResult;
-use daft_logical_plan::sink_info::CsvFormatOption;
+use daft_logical_plan::sink_info::{CsvFormatOption, ParquetDataPageVersion};
 use daft_micropartition::{MicroPartition, python::PyMicroPartition};
 use daft_recordbatch::{RecordBatch, python::PyRecordBatch};
 use pyo3::{
@@ -25,6 +25,7 @@ impl PyArrowWriter {
         partition_values: Option<&RecordBatch>,
         column_compression: Option<&[(String, String)]>,
         compression_level: Option<i32>,
+        data_page_version: ParquetDataPageVersion,
     ) -> DaftResult<Self> {
         Python::attach(|py| {
             let file_writer_module = py.import(pyo3::intern!(py, "daft.io.writer"))?;
@@ -46,6 +47,7 @@ impl PyArrowWriter {
             // dict that the pyarrow parquet writer can understand. It MUST be
             // complete, so we fill in any missing columns with the default.
             let kwargs = PyDict::new(py);
+            kwargs.set_item("data_page_version", data_page_version.as_str())?;
             if let Some(entries) = column_compression
                 && !entries.is_empty()
             {

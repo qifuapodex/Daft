@@ -365,6 +365,23 @@ impl Default for JsonFormatOption {
     }
 }
 
+/// Data page layout, independent of the file's logical types and value encodings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ParquetDataPageVersion {
+    #[default]
+    V1,
+    V2,
+}
+
+impl ParquetDataPageVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "1.0",
+            Self::V2 => "2.0",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ParquetFormatOption {
     /// Per-column compression overrides, the type matches the parquet writer builder
@@ -373,6 +390,8 @@ pub struct ParquetFormatOption {
     /// Compression level applied to every codec in use that supports one (zstd, gzip, brotli),
     /// including `column_compression` overrides. `None` keeps each codec's default level.
     pub compression_level: Option<i32>,
+    #[serde(default)]
+    pub data_page_version: ParquetDataPageVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -455,17 +474,28 @@ impl PyFormatSinkOption {
     }
 
     #[classmethod]
-    #[pyo3(signature = (column_compression=None, compression_level=None))]
+    #[pyo3(signature = (column_compression=None, compression_level=None, data_page_version="1.0"))]
     pub fn parquet(
         _cls: &pyo3::prelude::Bound<pyo3::types::PyType>,
         column_compression: Option<Vec<(String, String)>>,
         compression_level: Option<i32>,
-    ) -> Self {
-        Self {
+        data_page_version: &str,
+    ) -> pyo3::PyResult<Self> {
+        let data_page_version = match data_page_version {
+            "1.0" => ParquetDataPageVersion::V1,
+            "2.0" => ParquetDataPageVersion::V2,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "data_page_version must be '1.0' or '2.0'",
+                ));
+            }
+        };
+        Ok(Self {
             inner: FormatSinkOption::Parquet(ParquetFormatOption {
                 column_compression,
                 compression_level,
+                data_page_version,
             }),
-        }
+        })
     }
 }
