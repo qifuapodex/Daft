@@ -17,6 +17,9 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
+mod checksum;
+use checksum::RecoveryChecksum;
+
 // Amortize recovery I/O calls on shared filesystems while bounding temporary
 // memory per recovering writer. This does not affect the on-disk layout.
 const WRITE_RECOVERY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
@@ -361,24 +364,51 @@ impl<R: AsyncSeek + Unpin> AsyncSeek for RetryReader<R> {
 /// Owns the file's tail from its initial position through EOF. Existing prefixes
 /// are allowed; retaining an existing tail or pre-extending past the final write
 /// is not. Recovery validates that the final file length matches this region.
-pub struct RetryWriter {
+pub struct RetryWriter<const CHECKSUM_ON_WRITE: bool = true> {
     file: File,
     start: u64,
     offset: u64,
-    hasher: crc32fast::Hasher,
+    hasher: RecoveryChecksum,
     budget: EioRetryBudget,
     recovered_write: bool,
     terminal_error: Option<io::Error>,
 }
 
 impl RetryWriter {
-    pub fn new(mut file: File, budget: EioRetryBudget) -> io::Result<Self> {
+    pub fn new(file: File, budget: EioRetryBudget) -> io::Result<Self> {
+        Self::initialize(file, budget)
+    }
+
+    pub fn finish(self) -> io::Result<File> {
+        self.finish_impl(|writer| (writer.hasher.finalize(), writer.offset - writer.start))
+    }
+}
+
+impl RetryWriter<false> {
+    /// The caller already checksums the bytes above its write buffer. Reuse
+    /// those checksums at finish instead of traversing the bytes a second time.
+    /// This writer can only be finished by supplying the complete owned region's
+    /// checksum and length, including IPC headers and EOS, excluding any prefix.
+    pub fn with_deferred_checksum(file: File, budget: EioRetryBudget) -> io::Result<Self> {
+        Self::initialize(file, budget)
+    }
+
+    /// Compute the expected checksum only after a recovered write EIO. The
+    /// caller must first flush all buffering and cover every byte it supplied.
+    /// A failed/partial flush must fail the output, never supply a partial CRC.
+    pub fn finish_with_checksum(self, checksum: impl FnOnce() -> (u32, u64)) -> io::Result<File> {
+        self.finish_impl(|_| checksum())
+    }
+}
+
+impl<const CHECKSUM_ON_WRITE: bool> RetryWriter<CHECKSUM_ON_WRITE> {
+    fn initialize(mut file: File, budget: EioRetryBudget) -> io::Result<Self> {
         let offset = file.stream_position()?;
         Ok(Self {
             file,
             start: offset,
             offset,
-            hasher: crc32fast::Hasher::new(),
+            hasher: RecoveryChecksum::new(),
             budget,
             recovered_write: false,
             terminal_error: None,
@@ -395,12 +425,16 @@ impl RetryWriter {
     /// whole owned region, re-dirty it, then sync it on the original descriptor.
     /// A failed recovery I/O restarts the pass within the remaining file budget;
     /// checksum mismatches and sync failures are terminal, never synced away.
-    pub fn finish(mut self) -> io::Result<File> {
+    fn finish_impl(mut self, checksum: impl FnOnce(&Self) -> (u32, u64)) -> io::Result<File> {
         if let Some(error) = self.terminal_error.take() {
             return Err(error);
         }
         self.budget.check_cancelled()?;
         if self.recovered_write {
+            let (expected_crc, expected_len) = checksum(&self);
+            if expected_len != self.offset - self.start {
+                return Err(io::Error::from_raw_os_error(5));
+            }
             let mut buf = vec![
                 0u8;
                 (self.offset - self.start).min(WRITE_RECOVERY_BUFFER_BYTES as u64)
@@ -417,9 +451,7 @@ impl RetryWriter {
                     Err(error) => self.budget.retry(error, "recover read/write")?,
                 }
             };
-            if hasher.finalize() != self.hasher.clone().finalize()
-                || self.file.metadata()?.len() != self.offset
-            {
+            if hasher.finalize() != expected_crc || self.file.metadata()?.len() != self.offset {
                 return Err(io::Error::from_raw_os_error(5));
             }
             self.budget.check_cancelled()?;
@@ -444,11 +476,11 @@ impl RetryWriter {
         Ok(self.file)
     }
 
-    fn rewrite_region(&mut self, buf: &mut [u8]) -> io::Result<crc32fast::Hasher> {
+    fn rewrite_region(&mut self, buf: &mut [u8]) -> io::Result<RecoveryChecksum> {
         self.budget.check_cancelled()?;
         self.file.seek(SeekFrom::Start(self.start))?;
         let mut remaining = self.offset - self.start;
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = RecoveryChecksum::new();
         while remaining > 0 {
             self.budget.check_cancelled()?;
             let size = remaining.min(buf.len() as u64) as usize;
@@ -495,7 +527,7 @@ impl RetryWriter {
     }
 }
 
-impl Write for RetryWriter {
+impl<const CHECKSUM_ON_WRITE: bool> Write for RetryWriter<CHECKSUM_ON_WRITE> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if let Some(error) = &self.terminal_error {
             return Err(copy_io_error(error));
@@ -525,7 +557,7 @@ impl Write for RetryWriter {
             }
         };
         self.offset += n as u64;
-        if self.budget.policy.max_retries > 0 {
+        if CHECKSUM_ON_WRITE && self.budget.policy.max_retries > 0 {
             self.hasher.update(&buf[..n]);
         }
         Ok(n)
@@ -554,6 +586,85 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     use super::*;
+
+    #[test]
+    fn deferred_checksum_does_no_crc_work_without_a_write_eio() {
+        let mut writer = RetryWriter::with_deferred_checksum(
+            tempfile::tempfile().unwrap(),
+            EioRetryBudget::new(
+                EioRetryPolicy {
+                    max_retries: 6,
+                    ..Default::default()
+                },
+                "test",
+            ),
+        )
+        .unwrap();
+        writer.write_all(b"header-body-eos").unwrap();
+        assert_eq!(writer.hasher.finalize(), crc32fast::hash(b""));
+        let mut file = writer
+            .finish_with_checksum(|| panic!("normal path combined CRCs"))
+            .unwrap();
+        std::io::Seek::rewind(&mut file).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert_eq!(bytes, b"header-body-eos");
+    }
+
+    #[test]
+    fn deferred_checksum_recovery_validates_the_entire_owned_region() {
+        let bytes: Vec<u8> = (0..WRITE_RECOVERY_BUFFER_BYTES + 37)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        for failure in [
+            "none", "header", "body", "eos", "truncate", "extend", "length",
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(b"reserved-index").unwrap();
+            let mut writer = RetryWriter::with_deferred_checksum(
+                file,
+                EioRetryBudget::new(
+                    EioRetryPolicy {
+                        max_retries: 6,
+                        ..Default::default()
+                    },
+                    "test",
+                ),
+            )
+            .unwrap();
+            writer.write_all(&bytes).unwrap();
+            writer.recovered_write = true;
+            match failure {
+                "header" | "body" | "eos" => {
+                    let offset = match failure {
+                        "header" => 0,
+                        "body" => 2048,
+                        _ => bytes.len() - 1,
+                    };
+                    writer
+                        .file
+                        .seek(SeekFrom::Start(writer.start + offset as u64))
+                        .unwrap();
+                    writer.file.write_all(&[bytes[offset] ^ 1]).unwrap();
+                }
+                "truncate" => writer.file.set_len(writer.offset - 1).unwrap(),
+                "extend" => writer.file.set_len(writer.offset + 1).unwrap(),
+                _ => {}
+            }
+            let expected_len = bytes.len() as u64 + u64::from(failure == "length");
+            let result = writer.finish_with_checksum(|| (crc32fast::hash(&bytes), expected_len));
+            if failure == "none" {
+                let mut file = result.unwrap();
+                std::io::Seek::rewind(&mut file).unwrap();
+                let mut contents = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+                assert_eq!(&contents[..14], b"reserved-index");
+                assert_eq!(&contents[14..], bytes);
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(5), "{failure}");
+            }
+        }
+    }
 
     struct FaultReader {
         data: Vec<u8>,

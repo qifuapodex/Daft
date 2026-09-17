@@ -271,6 +271,7 @@ bytes = "1.11.0"
 chrono = "0.4.38"
 chrono-tz = "0.10.4"
 crc32fast = "1.5"
+crc-fast = {version = "=1.9.0", default-features = false, features = ["std", "vpclmulqdq"]}
 comfy-table = "7.1.1"
 criterion = {version = "0.7", features = ["html_reports"]}
 csv = "1.3"

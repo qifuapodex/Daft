@@ -46,7 +46,7 @@ use crate::{
 const FILE_BUF_BYTES: usize = CHUNK_TARGET_BYTES;
 
 struct CountingFile {
-    inner: BufWriter<RetryWriter>,
+    inner: BufWriter<RetryWriter<false>>,
     bytes_written: u64,
     /// CRC-32 of everything written since the last `crc_reset`. Fed at the
     /// logical level (before buffering), so it tracks exactly the bytes the
@@ -58,7 +58,7 @@ impl CountingFile {
     /// `start_offset` is where the IPC stream begins in the file, so that the
     /// byte counter — and therefore every recorded range — is an absolute file
     /// offset even when an index region precedes the stream.
-    fn new_at(inner: RetryWriter, start_offset: u64) -> Self {
+    fn new_at(inner: RetryWriter<false>, start_offset: u64) -> Self {
         Self {
             inner: BufWriter::with_capacity(FILE_BUF_BYTES, inner),
             bytes_written: start_offset,
@@ -74,11 +74,11 @@ impl CountingFile {
         self.hasher.clone().finalize()
     }
 
-    fn into_file(self) -> DaftResult<File> {
+    fn into_file(self, checksum: impl FnOnce() -> (u32, u64)) -> DaftResult<File> {
         self.inner
             .into_inner()
             .map_err(|e| DaftError::IoError(e.into_error()))?
-            .finish()
+            .finish_with_checksum(checksum)
             .map_err(DaftError::IoError)
     }
 }
@@ -148,7 +148,7 @@ pub async fn write_partitions_one_shot(
             let write_path = commit.as_ref().map_or(file_path.as_str(), |c| c.write_path()).to_owned();
             tracing::debug!(target: "daft_shuffle_io_retry", path = %write_path, output_path = %file_path, "Opened shuffle write attempt");
 
-            let file = RetryWriter::new(
+            let file = RetryWriter::with_deferred_checksum(
                 file,
                 EioRetryBudget::new(policy, &write_path).with_cancellation(cancellation.clone()),
             )
@@ -169,6 +169,7 @@ pub async fn write_partitions_one_shot(
             .map_err(|e| {
                 DaftError::ArrowRsError(e).with_shuffle_io_context("initialize writer", &write_path)
             })?;
+            let header_crc = writer.get_ref().crc_current();
 
             // Partition boundaries and checksums double as the on-disk index for
             // the shared target: `offsets[p]..offsets[p + 1]` is partition `p`
@@ -208,6 +209,8 @@ pub async fn write_partitions_one_shot(
 
             let encode_write_us = started.elapsed().as_micros() as u64;
             let flush_started = Instant::now();
+            // EOS is outside every partition CRC but inside the recovery region.
+            writer.get_mut().crc_reset();
             writer.finish().map_err(|e| {
                 DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &write_path)
             })?;
@@ -218,13 +221,18 @@ pub async fn write_partitions_one_shot(
 
             let flush_us = flush_started.elapsed().as_micros() as u64;
             let file_bytes = writer.get_ref().bytes_written;
+            let footer_crc = writer.get_ref().crc_current();
             let commit_started = Instant::now();
             let file = writer
                 .into_inner()
                 .map_err(|e| {
                     DaftError::ArrowRsError(e).with_shuffle_io_context("finish", &write_path)
                 })?
-                .into_file()
+                .into_file(|| {
+                    // Combining has a nontrivial fixed cost for tiny ranges.
+                    // RetryWriter invokes this closure only on the EIO path.
+                    recovery_checksum(base_offset, file_bytes, header_crc, footer_crc, &offsets, &crcs)
+                })
                 .map_err(|e| e.with_shuffle_io_context("flush or verify", &write_path))?;
             cancellation.check()?;
             if let Some(commit) = commit.take() {
@@ -264,6 +272,31 @@ pub async fn write_partitions_one_shot(
             Ok(caches)
         })
         .await?
+}
+
+/// Reconstruct the CRC of the complete owned IPC region, in wire order. The
+/// reserved shared-file index is written separately at commit and is excluded.
+fn recovery_checksum(
+    base_offset: u64,
+    file_bytes: u64,
+    header_crc: u32,
+    footer_crc: u32,
+    offsets: &[u64],
+    crcs: &[u32],
+) -> (u32, u64) {
+    assert_eq!(offsets.len(), crcs.len() + 1);
+    let mut whole = crc32fast::Hasher::new_with_initial_len(header_crc, offsets[0] - base_offset);
+    for (&crc, bounds) in crcs.iter().zip(offsets.windows(2)) {
+        whole.combine(&crc32fast::Hasher::new_with_initial_len(
+            crc,
+            bounds[1] - bounds[0],
+        ));
+    }
+    whole.combine(&crc32fast::Hasher::new_with_initial_len(
+        footer_crc,
+        file_bytes - offsets.last().unwrap(),
+    ));
+    (whole.finalize(), file_bytes - base_offset)
 }
 
 /// Create the destination file and report where the IPC stream starts within it.
@@ -397,6 +430,35 @@ fn write_coalesced(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_crc_includes_header_empty_partitions_and_eos() {
+        for base in [0, 128, 4096] {
+            for sizes in [vec![], vec![0, 0], vec![0, 1, 4096, 0, 4 * 1024 * 1024 + 7]] {
+                let header = b"schema-header";
+                let footer = b"\xff\xff\xff\xff\0\0\0\0";
+                let mut data = header.to_vec();
+                let mut offsets = vec![base + data.len() as u64];
+                let mut crcs = Vec::new();
+                for size in sizes {
+                    let part: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+                    crcs.push(crc32fast::hash(&part));
+                    data.extend(part);
+                    offsets.push(base + data.len() as u64);
+                }
+                data.extend(footer);
+                let combined = recovery_checksum(
+                    base,
+                    base + data.len() as u64,
+                    crc32fast::hash(header),
+                    crc32fast::hash(footer),
+                    &offsets,
+                    &crcs,
+                );
+                assert_eq!(combined, (crc32fast::hash(&data), data.len() as u64));
+            }
+        }
+    }
 
     /// Run with the Linux injector from tests/ray/shuffle_eio_injection.c,
     /// operation=write and failures=100. Fault markers let us cancel precisely

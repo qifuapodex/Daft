@@ -74,6 +74,19 @@ pub trait AsyncFileWriter: Send + Sync {
     /// Close the file and return the result. The caller should NOT write to the file after calling this method.
     async fn close(&mut self) -> DaftResult<Self::Result>;
 
+    /// Write the final input and close, allowing a writer to share one blocking
+    /// operation. The caller must already know that no more input can arrive.
+    async fn write_and_close(
+        &mut self,
+        data: Self::Input,
+    ) -> DaftResult<(WriteResult, Self::Result)>
+    where
+        Self::Input: Send,
+    {
+        let written = self.write(data).await?;
+        Ok((written, self.close().await?))
+    }
+
     /// Return the total number of bytes written by this writer.
     fn bytes_written(&self) -> usize;
 
@@ -250,6 +263,19 @@ pub fn make_ipc_writer_with_retry(
     policy: daft_io::shuffle_file::EioRetryPolicy,
     shuffle_id: Option<u64>,
 ) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>> {
+    make_ipc_writer_with_tracking(dir, target_filesize, compression, policy, shuffle_id, None)
+}
+
+/// Reuse the cache's tracking guard through every blocking write. The supplied
+/// guard must belong to `shuffle_id`; it remains alive until all operations drain.
+pub fn make_ipc_writer_with_tracking(
+    dir: &str,
+    target_filesize: usize,
+    compression: Option<&str>,
+    policy: daft_io::shuffle_file::EioRetryPolicy,
+    shuffle_id: Option<u64>,
+    tracking: Option<Arc<daft_io::shuffle_file::ActiveShuffleWrite>>,
+) -> DaftResult<Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>> {
     let compression = match compression {
         Some("lz4") => Some(arrow_ipc::CompressionType::LZ4_FRAME),
         Some("zstd") => Some(arrow_ipc::CompressionType::ZSTD),
@@ -263,7 +289,8 @@ pub fn make_ipc_writer_with_retry(
     };
     let base_writer_factory = IPCWriterFactory::new(dir.to_string(), compression)
         .with_retry_policy(policy)
-        .with_shuffle_id(shuffle_id);
+        .with_shuffle_id(shuffle_id)
+        .with_tracking(tracking);
     let file_size_calculator = TargetInMemorySizeBytesCalculator::new(
         target_filesize,
         if compression.is_some() { 2.0 } else { 1.0 },

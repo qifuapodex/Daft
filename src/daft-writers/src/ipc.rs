@@ -1,4 +1,8 @@
-use std::{fs::File, sync::Arc};
+use std::{
+    fs::File,
+    io::{self, BufWriter, Write},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use common_error::{DaftError, DaftResult};
@@ -14,6 +18,53 @@ use daft_recordbatch::RecordBatch;
 
 use crate::{AsyncFileWriter, RETURN_PATHS_COLUMN_NAME, WriteResult, WriterFactory};
 
+/// Coalesce small IPC headers/bodies without issuing writes from Drop. A
+/// cancelled future can drop the stream after its blocking task has returned;
+/// only explicit write/flush/finish may perform I/O under the active-write guard.
+struct BufferedRetryWriter(Option<BufWriter<RetryWriter>>);
+
+impl BufferedRetryWriter {
+    fn new(writer: RetryWriter) -> Self {
+        Self(Some(BufWriter::with_capacity(8 * 1024, writer)))
+    }
+
+    fn set_cancellation(&mut self, cancellation: WriteCancellation) {
+        self.0
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .set_cancellation(cancellation);
+    }
+
+    fn finish(mut self) -> io::Result<File> {
+        let mut buffer = self.0.take().unwrap();
+        let flushed = buffer.flush();
+        // into_parts never flushes, including after a failed explicit flush.
+        let (writer, pending) = buffer.into_parts();
+        flushed?;
+        debug_assert!(pending.unwrap().is_empty());
+        writer.finish()
+    }
+}
+
+impl Write for BufferedRetryWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.as_mut().unwrap().write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.as_mut().unwrap().flush()
+    }
+}
+
+impl Drop for BufferedRetryWriter {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.0.take() {
+            let _ = buffer.into_parts();
+        }
+    }
+}
+
 pub struct IPCWriter {
     is_closed: bool,
     error: Option<Arc<DaftError>>,
@@ -22,7 +73,8 @@ pub struct IPCWriter {
     compression: Option<arrow_ipc::CompressionType>,
     retry_policy: EioRetryPolicy,
     shuffle_id: Option<u64>,
-    writer: Option<arrow_ipc::writer::StreamWriter<RetryWriter>>,
+    tracking: Option<Arc<ActiveShuffleWrite>>,
+    writer: Option<arrow_ipc::writer::StreamWriter<BufferedRetryWriter>>,
 }
 
 impl IPCWriter {
@@ -36,6 +88,7 @@ impl IPCWriter {
             writer: None,
             retry_policy: EioRetryPolicy::default(),
             shuffle_id: None,
+            tracking: None,
         }
     }
 
@@ -62,7 +115,7 @@ impl IPCWriter {
         &mut self,
         schema: &Schema,
         cancellation: &WriteCancellation,
-    ) -> DaftResult<&mut arrow_ipc::writer::StreamWriter<RetryWriter>> {
+    ) -> DaftResult<&mut arrow_ipc::writer::StreamWriter<BufferedRetryWriter>> {
         if self.writer.is_none() {
             let mut budget = EioRetryBudget::new(self.retry_policy, &self.file_path)
                 .with_cancellation(cancellation.clone());
@@ -74,7 +127,7 @@ impl IPCWriter {
                     .truncate(true)
                     .open(&self.file_path)
             })?;
-            let file = RetryWriter::new(file, budget)?;
+            let file = BufferedRetryWriter::new(RetryWriter::new(file, budget)?);
 
             let arrow_schema = schema.to_arrow()?;
             let write_options = arrow_ipc::writer::IpcWriteOptions::default()
@@ -91,14 +144,7 @@ impl IPCWriter {
         writer.get_mut().set_cancellation(cancellation.clone());
         Ok(writer)
     }
-}
-
-#[async_trait]
-impl AsyncFileWriter for IPCWriter {
-    type Input = MicroPartition;
-    type Result = Option<RecordBatch>;
-
-    async fn write(&mut self, data: Self::Input) -> DaftResult<WriteResult> {
+    async fn write_impl(&mut self, data: MicroPartition, finish: bool) -> DaftResult<WriteResult> {
         self.check_error()?;
         if self.is_closed {
             return Err(DaftError::ValueError("IPC writer is closed".into()));
@@ -107,7 +153,10 @@ impl AsyncFileWriter for IPCWriter {
         let rows_written = data.len();
         let cancellation = WriteCancellation::default();
         let _cancel_on_drop = cancellation.guard();
-        let active = ActiveShuffleWrite::for_shuffle(self.shuffle_id);
+        let shared = self.tracking.clone();
+        let active = shared
+            .is_none()
+            .then(|| ActiveShuffleWrite::for_shuffle(self.shuffle_id));
         // Poison before yielding: dropping the future must not leave a reusable
         // writer that truncates the previous file or reports a successful close.
         self.mark_incomplete();
@@ -117,7 +166,7 @@ impl AsyncFileWriter for IPCWriter {
         state.writer = self.writer.take();
         let result = common_runtime::get_io_runtime(true)
             .spawn_blocking(move || -> DaftResult<_> {
-                let _active = active;
+                let _active = (active, shared);
                 cancellation.check()?;
                 let writer = state.get_or_create_writer(&data.schema(), &cancellation)?;
                 for table in data.record_batches() {
@@ -126,6 +175,12 @@ impl AsyncFileWriter for IPCWriter {
                     writer.write(&arrow_batch)?;
                 }
                 cancellation.check()?;
+                if finish {
+                    let mut writer = state.writer.take().unwrap();
+                    writer.finish()?;
+                    writer.into_inner()?.finish()?;
+                    cancellation.check()?;
+                }
                 Ok(state.writer)
             })
             .await
@@ -134,6 +189,7 @@ impl AsyncFileWriter for IPCWriter {
             Ok(writer) => {
                 self.writer = writer;
                 self.error = None;
+                self.is_closed = finish;
             }
             Err(error) => return Err(self.remember_error(error)),
         }
@@ -145,6 +201,24 @@ impl AsyncFileWriter for IPCWriter {
             rows_written,
         })
     }
+}
+
+#[async_trait]
+impl AsyncFileWriter for IPCWriter {
+    type Input = MicroPartition;
+    type Result = Option<RecordBatch>;
+
+    async fn write(&mut self, data: Self::Input) -> DaftResult<WriteResult> {
+        self.write_impl(data, false).await
+    }
+
+    async fn write_and_close(
+        &mut self,
+        data: Self::Input,
+    ) -> DaftResult<(WriteResult, Self::Result)> {
+        let written = self.write_impl(data, true).await?;
+        Ok((written, self.close().await?))
+    }
 
     async fn close(&mut self) -> DaftResult<Self::Result> {
         self.check_error()?;
@@ -152,11 +226,14 @@ impl AsyncFileWriter for IPCWriter {
             self.mark_incomplete();
             let cancellation = WriteCancellation::default();
             let _cancel_on_drop = cancellation.guard();
-            let active = ActiveShuffleWrite::for_shuffle(self.shuffle_id);
+            let shared = self.tracking.clone();
+            let active = shared
+                .is_none()
+                .then(|| ActiveShuffleWrite::for_shuffle(self.shuffle_id));
             writer.get_mut().set_cancellation(cancellation.clone());
             let result = common_runtime::get_io_runtime(true)
                 .spawn_blocking(move || -> DaftResult<()> {
-                    let _active = active;
+                    let _active = (active, shared);
                     cancellation.check()?;
                     writer.finish()?;
                     writer.into_inner()?.finish()?;
@@ -193,6 +270,7 @@ impl AsyncFileWriter for IPCWriter {
 pub struct IPCWriterFactory {
     retry_policy: EioRetryPolicy,
     shuffle_id: Option<u64>,
+    tracking: Option<Arc<ActiveShuffleWrite>>,
     dir: String,
     compression: Option<arrow_ipc::CompressionType>,
 }
@@ -204,6 +282,7 @@ impl IPCWriterFactory {
             compression,
             retry_policy: EioRetryPolicy::default(),
             shuffle_id: None,
+            tracking: None,
         }
     }
 }
@@ -216,6 +295,11 @@ impl IPCWriterFactory {
 
     pub fn with_shuffle_id(mut self, shuffle_id: Option<u64>) -> Self {
         self.shuffle_id = shuffle_id;
+        self
+    }
+
+    pub(crate) fn with_tracking(mut self, tracking: Option<Arc<ActiveShuffleWrite>>) -> Self {
+        self.tracking = tracking;
         self
     }
 }
@@ -233,6 +317,7 @@ impl WriterFactory for IPCWriterFactory {
         let mut writer = IPCWriter::new(&file_path, self.compression);
         writer.retry_policy = self.retry_policy;
         writer.shuffle_id = self.shuffle_id;
+        writer.tracking = self.tracking.clone();
         Ok(Box::new(writer))
     }
 }
@@ -241,6 +326,20 @@ impl WriterFactory for IPCWriterFactory {
 mod tests {
     use super::*;
     use crate::test::make_dummy_mp;
+
+    #[test]
+    fn abandoned_ipc_buffer_never_flushes_from_drop() {
+        let path =
+            std::env::temp_dir().join(format!("daft-ipc-buffer-{}.arrow", uuid::Uuid::new_v4()));
+        let file = File::create(&path).unwrap();
+        let mut writer = BufferedRetryWriter::new(
+            RetryWriter::new(file, EioRetryBudget::new(EioRetryPolicy::default(), "test")).unwrap(),
+        );
+        writer.write_all(b"uncommitted buffered bytes").unwrap();
+        drop(writer);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn failed_write_keeps_its_error_on_close_and_later_writes() {
@@ -283,6 +382,22 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LD_PRELOAD shuffle EIO injector"]
     async fn cancelled_write_poisoning_survives_close_and_reuse() {
+        cancelled_operation_poisoning("write").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LD_PRELOAD shuffle EIO injector"]
+    async fn cancelled_buffered_close_poisoning_survives_reuse() {
+        cancelled_operation_poisoning("close").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LD_PRELOAD shuffle EIO injector"]
+    async fn cancelled_final_write_poisoning_survives_reuse() {
+        cancelled_operation_poisoning("final").await;
+    }
+
+    async fn cancelled_operation_poisoning(operation: &str) {
         let root = std::path::PathBuf::from(std::env::var("DAFT_TEST_SHUFFLE_IO_ROOT").unwrap());
         assert!(!root.join("fault-0").exists());
         std::fs::create_dir_all(root.join("daft_shuffle")).unwrap();
@@ -295,7 +410,21 @@ mod tests {
             initial_backoff_ms: 32_000,
             max_backoff_ms: 32_000,
         };
-        let mut writing = Box::pin(writer.write(make_dummy_mp(1024)));
+        if operation == "close" {
+            writer.write(make_dummy_mp(1024)).await.unwrap();
+        }
+        let mut writing = Box::pin(async {
+            if operation == "close" {
+                writer.close().await.map(|_| ())
+            } else if operation == "final" {
+                writer
+                    .write_and_close(make_dummy_mp(1024))
+                    .await
+                    .map(|_| ())
+            } else {
+                writer.write(make_dummy_mp(16 * 1024)).await.map(|_| ())
+            }
+        });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut writing => panic!("write completed before cancellation: {}", result.is_ok()),

@@ -12,6 +12,28 @@ use common_error::{DaftError, DaftResult};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
 const CONTINUATION_MARKER: i32 = -1;
+// Initialization is material for large bodies. Keep the existing read path for
+// metadata and small (often compressed) bodies: the all-message append prototype
+// did not pass the two-worker sparse-query performance control.
+const APPEND_READ_MIN_BYTES: usize = 64 * 1024;
+
+/// Allocate once and let AsyncRead initialize only the bytes it returns. The
+/// limit prevents reading into the next IPC message, even if the allocation has
+/// spare capacity. Do not use read_to_end: it can grow the allocation to probe
+/// for EOF after reading the requested bytes.
+async fn read_message_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(len);
+    let mut reader = reader.take(len as u64);
+    while bytes.len() < len {
+        if reader.read_buf(&mut bytes).await? == 0 {
+            return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "early eof"));
+        }
+    }
+    Ok(bytes)
+}
 
 /// What [`next_flight_data`] found.
 ///
@@ -87,8 +109,13 @@ pub(crate) async fn next_flight_data<R: AsyncRead + Unpin>(
         .map_err(|_| DaftError::InternalError("Unexpected negative integer".to_string()))?;
 
     // Read message body
-    let mut data_buffer = vec![0; body_length];
-    reader.read_exact(&mut data_buffer).await?;
+    let data_buffer = if body_length >= APPEND_READ_MIN_BYTES {
+        read_message_bytes(reader, body_length).await?
+    } else {
+        let mut buffer = vec![0; body_length];
+        reader.read_exact(&mut buffer).await?;
+        buffer
+    };
 
     Ok(FlightMessage::Data(FlightData {
         data_header: message_buffer.into(),
@@ -96,3 +123,9 @@ pub(crate) async fn next_flight_data<R: AsyncRead + Unpin>(
         ..Default::default()
     }))
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod bench;

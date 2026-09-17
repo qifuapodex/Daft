@@ -6,7 +6,7 @@ use daft_io::{SourceType, parse_url};
 use daft_micropartition::MicroPartition;
 use daft_recordbatch::RecordBatch;
 use daft_schema::schema::SchemaRef;
-use daft_writers::{AsyncFileWriter, make_ipc_writer_with_retry};
+use daft_writers::{AsyncFileWriter, make_ipc_writer_with_tracking};
 use tokio::sync::Mutex;
 
 fn get_shuffle_dirs(shuffle_dirs: &[String], shuffle_id: u64) -> Vec<String> {
@@ -39,6 +39,10 @@ pub fn partition_ref_id(input_id: u32, partition_idx: usize) -> u64 {
 /// Shared by the oneshot writer and the read-side concat path so write emits at the
 /// size read wants.
 pub const CHUNK_TARGET_BYTES: usize = 4 * 1024 * 1024;
+
+// Group ready IPC batches into a single blocking operation without changing
+// individual IPC messages or waiting for more input.
+const READY_WRITE_GROUP_BYTES: usize = 8 * CHUNK_TARGET_BYTES;
 
 // Result of a writer task
 struct WriterTaskResult {
@@ -74,7 +78,9 @@ impl InProgressShuffleCache {
         compression: Option<&str>,
     ) -> DaftResult<Self> {
         // Create the directories
-        let active = daft_io::shuffle_file::ActiveShuffleWrite::for_shuffle(Some(shuffle_id));
+        let active = Arc::new(daft_io::shuffle_file::ActiveShuffleWrite::for_shuffle(
+            Some(shuffle_id),
+        ));
         // TODO: Add checks here, as well as periodic checks to ensure that the dirs are not too full. If so, we switch to directories with more space.
         // And raise an error if we can't find any directories with space.
         let shuffle_dirs = get_shuffle_dirs(dirs, shuffle_id);
@@ -102,12 +108,13 @@ impl InProgressShuffleCache {
             DaftError::IoError(e).with_shuffle_io_context("create directory", &partition_dir)
         })?;
 
-        let writer = make_ipc_writer_with_retry(
+        let writer = make_ipc_writer_with_tracking(
             &partition_dir,
             target_filesize,
             compression,
             crate::local_io::policy(shuffle_id),
             Some(shuffle_id),
+            Some(active.clone()),
         )?;
 
         let mut cache =
@@ -129,7 +136,7 @@ impl InProgressShuffleCache {
         writer: Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>,
         partition_ref_id: u64,
         schema: SchemaRef,
-        active: Option<daft_io::shuffle_file::ActiveShuffleWrite>,
+        active: Option<Arc<daft_io::shuffle_file::ActiveShuffleWrite>>,
     ) -> DaftResult<Self> {
         let num_cpus = std::thread::available_parallelism().unwrap().get();
         let (tx, rx) = async_channel::bounded(num_cpus * 2);
@@ -232,20 +239,46 @@ async fn writer_task(
     rx: async_channel::Receiver<MicroPartition>,
     mut writer: Box<dyn AsyncFileWriter<Input = MicroPartition, Result = Vec<RecordBatch>>>,
 ) -> DaftResult<WriterTaskResult> {
-    let io_runtime = get_io_runtime(true);
     let mut total_rows_written = 0;
     let mut total_bytes_written = 0;
+    let mut completed = None;
     while let Ok(partition) = rx.recv().await {
-        total_rows_written += partition.len();
-        total_bytes_written += partition.size_bytes();
-        writer = io_runtime
-            .spawn(async move {
-                writer.write(partition).await?;
-                DaftResult::Ok(writer)
-            })
-            .await??;
+        let mut bytes = partition.size_bytes();
+        let mut rows = partition.len();
+        // Drain only ready input: never wait for a batch to fill. Reuse the
+        // existing bounded queue, and bound work between await points even if
+        // producers refill it. concat keeps record batches without copying data.
+        let partition = if bytes < READY_WRITE_GROUP_BYTES
+            && let Ok(next) = rx.try_recv()
+        {
+            bytes += next.size_bytes();
+            rows += next.len();
+            let mut parts = vec![partition, next];
+            while parts.len() < 32 && bytes < READY_WRITE_GROUP_BYTES {
+                let Ok(next) = rx.try_recv() else { break };
+                bytes += next.size_bytes();
+                rows += next.len();
+                parts.push(next);
+            }
+            MicroPartition::concat(parts)?
+        } else {
+            partition
+        };
+        total_rows_written += rows;
+        total_bytes_written += bytes;
+        // This task already runs on the IO runtime. IPCWriter still offloads
+        // blocking syscalls and owns their cancellation/drain guards.
+        if rx.is_closed() && rx.is_empty() {
+            let (_, paths) = writer.write_and_close(partition).await?;
+            completed = Some(paths);
+            break;
+        }
+        writer.write(partition).await?;
     }
-    let file_path_tables = writer.close().await?;
+    let file_path_tables = match completed {
+        Some(paths) => paths,
+        None => writer.close().await?,
+    };
 
     let file_paths = file_path_tables
         .into_iter()
@@ -308,6 +341,98 @@ mod tests {
     fn dummy_schema() -> SchemaRef {
         // Matches the schema produced by `make_dummy_mp` in daft-writers tests.
         Arc::new(Schema::new(vec![Field::new("ints", DataType::UInt8)]))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LD_PRELOAD shuffle EIO injector"]
+    async fn shared_write_tracking_survives_cancellation() -> DaftResult<()> {
+        let root = std::path::PathBuf::from(std::env::var("DAFT_TEST_SHUFFLE_IO_ROOT").unwrap());
+        let shuffle_id = 0xe10_008;
+        crate::local_io::configure(
+            shuffle_id,
+            daft_io::shuffle_file::EioRetryPolicy {
+                max_retries: 6,
+                initial_backoff_ms: 32_000,
+                max_backoff_ms: 32_000,
+            },
+        );
+        let cache = InProgressShuffleCache::try_new(
+            0,
+            1,
+            dummy_schema(),
+            &[root.to_string_lossy().into_owned()],
+            shuffle_id,
+            1024 * 1024,
+            None,
+        )?;
+        cache.push_partition_data(make_dummy_mp(16 * 1024)).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !root.join("fault-0").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Queue, factory and blocking operation share a single registration.
+        assert_eq!(
+            daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]),
+            1
+        );
+        drop(cache);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while daft_io::shuffle_file::active_shuffle_writes_for(&[shuffle_id]) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!root.join("fault-1").exists());
+        std::fs::remove_dir_all(root.join("daft_shuffle"))?;
+        crate::store::forget_shuffle(shuffle_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_ready_batches_preserve_order_across_file_rotation() -> DaftResult<()> {
+        let shuffle_id = rand::random::<u64>();
+        let root = std::env::temp_dir().join(format!("daft-cache-batching-{shuffle_id}"));
+        let cache = InProgressShuffleCache::try_new(
+            0,
+            1,
+            dummy_schema(),
+            &[root.to_string_lossy().into_owned()],
+            shuffle_id,
+            8192,
+            None,
+        )?;
+        let mut expected = Vec::new();
+        for i in 0..97 {
+            let size = [0, 257, 4096, 65][i % 4];
+            expected.extend((0..size).map(|i| i as u8));
+            cache.push_partition_data(make_dummy_mp(size)).await?;
+        }
+        let result = cache.close().await?;
+        assert!(result.file_paths.len() > 1);
+        assert_eq!(result.num_rows, expected.len());
+        assert_eq!(result.size_bytes, expected.len());
+        let mut actual = Vec::new();
+        for path in result.file_paths {
+            let reader =
+                arrow_ipc::reader::StreamReader::try_new(std::fs::File::open(path)?, None)?;
+            for batch in reader {
+                let batch = batch?;
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt8Array>()
+                    .unwrap();
+                actual.extend_from_slice(values.values());
+            }
+        }
+        assert_eq!(actual, expected);
+        std::fs::remove_dir_all(root)?;
+        crate::store::forget_shuffle(shuffle_id);
+        Ok(())
     }
 
     #[tokio::test]
