@@ -72,7 +72,7 @@ pub(crate) fn parse_compression(s: &str, level: Option<i32>) -> DaftResult<Compr
             // writers when upgrading the underlying codec implementation.
             Some(l) if !(1..=22).contains(&l) => {
                 return Err(DaftError::ValueError(format!(
-                    "invalid compression level {l} for parquet codec zstd: valid range is 1..=22"
+                    "invalid compression level {l} for parquet codec zstd: valid compression range is 1..=22"
                 )));
             }
             Some(l) => ZstdLevel::try_new(l).map_err(level_err)?,
