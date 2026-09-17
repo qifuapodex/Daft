@@ -1,0 +1,173 @@
+{
+  "date_utc": "2026-09-17",
+  "candidate_commit": "3ec21f0ec3a1bbaf622833992ac2da6646f1dca5",
+  "source_files_rechecked": 1490,
+  "source_and_artifact_identity": "PASS before and after measurement",
+  "build_commands": [
+    "make build",
+    "cargo test --release --offline -p daft-io -p daft-writers -p daft-shuffles --lib --no-run --message-format=json",
+    "maturin build --release --offline"
+  ],
+  "build_environment": {
+    "CI": "1",
+    "DAFT_DASHBOARD_SKIP_BUILD": "1",
+    "CARGO_BUILD_JOBS": "6",
+    "CARGO_NET_OFFLINE": "true",
+    "UV_OFFLINE": "1"
+  },
+  "rustc": "rustc 1.91.0-nightly (51ff89506 2025-09-02)\nbinary: rustc\ncommit-hash: 51ff895062ba60a7cba53f57af928c3fb7b0f2f4\ncommit-date: 2025-09-02\nhost: x86_64-unknown-linux-gnu\nrelease: 1.91.0-nightly\nLLVM version: 21.1.0\n",
+  "component_tests": [
+    {
+      "package": "daft_io",
+      "passed": 16,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "package": "daft_writers",
+      "passed": 29,
+      "failed": 0,
+      "ignored": 4
+    },
+    {
+      "package": "daft_shuffles",
+      "passed": 63,
+      "failed": 0,
+      "ignored": 7
+    }
+  ],
+  "injected_cancellation_tests": {
+    "passed": 4,
+    "tests": [
+      "cancelled_write_poisoning_survives_close_and_reuse",
+      "cancelled_buffered_close_poisoning_survives_reuse",
+      "cancelled_final_write_poisoning_survives_reuse",
+      "shared_write_tracking_survives_cancellation"
+    ]
+  },
+  "ray_eio": {
+    "passed": 20,
+    "deselected": 22,
+    "selection": "real_local_shuffle_io_failure or local_retry_exhaustion_and_unsafe_commit_errors or recovered_write_syncs_original_fd_before_returning or recovery_pass_retries_io_but_never_swallows_sync_failure or cancel_during_shuffle_eio_backoff"
+  },
+  "dev_build_flight_gather": {
+    "compressions": [
+      "none",
+      "lz4"
+    ],
+    "collects_each_including_warmup": 2,
+    "status": "PASS"
+  },
+  "release_preflight": {
+    "status": "PASS",
+    "storage": "/hdd-01/dev/qi.f",
+    "compression": "none",
+    "cycles": 1,
+    "formal_samples_per_job": 1,
+    "scope": "Harness/functionality check excluded from formal results"
+  },
+  "formal": {
+    "jobs": 384,
+    "formal_samples": 1152,
+    "warmups": 384,
+    "n_each_version_storage_case": 48,
+    "query_jobs": 128,
+    "query_collects_including_warmup": 512,
+    "rows_checked_each_query": 64000,
+    "query_inputs": 32,
+    "query_output_partitions": 1,
+    "spilled_bytes": 0,
+    "worker_storage_probes": 6,
+    "driver_and_worker_extension_hashes": "PASS for every query job",
+    "node_and_dependency_consistency": "PASS",
+    "dependencies": {
+      "numpy": "2.2.6",
+      "pandas": "2.2.3",
+      "pyarrow": "22.0.0",
+      "ray": "2.57.0"
+    },
+    "cleanup": "PASS: both private storage roots removed"
+  },
+  "statistics_audit": {
+    "status": "PASS",
+    "comparisons": 8,
+    "rows": 24,
+    "command": "python benchmarking/shuffle/storage_stats.py benchmarking/shuffle/normal_path_performance/arrow60_20260917"
+  },
+  "performance_acceptance": "NOT PASSED: 6 of 12 same-storage cells exceed +1% in observed min or median; additional cells remain statistically inconclusive.",
+  "observed_cells_exceeding_1pct": [
+    {
+      "comparison": "writer/versions-local",
+      "case": "stream-single",
+      "configuration": "c8-none",
+      "min_change_pct": 22.61532599332905,
+      "median_change_pct": 23.26776825317505,
+      "median_ci_95pct": [
+        17.80696579123431,
+        28.57675211954531
+      ],
+      "median_ci_gate": "REGRESSION"
+    },
+    {
+      "comparison": "writer/versions-local",
+      "case": "stream-wide",
+      "configuration": "c8-none",
+      "min_change_pct": -8.31522852163651,
+      "median_change_pct": 6.61422732904744,
+      "median_ci_95pct": [
+        4.990305607090484,
+        8.592240522987717
+      ],
+      "median_ci_gate": "REGRESSION"
+    },
+    {
+      "comparison": "writer/versions-shared",
+      "case": "oneshot-small",
+      "configuration": "c8-none",
+      "min_change_pct": 15.524705640508984,
+      "median_change_pct": 3.278998489427676,
+      "median_ci_95pct": [
+        -0.6290548936765505,
+        6.390420446152212
+      ],
+      "median_ci_gate": "INCONCLUSIVE"
+    },
+    {
+      "comparison": "query/versions-local",
+      "case": "flight-gather-lz4",
+      "configuration": "collect",
+      "min_change_pct": 5.751333941920844,
+      "median_change_pct": 4.482916716452978,
+      "median_ci_95pct": [
+        2.1826977773675704,
+        6.075330907558629
+      ],
+      "median_ci_gate": "REGRESSION"
+    },
+    {
+      "comparison": "query/versions-local",
+      "case": "flight-gather-none",
+      "configuration": "collect",
+      "min_change_pct": 1.4968492370813546,
+      "median_change_pct": 3.0700557608203782,
+      "median_ci_95pct": [
+        1.5782505987095963,
+        4.079848337531478
+      ],
+      "median_ci_gate": "REGRESSION"
+    },
+    {
+      "comparison": "query/versions-shared",
+      "case": "flight-gather-none",
+      "configuration": "collect",
+      "min_change_pct": -3.0773615068097837,
+      "median_change_pct": 1.4180850146461532,
+      "median_ci_95pct": [
+        -0.7301883287852973,
+        2.1782258707575997
+      ],
+      "median_ci_gate": "INCONCLUSIVE"
+    }
+  ],
+  "original_validation_log_sha256": "619a7e30b83b2d5ef6df150b85ac4a56891bae0f8af1bd09b734aa3f81f8acad"
+}

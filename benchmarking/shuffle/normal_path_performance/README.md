@@ -4,10 +4,15 @@ The implementation preserves local EIO recovery and cancellation safety while re
 normal-path IPC work. **The pre-EIO baseline's 1% regression target is not met.**
 This change is suitable for code review; the historical data below is not a release acceptance claim.
 
-The PR is based on `42b8b9f3c` (`release_apodex_0724`, Arrow-rs 60). The measurements
-were made before rebasing, with the V7 prototype on `5833cac55` and Arrow-rs 59.
-They must not be presented as measurements of the rebased Arrow 60 build. New-build
-correctness checks are recorded separately in [validation.json](validation.json).
+A new [latest-source comparison](arrow60_20260917/README.md) measures commit
+`3ec21f0ec` after integrating release `ffe64ff10` (Arrow-rs 60), with 48 formal
+samples per version/storage/case. It also does not meet the 1% target; see its
+separate min/median/max tables and current-source validation.
+
+The historical measurements below used the V7 prototype on `5833cac55` and
+Arrow-rs 59. They must not be presented as measurements of the Arrow 60 build.
+[validation.json](validation.json) records the earlier functional checks on the
+initial Arrow 60 rebase at `42b8b9f3c`; the new report records the latest checks.
 
 ## Implementation and recovery invariants
 
@@ -33,9 +38,8 @@ on the original descriptor. This fault-path I/O has not been removed.
 
 The RetryReader zero-initialization optimization was already merged in #15 and
 is part of the PR's base; it is not a new change here.
-A separate one-line integration commit restores the existing Parquet compression-range
-error wording expected by its test after the base branch's Arrow 60 upgrade.
-It does not change compression selection or the accepted level range.
+The initial Parquet error-wording workaround was removed after the latest
+release corrected its test. No Parquet implementation change remains in this PR.
 
 ## Why retain a checksum?
 
