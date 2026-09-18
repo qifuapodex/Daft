@@ -3217,6 +3217,7 @@ dependencies = [
  "common-file-formats",
  "common-io-config",
  "common-runtime",
+ "crc-fast",
  "crc32fast",
  "futures",
  "globset",

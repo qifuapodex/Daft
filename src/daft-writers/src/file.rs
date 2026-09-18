@@ -176,6 +176,34 @@ impl AsyncFileWriter for TargetFileSizeWriter {
         self.is_closed = true;
         Ok(std::mem::take(&mut self.results))
     }
+
+    async fn write_and_close(
+        &mut self,
+        input: MicroPartition,
+    ) -> DaftResult<(WriteResult, Self::Result)> {
+        assert!(
+            !self.is_closed,
+            "Cannot write to a closed TargetFileSizeWriter"
+        );
+        // Leave boundary/rotation handling to the established path. The common
+        // final partial file can write and close its IPC stream in one task.
+        let estimated_size = max(input.size_bytes() / input.len().max(1), 1) * input.len();
+        if input.is_empty() || estimated_size >= self.remaining_bytes_for_current_file() {
+            let written = self.write(input).await?;
+            return Ok((written, self.close().await?));
+        }
+        self.current_in_memory_bytes_written += estimated_size;
+        let (written, result) = self.current_writer.write_and_close(input).await?;
+        self.total_physical_bytes_written += written.bytes_written;
+        if let Some(result) = result {
+            self.results.push(result);
+            self.bytes_per_file
+                .push(self.current_writer.bytes_written());
+        }
+        self.current_in_memory_bytes_written = 0;
+        self.is_closed = true;
+        Ok((written, std::mem::take(&mut self.results)))
+    }
 }
 
 /// SingleFileWriter wraps a base writer and never rotates — all data flows into one file.
@@ -322,6 +350,28 @@ mod tests {
 
     use super::*;
     use crate::test::{DummyWriterFactory, make_dummy_mp};
+
+    #[tokio::test]
+    async fn final_input_preserves_file_boundaries_and_accounting() {
+        for prefix in [0, 41] {
+            for size in [0, 1, 58, 59, 60, 199] {
+                let mut writer = TargetFileSizeWriter::new(
+                    Arc::new(DummyWriterFactory),
+                    None,
+                    Arc::new(TargetInMemorySizeBytesCalculator::new(100, 1.0)),
+                )
+                .unwrap();
+                writer.write(make_dummy_mp(prefix)).await.unwrap();
+                let (written, files) = writer.write_and_close(make_dummy_mp(size)).await.unwrap();
+                assert_eq!(written.rows_written, size);
+                assert_eq!(written.bytes_written, size);
+                assert_eq!(files.len(), (prefix + size).div_ceil(100));
+                assert_eq!(writer.bytes_written(), prefix + size);
+                assert_eq!(writer.bytes_per_file().iter().sum::<usize>(), prefix + size);
+                assert!(writer.bytes_per_file().iter().all(|&n| n <= 100));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_target_file_writer_exact_file() {
