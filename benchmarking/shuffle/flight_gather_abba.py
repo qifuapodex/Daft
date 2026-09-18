@@ -4,6 +4,9 @@ Dependencies must already be installed in this Python environment. Each job
 verifies that its driver and workers loaded the same extension before measuring.
 Use --root to select the actual shuffle mount. Both Ray workers run on one host.
 The Gather PerPartition backend does not fsync, even with shared durability set.
+flight_gather_collect.py generates the input and validates every output row.
+Samples, build hashes and full statistics are generated under --output; use a
+directory outside the source tree, e.g. /tmp/gather-run.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import zipfile
 from pathlib import Path
 
 import ray
-from message_buffers_stats import write_summary
+from abba_stats import write_summary
 from ray.cluster_utils import Cluster
 
 

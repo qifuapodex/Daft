@@ -14,7 +14,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from message_buffers_stats import percentile
+from abba_stats import percentile
 
 
 def change(old, new):
@@ -92,7 +92,7 @@ def analyze(events, previous):
                 "cycle_minima_median_change_pct": change(cycle_min_medians["baseline"], cycle_min_medians["candidate"]),
                 "cycle_minima_changes_above_1pct": sum(row["change_pct"] > 1 for row in cycle_minima),
                 "previous_median_ci_gate": prior[key]["gate"],
-                "previous_median_ci_95pct": prior[key]["paired_cycle_bootstrap_95pct"],
+                "previous_median_ci_95pct": prior[key].get("paired_cycle_bootstrap_95pct"),
             }
         )
     return results
@@ -126,6 +126,20 @@ def report_table(name, rows):
     return "\n".join(lines)
 
 
+def write_analysis(run):
+    raw = (run / "events.jsonl").read_bytes()
+    previous = (run / "summary.json").read_bytes()
+    rows = analyze([json.loads(line) for line in raw.splitlines()], json.loads(previous))
+    payload = {
+        "source_events_sha256": hashlib.sha256(raw).hexdigest(),
+        "source_summary_sha256": hashlib.sha256(previous).hexdigest(),
+        "analysis_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "results": rows,
+    }
+    (run / "min_median.json").write_text(json.dumps(payload, indent=2) + "\n")
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", type=Path, nargs="+")
@@ -145,16 +159,7 @@ def main():
         "组件时间涵盖整个批量写入用例，不是单个文件耗时；wide 的 c8 配置实际最多并行两个文件。",
     ]
     for run in args.runs:
-        raw = (run / "events.jsonl").read_bytes()
-        previous = (run / "summary.json").read_bytes()
-        rows = analyze([json.loads(line) for line in raw.splitlines()], json.loads(previous))
-        payload = {
-            "source_events_sha256": hashlib.sha256(raw).hexdigest(),
-            "source_summary_sha256": hashlib.sha256(previous).hexdigest(),
-            "analysis_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "results": rows,
-        }
-        (run / "min_median.json").write_text(json.dumps(payload, indent=2) + "\n")
+        rows = write_analysis(run)
         sections.append(report_table(run.name, rows))
         print(f"{run.name}: {len(rows)} cells; original min/median/max/counts matched")
     args.report.write_text("\n\n".join(sections) + "\n")

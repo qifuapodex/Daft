@@ -17,7 +17,7 @@ from collections import defaultdict
 from itertools import pairwise
 from pathlib import Path
 
-from message_buffers_stats import summarize
+from abba_stats import summarize
 from min_median_stats import analyze
 from storage_abba import ORDER, VIEWS
 
@@ -97,14 +97,18 @@ def render_csv(result):
         for row in rows:
             assert row["baseline"]["n"] == row["candidate"]["n"]
             values = [row[label][metric] for metric in metrics for label in ["baseline", "candidate"]]
-            values += [row["change_pct"]["min"], row["change_pct"]["median"], *row["previous_median_ci_95pct"]]
+            values += [
+                row["change_pct"]["min"],
+                row["change_pct"]["median"],
+                *(row["previous_median_ci_95pct"] or [None, None]),
+            ]
             writer.writerow(
                 [
                     comparison,
                     row["case"],
                     row["reader"],
                     row["baseline"]["n"],
-                    *[f"{v:.9g}" for v in values],
+                    *[f"{v:.9g}" if v is not None else "" for v in values],
                     row["previous_median_ci_gate"],
                     row["cycle_minima_changes_above_1pct"],
                     f"{row['cycle_minima_median_change_pct']:.9g}",
@@ -113,18 +117,23 @@ def render_csv(result):
     return output.getvalue()
 
 
+def write_summary(folder):
+    manifest, result = compute(folder)
+    (folder / "summary.csv").write_text(render_csv(result))
+    (folder / "min_median.json").write_text(json.dumps(result, indent=2) + "\n")
+    return manifest, result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
     parser.add_argument("--write", action="store_true", help="Write summary.csv and full per-cycle statistics")
     args = parser.parse_args()
-    manifest, result = compute(args.folder)
-    rendered = render_csv(result)
     if args.write:
-        (args.folder / "summary.csv").write_text(rendered)
-        (args.folder / "min_median.json").write_text(json.dumps(result, indent=2) + "\n")
+        manifest, result = write_summary(args.folder)
     else:
-        assert rendered == (args.folder / "summary.csv").read_text(), "published summary differs from raw events"
+        manifest, result = compute(args.folder)
+        assert render_csv(result) == (args.folder / "summary.csv").read_text(), "summary differs from raw events"
     print(
         f"PASS: {manifest['unique_jobs_expected']} serial jobs; {manifest['formal_samples_expected']} formal samples; "
         f"{manifest['warmups_expected']} warmups; {len(result)} comparisons"

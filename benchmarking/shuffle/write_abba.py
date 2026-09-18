@@ -3,6 +3,11 @@
 The historical source uses the identical test module with only configure() a
 no-op, because the pre-EIO version has no local retry policy. Retain warmups and
 every observation. CPU pinning applies equally to all threads of both binaries.
+
+Input data and readback oracles come from src/daft-shuffles/src/write_bench.rs.
+Build the test executable with cargo test --release -p daft-shuffles --no-run.
+Use TMPDIR to select the storage mount. Logs, samples, build hashes and full
+min/median/max/variance statistics are generated under --output (e.g. /tmp/run).
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import subprocess
 from itertools import product
 from pathlib import Path
 
-from message_buffers_stats import write_summary
+from abba_stats import write_summary
 
 
 def main():

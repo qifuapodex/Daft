@@ -3,6 +3,21 @@
 Builds must be prepared before this script starts. Writer jobs and a private
 two-worker Ray cluster run in separate phases, with no overlapping jobs. All
 formal samples and warmups are retained, including slow observations.
+
+Example (Python environment needs Ray and the wheel dependencies):
+  python storage_abba.py --baseline-binary /tmp/old-writer \
+    --candidate-binary /tmp/new-writer --baseline-wheel /tmp/old.whl \
+    --candidate-wheel /tmp/new.whl --shared-root /mnt/juicefs \
+    --output /tmp/shuffle-run --cycles 8 --samples 3
+
+The writer test (src/daft-shuffles/src/write_bench.rs) and
+flight_gather_collect.py generate all input data and verify the output.
+This script generates builds.json, manifests, raw samples, per-view statistics
+and combined summary.csv/min_median.json under --output. No checked-in dataset
+is needed. Reuse a generated builds.json with --builds to verify pinned hashes.
+For A/A controls, pass the same artifacts for both versions. GNU time, taskset,
+strace, findmnt and lscpu must be installed; do not overlap builds or profiling
+with measurement. Storage roots must already exist.
 """
 
 from __future__ import annotations
@@ -49,6 +64,43 @@ def save(path, value):
     temporary.replace(path)
 
 
+def build_manifest(args, parser):
+    versions = ["baseline", "candidate"]
+    artifacts = ["binary", "wheel"]
+    paths = [getattr(args, f"{version}_{artifact}") for version in versions for artifact in artifacts]
+    if args.builds:
+        if any(paths):
+            parser.error("use either --builds or the four binary/wheel arguments")
+        builds = json.loads(args.builds.read_text())
+    else:
+        if not all(paths):
+            parser.error("provide --builds or all four --baseline/--candidate binary/wheel arguments")
+        builds = {
+            version: {
+                artifact: {"path": str(getattr(args, f"{version}_{artifact}").resolve())} for artifact in artifacts
+            }
+            for version in versions
+        }
+    for version in versions:
+        for artifact in artifacts:
+            entry = builds[version][artifact]
+            path = Path(entry["path"]).resolve()
+            digest = sha(path)
+            if args.builds:
+                assert entry["sha256"] == digest, (version, artifact, "hash mismatch")
+            entry.update(path=str(path), sha256=digest)
+        wheel = builds[version]["wheel"]
+        with zipfile.ZipFile(wheel["path"]) as archive:
+            extensions = [name for name in archive.namelist() if Path(name).match("daft/daft*.so")]
+            assert len(extensions) == 1, "expected one Linux Daft extension per wheel"
+            with archive.open(extensions[0]) as extension:
+                digest = hashlib.file_digest(extension, "sha256").hexdigest()
+        if args.builds:
+            assert wheel["extension_sha256"] == digest, (version, "extension hash mismatch")
+        wheel["extension_sha256"] = digest
+    return builds
+
+
 def load_snapshot():
     # Diagnostics only: no load-based rejection or sample trimming.
     return {
@@ -65,8 +117,11 @@ def load_snapshot():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--builds", type=Path, required=True, help="Pinned binary/wheel paths, hashes and source revisions"
+        "--builds", type=Path, help="Previously generated binary/wheel manifest; verify all pinned hashes"
     )
+    for version in ["baseline", "candidate"]:
+        parser.add_argument(f"--{version}-binary", type=Path, help="Release daft-shuffles test executable")
+        parser.add_argument(f"--{version}-wheel", type=Path, help="Release Daft wheel")
     parser.add_argument("--output", type=Path, required=True, help="New output directory")
     parser.add_argument("--local-root", type=Path, default=Path("/tmp"))
     parser.add_argument("--shared-root", type=Path, required=True)
@@ -78,14 +133,12 @@ def main():
         parser.error("counts must be positive")
     if not all(path.is_dir() for path in [args.local_root, args.shared_root]):
         parser.error("storage roots must exist")
+    builds = build_manifest(args, parser)
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    builds = json.loads(args.builds.read_text())
+    save(out / "builds.json", builds)
     packages = {}
     for version in ["baseline", "candidate"]:
-        for artifact in ["binary", "wheel"]:
-            data = builds[version][artifact]
-            assert sha(data["path"]) == data["sha256"], (version, artifact)
         packages[version] = out / "packages" / version
         with zipfile.ZipFile(builds[version]["wheel"]["path"]) as archive:
             archive.extractall(packages[version])
@@ -210,7 +263,8 @@ def main():
             assert "FlightGather" in next(e for e in events if e["event"] == "physical_plan")["plan"]
             input_event = next(e for e in events if e["event"] == "input")
             assert input_event["partitions"] == 32 and input_event["rows"] == 64000
-            assert ("flight_shuffle_eio_local_max_retries" in settings) == (version == "candidate")
+            if "flight_shuffle_eio_local_max_retries" in settings:
+                assert settings["flight_shuffle_eio_local_max_retries"] == 6
             for event in events:
                 if event["event"] == "sample":
                     event["case"] = "flight-gather-" + compression
@@ -275,8 +329,9 @@ def main():
                 for p in [
                     Path(__file__),
                     workload,
-                    Path(__file__).with_name("message_buffers_stats.py"),
+                    Path(__file__).with_name("abba_stats.py"),
                     Path(__file__).with_name("min_median_stats.py"),
+                    Path(__file__).with_name("storage_stats.py"),
                 ]
             },
             "cache": "client/server caches not cleared; no load-based rejection or trimming",
@@ -412,7 +467,8 @@ def main():
         save(out / "cleanup.json", cleanup)
     assert jobs == total
     status("summarizing", jobs=jobs)
-    from message_buffers_stats import write_summary
+    from abba_stats import write_summary
+    from storage_stats import write_summary as write_storage_summary
 
     events = [json.loads(line) for line in all_events.read_text().splitlines()]
     for kind in ["writer", "query"]:
@@ -434,6 +490,7 @@ def main():
                             + "\n"
                         )
             write_summary(destination, regression_budget_pct=1)
+    write_storage_summary(out)
     status("complete", jobs=jobs)
 
 

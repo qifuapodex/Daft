@@ -2,6 +2,7 @@
 
 Bootstrap whole paired cycles, not individual correlated samples within jobs.
 The interval describes this local experiment; it is not a release guarantee.
+Writes summary.json and min_median.json, including variance/CV and cycle minima.
 """
 
 from __future__ import annotations
@@ -105,9 +106,12 @@ def summarize(events, regression_budget_pct=1.0):
 
 
 def write_summary(output, regression_budget_pct=1.0):
+    from min_median_stats import write_analysis
+
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
     results = summarize(events, regression_budget_pct)
     (output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
+    write_analysis(output)
     for result in results:
         print(json.dumps(result), flush=True)
 
