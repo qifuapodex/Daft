@@ -1,6 +1,0 @@
-# started on Fri Sep 18 03:15:56 2026
-
-1677534344,,cycles,825984315,100.00,2.425,GHz
-712258409,,instructions,696868829,100.00,0.42,insn per cycle
-691720707,,task-clock,691720707,100.00,0.066,CPUs utilized
-10661,,context-switches,679913826,100.00,15.412,K/sec

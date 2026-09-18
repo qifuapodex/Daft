@@ -30,7 +30,7 @@ blocking pool 中执行。这样省去一次异步转交，并让单批输入稳
   `e063e2ab646c22210f3f0f5fe6cd401aac3a3342` 只增加报告，与之生产代码一致。
 - 测试版本：`e063e2ab6` 加 [final.patch（gzip）](final.patch.gz)，Arrow-rs 60。
   [builds-final.json](builds-final.json) 固定 release binary、wheel 和实际扩展的哈希。
-  [source-final-manifest.json](source-final-manifest.json) 固定 1,233 个源码及配置文件。
+  [source-final-manifest.json.gz](source-final-manifest.json.gz) 固定 1,233 个源码及配置文件。
 - 历史对照包含 EIO、此前优化及 Arrow 版本变化；独立优化对照用于分离本次改动的影响。
 - 重点本地单批测试：12 轮 ABBA，每 job 一次 warmup、八次正式样本，每侧每配置 192 个正式样本。
 - 完整存储矩阵：八轮对称顺序 old-local、new-local、old-JuiceFS、new-JuiceFS、
@@ -190,7 +190,7 @@ A 为此前 Arrow 60/EIO/CRC 版本，B 为本次优化；每侧每格 48 个正
 增加样本并没有消除实验波动。它不能证明 A/B 的差异全部来自噪声，
 也不能用于扣减 A/B 的退化，更不能覆盖本地完整查询中已有明确区间证据的回归。
 
-这些对照与完整存储矩阵分时运行，不能跨实验混合样本或直接比较极值。全部方差和每轮 min 见 [focus-summary.json](focus-summary.json)，完整存储统计见 [min_median.json](min_median.json)。
+这些对照与完整存储矩阵分时运行，不能跨实验混合样本或直接比较极值。全部方差和每轮 min 见 [focus-summary.json.gz](focus-summary.json.gz)，完整存储统计见 [min_median.json.gz](min_median.json.gz)。JSON 仅做无损压缩，数据没有变更。
 
 ## 验证与复现
 
@@ -198,13 +198,12 @@ A 为此前 Arrow 60/EIO/CRC 版本，B 为本次优化；每侧每格 48 个正
 五项取消注入测试，以及 58 项 Python/Ray 测试（22 项未选中）。新增测试覆盖首批延后后的
 并发生产者、push/close 竞争，以及关闭期间取消后的 active-write 排空。
 
-全部数据已由 [archive.py](archive.py) 归档；[audit.py](audit.py) 从全部原始样本重算统计，
+全部数据已归档；[audit.py](audit.py) 从全部原始样本重算统计，
 检查 ABBA 次序、轮次、warmup、样本数及 oracle，不依赖已有汇总判断通过。
 共归档 12,288 个正式样本和 2,016 个 warmup；全部源码、patch、binary 和 wheel
 哈希在测量结束后复核一致。审计中的 PASS 表示数据和来源校验通过，不表示性能满足 1% 门槛。
 
 ```sh
-python3 benchmarking/shuffle/normal_path_performance/deferred_first_batch_20260917/archive.py /tmp/daft-task-handle-20260917
 python3 benchmarking/shuffle/normal_path_performance/deferred_first_batch_20260917/audit.py
 ```
 

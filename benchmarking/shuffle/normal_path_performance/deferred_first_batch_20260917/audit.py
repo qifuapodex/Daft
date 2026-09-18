@@ -20,7 +20,7 @@ def main():
     folder = Path(__file__).resolve().parent
     manifest, storage = compute(folder)
     assert render_csv(storage) == (folder / "summary.csv").read_text()
-    assert storage == json.loads((folder / "min_median.json").read_text())
+    assert storage == json.loads(gzip.decompress((folder / "min_median.json.gz").read_bytes()))
 
     focus = json.loads((folder / "focus-manifest.json").read_text())
     resources = gzip.decompress((folder / "focus-resources.jsonl.gz").read_bytes())
@@ -41,7 +41,7 @@ def main():
     raw = gzip.decompress((folder / "focus-events.jsonl.gz").read_bytes())
     assert hashlib.sha256(raw).hexdigest() == focus["events_sha256"]
     events = [json.loads(line) for line in raw.splitlines()]
-    stored = json.loads((folder / "focus-summary.json").read_text())
+    stored = json.loads(gzip.decompress((folder / "focus-summary.json.gz").read_bytes()))
     total = 0
     for study, params in focus["studies"].items():
         assert params["binaries"]["candidate"]["sha256"] == builds["candidate"]["binary"]["sha256"]
