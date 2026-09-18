@@ -10,10 +10,10 @@ on:
         required: true
       tag_name:
         description: Release to update
-        default: apodex-0.7.24.7
+        default: apodex-0.7.24.8
       package_version:
         description: Expected wheel version
-        default: 0.7.24+apodex.7
+        default: 0.7.24+apodex.8
   push:
     tags:
     - apodex-assets-*
@@ -33,8 +33,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REQUESTED_RUN_ID: ${{ inputs.run_id }}
-      RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
-      PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.7' }}
+      RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.8' }}
+      PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.8' }}
     steps:
     - uses: actions/checkout@v7
     - name: Verify source run and release tag
@@ -62,8 +62,8 @@ jobs:
     - name: Publish release notes first
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.7' }}
-        PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.7' }}
+        RELEASE_TAG: ${{ inputs.tag_name || 'apodex-0.7.24.8' }}
+        PACKAGE_VERSION: ${{ inputs.package_version || '0.7.24+apodex.8' }}
       run: |
         # The tag already identifies the build. Do not rewrite target_commitish
         # when updating an existing release with a workflow-scoped token.
