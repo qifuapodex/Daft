@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--compression", choices=["lz4", "none"], default="lz4")
     parser.add_argument("--root", type=Path, default=Path(tempfile.gettempdir()))
+    parser.add_argument("--inspect-input", action="store_true", help="Diagnostic input inspection before warmup")
     parser.add_argument("--perf-control", type=Path, help="Diagnostic perf control FIFO; requires --perf-ack")
     parser.add_argument("--perf-ack", type=Path, help="Diagnostic perf acknowledgement FIFO")
     args = parser.parse_args()
@@ -164,6 +165,17 @@ def main():
                 )
 
                 emit(event="input", label=args.label, partitions=source._result_cache.num_partitions(), rows=rows)
+                if args.inspect_input:
+                    for partition_id, materialized in source._result_cache.value.items():
+                        partition = materialized.micropartition()
+                        emit(
+                            event="input_partition",
+                            label=args.label,
+                            partition_id=partition_id,
+                            rows=len(partition),
+                            size_bytes=partition.size_bytes(),
+                            arrow_batches=[len(batch) for batch in partition.to_arrow().to_batches()],
+                        )
                 for trial in range(args.samples + 1):
                     query = source.with_column("ordinal", row_number().over(Window().order_by("v")))
                     if trial == 0:

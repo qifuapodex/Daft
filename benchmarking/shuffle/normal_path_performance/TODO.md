@@ -41,13 +41,23 @@ Starting production revision: `20fe7b0b05646418d84433f6613a13e46762becc`.
   scheduling costs, including worker processes. Profile separately from ABBA.
   Do not attribute all full-process futex calls to one blocking handoff or
   convert aggregate query differences into measured per-file costs.
-  The query's 2,000-row/two-int64 input partitions are about 32 KiB, above the
-  current 8 KiB first-input deferral threshold. Verify their actual write shape;
-  if they are single-batch files, test a larger deferral threshold separately.
+  Input-shape verification and an explicit final-input experiment are complete
+  (below); widening the global streaming threshold is no longer the next step.
   [Initial current-version capture](gather_profile_20260918/README.md) completed
   128 profiled collects with all oracles passing; counter-mode smoke checks
   also passed for current/pre-EIO wheels. Library-level CPU shares are retained,
   but a controlled baseline comparison and phase attribution are still pending.
+  Follow-up screen completed: input inspection confirms 32 partitions of exactly 32,000
+  logical bytes / 2,000 rows / one Arrow batch. `FlightGatherState::push` creates
+  a cache per MP and immediately closes it, so the experiment used an explicit
+  final-input operation instead of widening the global streaming threshold.
+  [The separate uncompressed screen](gather_final_input_20260918/README.md) ran four symmetric cycles across
+  pre-EIO/current/prototype and local/JuiceFS, four formal collects plus one
+  warmup per job (32 formal samples per version/disk). Relative to current,
+  local min/median change -1.50%/+0.23%, JuiceFS +0.17%/+1.82%; intervals remain
+  inconclusive. Relative to pre-EIO both observed min/median exceed +1% on both
+  disks. Prototype not adopted; production Rust restored, patch/tests retained.
+  Return to controlled phase attribution before expanding this candidate's matrix.
 - [ ] **P3: Per-file fixed costs.** Use P2 evidence to choose isolated changes:
   initial/final seeks, cancellation guard/poison allocations, repeated Arrow
   schema conversion and policy/tracking locks. Prior combined cancellation
@@ -94,3 +104,9 @@ Starting production revision: `20fe7b0b05646418d84433f6613a13e46762becc`.
   lseek counts stayed at 28. Initial Gather CPU capture and profiling-tool
   validation completed; no causal or 1% acceptance claim is made from these
   instrumented observations. Production Rust and the development build are restored.
+- 2026-09-18: Gather final-input prototype completed 48 three-version/two-disk
+  jobs, 192 formal collects and 48 warmups, all output/hash/spill checks passing.
+  Four-cycle exploratory results do not support adoption or satisfy the historical
+  1% budget. 111 relevant Rust tests, six injected cancellation tests and four
+  real Ray streaming fault tests passed; source patch, raw observations, source
+  hashes and reproducible statistics are retained. Production Rust is restored.
