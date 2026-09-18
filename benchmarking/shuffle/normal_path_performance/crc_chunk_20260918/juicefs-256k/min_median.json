@@ -1,0 +1,101 @@
+[
+  {
+    "case": "stream-wide",
+    "reader": "c8-none",
+    "baseline": {
+      "n": 48,
+      "min_s": 0.829710785,
+      "median_s": 7.0699244375,
+      "max_s": 9.268152009,
+      "mean_s": 5.496960996604167,
+      "sample_variance_s2": 9.343326453128622,
+      "sample_stddev_s": 3.056685533895926,
+      "cv_pct": 55.60682594954268,
+      "mad_s": 1.4706531139999992,
+      "mad_over_median_pct": 20.801539351671455,
+      "p10_s": 0.8841225198,
+      "p95_s": 8.73138266235
+    },
+    "candidate": {
+      "n": 48,
+      "min_s": 0.848104228,
+      "median_s": 6.021357964,
+      "max_s": 9.24908384,
+      "mean_s": 5.400726343645833,
+      "sample_variance_s2": 7.10695129586456,
+      "sample_stddev_s": 2.665886587209696,
+      "cv_pct": 49.3616305952294,
+      "mad_s": 1.4577524360000003,
+      "mad_over_median_pct": 24.209695632039995,
+      "p10_s": 0.9739598735,
+      "p95_s": 8.877523803299999
+    },
+    "change_pct": {
+      "min": 2.2168499352458015,
+      "median": -14.83136747456928,
+      "p10": 10.161188261590981,
+      "p95": 1.6737456895591585
+    },
+    "cycle_minima": [
+      {
+        "cycle": 0,
+        "baseline": 0.829710785,
+        "candidate": 0.917297557,
+        "change_pct": 10.556301494863662
+      },
+      {
+        "cycle": 1,
+        "baseline": 0.871456497,
+        "candidate": 0.848104228,
+        "change_pct": -2.6796827013615188
+      },
+      {
+        "cycle": 2,
+        "baseline": 0.958660522,
+        "candidate": 2.119762272,
+        "change_pct": 121.11709237568876
+      },
+      {
+        "cycle": 3,
+        "baseline": 2.010414834,
+        "candidate": 2.92061833,
+        "change_pct": 45.27441205698941
+      },
+      {
+        "cycle": 4,
+        "baseline": 6.889048953,
+        "candidate": 6.162657364,
+        "change_pct": -10.54414903937756
+      },
+      {
+        "cycle": 5,
+        "baseline": 6.582382283,
+        "candidate": 5.132003849,
+        "change_pct": -22.0342479613471
+      },
+      {
+        "cycle": 6,
+        "baseline": 3.765204533,
+        "candidate": 5.42541199,
+        "change_pct": 44.093420223235455
+      },
+      {
+        "cycle": 7,
+        "baseline": 4.835823365,
+        "candidate": 5.425533097,
+        "change_pct": 12.194608601052547
+      }
+    ],
+    "cycle_minima_median_s": {
+      "baseline": 2.8878096835,
+      "candidate": 4.0263110895
+    },
+    "cycle_minima_median_change_pct": 39.424391867131156,
+    "cycle_minima_changes_above_1pct": 5,
+    "previous_median_ci_gate": "INCONCLUSIVE",
+    "previous_median_ci_95pct": [
+      -21.030420062458887,
+      105.99063849885879
+    ]
+  }
+]

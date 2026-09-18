@@ -1,0 +1,23 @@
+{
+  "prototype_rust_tests_per_variant": 111,
+  "injected_cancellation_tests_per_variant": 5,
+  "variants": [
+    "512k",
+    "256k"
+  ],
+  "python_ray_streaming_tests": {
+    "variant": "256k",
+    "passed": 4,
+    "deselected": 38
+  },
+  "make_build": "PASS (256k prototype)",
+  "sandbox_retry": "One Flight port-binding test failed in the sandbox; all 65 shuffle tests passed outside the sandbox. Original and rerun logs retained.",
+  "crc_backend": "RecoveryChecksum::Wide selected by production predicate: true\ncrc-fast actual target: x86_64-avx512-vpclmulqdq\n",
+  "source_audit": {
+    "status": "PASS",
+    "files_checked": 1233,
+    "source_unchanged_during_measurement": true
+  },
+  "production_adoption": false,
+  "restored_make_build": "PASS; production Rust restored unchanged"
+}

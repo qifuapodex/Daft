@@ -1,0 +1,28 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 23K of event 'cycles'
+# Event count (approx.): 121209056262
+#
+# Overhead  Shared Object
+# ........  .........................................
+#
+    27.21%  [kernel.kallsyms]
+    21.63%  python3.11
+    20.23%  _raylet.so
+    10.43%  libc.so.6
+     8.74%  daft.abi3.so
+     4.17%  raylet
+     1.87%  libstdc++.so.6.0.33
+     1.85%  gcs_server
+     0.87%  [vdso]
+     0.85%  loop.cpython-311-x86_64-linux-gnu.so
+     0.73%  libjemalloc.so
+     0.67%  ld-linux-x86-64.so.2
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

@@ -1,0 +1,29 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 23K of event 'cycles'
+# Event count (approx.): 121209056262
+#
+# Overhead Command Shared Object Symbol IPC [IPC Coverage]
+#
+3.20% ray::IDLE python3.11 [.] _PyEval_EvalFrameDefault - -
+0.90% python python3.11 [.] _PyEval_EvalFrameDefault - -
+0.84% Daft-Scheduler python3.11 [.] _PyEval_EvalFrameDefault - -
+0.79% ray::IDLE python3.11 [.] PyObject_GenericGetAttr - -
+0.73% worker.io python3.11 [.] _PyEval_EvalFrameDefault - -
+0.54% ray::IDLE python3.11 [.] _PyObject_Malloc - -
+0.42% ray::IDLE libc.so.6 [.] __memmove_avx512_unaligned_erms - -
+0.32% ray::IDLE python3.11 [.] _PyFunction_Vectorcall - -
+0.31% ray::IDLE libc.so.6 [.] _int_malloc - -
+0.29% worker.io python3.11 [.] PyObject_GenericGetAttr - -
+0.28% ray::IDLE libc.so.6 [.] malloc - -
+0.27% ray::InMemorySc python3.11 [.] _PyEval_EvalFrameDefault - -
+0.26% worker.io libc.so.6 [.] malloc - -
+0.26% Daft-Scheduler libc.so.6 [.] __memmove_avx512_unaligned_erms - -
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

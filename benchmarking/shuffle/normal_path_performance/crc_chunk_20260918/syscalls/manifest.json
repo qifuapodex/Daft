@@ -1,0 +1,56 @@
+{
+  "samples_per_job": 1,
+  "warmups_per_job": 1,
+  "case": "stream-wide",
+  "concurrency": 8,
+  "compression": "none",
+  "retries": 6,
+  "cpu_set": "2,3",
+  "builds": {
+    "whole": {
+      "path": "/tmp/daft-crc-chunk-20260918/whole-daft_shuffles",
+      "sha256": "e7e3d8a9db8864ecfd8da87ef1064b517a2d6ed0df46d5d01ab81441c7c2cc4c",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      },
+      "commit": "20fe7b0b05646418d84433f6613a13e46762becc",
+      "patch_sha256": null
+    },
+    "512k": {
+      "path": "/tmp/daft-crc-chunk-20260918/512k-daft_shuffles",
+      "sha256": "7aab36c203a94e6eb5fee15af6c885b58e956fef35ff3cfa13cd3494e0fb62a7",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      },
+      "commit": "20fe7b0b05646418d84433f6613a13e46762becc",
+      "patch_sha256": "2bba73ea22ffdaecf57bee91afd428a1cfaba334ff142631fc7e3ebca5977738"
+    },
+    "256k": {
+      "path": "/tmp/daft-crc-chunk-20260918/256k-daft_shuffles",
+      "sha256": "c1d29978f22caf7a53806e32265e634ab633d1afb1db2fc93a40084951c8da65",
+      "profile": {
+        "opt_level": "3",
+        "debuginfo": 0,
+        "debug_assertions": false,
+        "overflow_checks": false,
+        "test": true
+      },
+      "commit": "20fe7b0b05646418d84433f6613a13e46762becc",
+      "patch_sha256": "ac6d1390eda7aec7ee7ea75f0fb9f4afbc1df729d388a9326b9022ba1a768990"
+    }
+  },
+  "purpose": "deterministic syscall counts; traced timings are not acceptance",
+  "trace": [
+    "pwrite64",
+    "lseek"
+  ],
+  "stat_time": "summed syscall wall time across threads, not elapsed query time"
+}

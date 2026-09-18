@@ -1,0 +1,15 @@
+{
+  "raw_capture": "/tmp/daft-crc-chunk-20260918/gather-current-record-v2/perf.data",
+  "raw_capture_bytes": 206459836,
+  "raw_capture_sha256": "5903886be95438a020cb1ad0bacd86371f4c36c1f48807c940951d1a58a83e5b",
+  "profiled_collects": 128,
+  "warmups": 1,
+  "samples_reported": "23K",
+  "lost_samples": 0,
+  "production_revision": "20fe7b0b05646418d84433f6613a13e46762becc",
+  "old_profile_comparison_complete": false,
+  "phase_attribution_complete": false,
+  "failed_control_probe": "Initial run rejected perf 6.17 NUL-terminated ack; its warmup-only trace was not analyzed.",
+  "report_rendering": "The original inline-symbol report was interrupted after capture; report-no-inline and dso aggregates were generated from the completed raw trace.",
+  "hardware_counters_smoke_only": true
+}

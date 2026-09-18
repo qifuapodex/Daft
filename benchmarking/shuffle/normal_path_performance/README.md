@@ -4,6 +4,12 @@ The implementation preserves local EIO recovery and cancellation safety while re
 normal-path IPC work. **The pre-EIO baseline's 1% regression target is not met.**
 This change is suitable for code review; the historical data below is not a release acceptance claim.
 
+The [review follow-up TODO](TODO.md) tracks the remaining optimization and
+validation work. The [CRC chunking experiment](crc_chunk_20260918/README.md)
+found a local benefit at 512 KiB, but neither cap met the observed-min budget
+on JuiceFS. Both rejected prototypes and every observation are retained;
+production Rust is unchanged by that experiment.
+
 The latest [deferred-first-batch comparison](deferred_first_batch_20260917/README.md)
 keeps CRC enabled and avoids an async forwarding task for a single input of at
 most 8 KiB. Against the pre-EIO version, the 4 KiB single-batch writer improves
